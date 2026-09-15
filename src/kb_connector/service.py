@@ -89,22 +89,10 @@ def _default_session_factory(region: str | None, profile: str | None) -> Any:
     return boto3.Session(region_name=region, profile_name=profile)
 
 
-def _default_target_factory(
-    *,
-    session: Any,
-    region: str,
-    buildtime_endpoint: str | None = None,
-    runtime_endpoint: str | None = None,
-) -> Any:
+def _default_target_factory(*, session: Any, region: str) -> Any:
     """Build a BmkbTarget. Imported lazily so tests don't pay for it."""
     from kb_connector.targets import get_target
-    return get_target(
-        "bmkb",
-        session=session,
-        region=region,
-        buildtime_endpoint=buildtime_endpoint,
-        runtime_endpoint=runtime_endpoint,
-    )
+    return get_target("bmkb", session=session, region=region)
 
 
 SessionFactory = Callable[[str | None, str | None], Any]
@@ -360,12 +348,7 @@ def monitor(
     sess_factory = session_factory or _default_session_factory
     tgt_factory = target_factory or _default_target_factory
     session = sess_factory(region, profile)
-    target = tgt_factory(
-        session=session,
-        region=region,
-        buildtime_endpoint=cfg.endpoint_url if cfg else None,
-        runtime_endpoint=cfg.runtime_endpoint_url if cfg else None,
-    )
+    target = tgt_factory(session=session, region=region)
 
     if start:
         return start_and_poll(
@@ -471,12 +454,7 @@ def validate(
         sess_factory = session_factory or _default_session_factory
         tgt_factory = target_factory or _default_target_factory
         session = sess_factory(region, profile)
-        target = tgt_factory(
-            session=session,
-            region=region,
-            buildtime_endpoint=cfg.endpoint_url if cfg else None,
-            runtime_endpoint=cfg.runtime_endpoint_url if cfg else None,
-        )
+        target = tgt_factory(session=session, region=region)
 
         if acl_enabled:
             if authorized_user:

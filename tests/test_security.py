@@ -14,7 +14,8 @@ from dataclasses import asdict
 
 import pytest
 
-from kb_connector.core.errors import AwsError, ConfigError
+from kb_connector.core.diagnostics import describe_endpoints
+from kb_connector.core.errors import ConfigError
 from kb_connector.core.fileio import (
     atomic_write_bytes,
     atomic_write_json,
@@ -28,7 +29,6 @@ from kb_connector.core.log_analysis import (
     redact_reason,
 )
 from kb_connector.core.provisioning import _reclaim_untagged, build_inline_policy
-from kb_connector.core.signed_client import validate_endpoint
 from botocore.exceptions import ClientError
 
 from kb_connector.core.config import load_config
@@ -59,49 +59,6 @@ from kb_connector.core.tagging import (
     validate_extra_tags,
 )
 from kb_connector.providers.microsoft.apps import escape_odata_literal
-
-
-# --- T-01: endpoint allowlist ------------------------------------------------
-
-
-@pytest.mark.parametrize("url", [
-    "https://bedrock-agent.us-east-1.amazonaws.com",
-    "https://bedrock-agent-runtime.eu-west-1.amazonaws.com/",
-    "https://bedrock-agent.cn-north-1.amazonaws.com.cn",
-    "https://something.api.aws",
-    "https://something.on.aws",
-])
-def test_endpoint_allowlist_accepts_aws_hosts(url):
-    assert validate_endpoint(url).startswith("https://")
-
-
-@pytest.mark.parametrize("url,expected", [
-    ("http://bedrock-agent.us-east-1.amazonaws.com", "only https is allowed"),
-    ("https://blocked.example.com", "not an AWS-owned endpoint"),
-    # The suffix check must be on the parsed hostname, not a substring match.
-    ("https://amazonaws.com.blocked.example", "not an AWS-owned endpoint"),
-    ("https://notamazonaws.com", "not an AWS-owned endpoint"),
-    ("ftp://bedrock-agent.us-east-1.amazonaws.com", "only https is allowed"),
-    ("not-a-url", "not a valid absolute URL"),
-    ("", "is empty"),
-])
-def test_endpoint_allowlist_rejects(url, expected):
-    with pytest.raises(AwsError, match=expected):
-        validate_endpoint(url)
-
-
-def test_endpoint_trailing_slash_normalized():
-    assert validate_endpoint(
-        "https://bedrock-agent.us-east-1.amazonaws.com/"
-    ) == "https://bedrock-agent.us-east-1.amazonaws.com"
-
-
-def test_endpoint_opt_out_requires_explicit_env(monkeypatch):
-    monkeypatch.delenv("KB_CONNECTOR_ALLOW_INSECURE_ENDPOINT", raising=False)
-    with pytest.raises(AwsError):
-        validate_endpoint("https://localhost:8443")
-    monkeypatch.setenv("KB_CONNECTOR_ALLOW_INSECURE_ENDPOINT", "1")
-    assert validate_endpoint("https://localhost:8443") == "https://localhost:8443"
 
 
 # --- T-03: tag-verified ownership -------------------------------------------
@@ -693,6 +650,44 @@ def test_inline_policy_omits_kms_without_cmk():
         cert_key=None,
     )
     assert not [s for s in policy["Statement"] if s["Sid"] == "KmsDecryptStatement"]
+
+
+# --- T-01: endpoint redirection is surfaced before the first write -----------
+
+
+def _session():
+    """A credential-shaped session; endpoint env vars come from monkeypatch."""
+    import boto3
+
+    return boto3.Session(
+        region_name="us-west-2", aws_access_key_id="A", aws_secret_access_key="B"
+    )
+
+
+def test_default_endpoints_are_reported_as_default(monkeypatch):
+    for var in ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_BEDROCK_AGENT"):
+        monkeypatch.delenv(var, raising=False)
+    lines = describe_endpoints(_session(), "us-west-2")
+    assert lines == ["AWS endpoints: default for us-west-2"]
+
+
+def test_service_specific_redirect_is_reported(monkeypatch):
+    """A per-service variable must not hide behind an unredirected STS check."""
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_AGENT", "https://elsewhere.example.com")
+    lines = describe_endpoints(_session(), "us-west-2")
+    assert "REDIRECTED" in lines[0]
+    assert any("bedrock-agent: https://elsewhere.example.com" in ln for ln in lines)
+
+
+def test_global_redirect_reports_every_affected_service(monkeypatch):
+    """The exposure is not Bedrock-only: the secret-bearing path moves too."""
+    monkeypatch.delenv("AWS_ENDPOINT_URL_BEDROCK_AGENT", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://elsewhere.example.com")
+    lines = describe_endpoints(_session(), "us-west-2")
+    joined = "\n".join(lines)
+    for service in ("bedrock-agent", "secretsmanager", "s3", "sts"):
+        assert f"{service}: https://elsewhere.example.com" in joined
 
 
 # --- T-26: kms_key_arn reaches a policy Resource, so it is shape-checked -----

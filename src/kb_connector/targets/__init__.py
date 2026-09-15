@@ -10,22 +10,13 @@ from typing import Any
 from kb_connector.targets.base import Target
 
 
-def get_target(
-    target_name: str,
-    *,
-    session: Any,
-    region: str,
-    buildtime_endpoint: str | None = None,
-    runtime_endpoint: str | None = None,
-) -> Target:
+def get_target(target_name: str, *, session: Any, region: str) -> Target:
     """Construct a Target for the named backend.
 
     Args:
         target_name: "bmkb" (default) or "quick".
         session: boto3 session.
         region: AWS region.
-        buildtime_endpoint / runtime_endpoint: optional endpoint overrides
-            (for pre-production testing).
 
     Raises:
         ValueError: for an unknown target name.
@@ -33,12 +24,7 @@ def get_target(
     name = (target_name or "bmkb").strip().lower()
     if name == "bmkb":
         from kb_connector.targets.bmkb import BmkbTarget
-        return BmkbTarget(
-            session=session,
-            region=region,
-            buildtime_endpoint=buildtime_endpoint,
-            runtime_endpoint=runtime_endpoint,
-        )
+        return BmkbTarget(session=session, region=region)
     if name == "quick":
         from kb_connector.targets.quick import QuickTarget
         return QuickTarget(session=session, region=region)

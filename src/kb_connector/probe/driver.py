@@ -99,14 +99,7 @@ class ProbeResult:
     events: list[dict]
 
 
-def run_probe(
-    args: ProbeArgs,
-    *,
-    session: Any,
-    region: str,
-    buildtime_endpoint: str | None = None,
-    runtime_endpoint: str | None = None,
-) -> ProbeResult:
+def run_probe(args: ProbeArgs, *, session: Any, region: str) -> ProbeResult:
     """Execute one probe run; returns a structured result. Captures to disk."""
     connector_params = _read_json_file(args.connector_params_file)
     if not isinstance(connector_params, dict):
@@ -124,12 +117,7 @@ def run_probe(
 
     _write_json(out_dir, "00-input-connector-params.json", connector_params)
 
-    target = BmkbTarget(
-        session=session,
-        region=region,
-        buildtime_endpoint=buildtime_endpoint,
-        runtime_endpoint=runtime_endpoint,
-    )
+    target = BmkbTarget(session=session, region=region)
 
     # 1. Optional secret.
     secret_arn: str | None = None

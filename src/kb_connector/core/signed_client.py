@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import random
-import sys
 import time
 from typing import Any
 
@@ -34,107 +33,12 @@ from kb_connector.core.errors import AwsError
 _SIGNING_SERVICE = "bedrock"
 _TIMEOUT = 60
 
-# Hosts this client will sign requests to. Every request carries a SigV4
-# signature computed with the caller's live credentials, so the destination is
-# a security boundary: a request sent to a host an attacker controls hands them
-# a valid Authorization header for service "bedrock" plus the request body
-# (which includes secret ARNs), and that header is replayable against the real
-# endpoint inside its signing window.
-#
-# endpoint_url / runtime_endpoint_url exist as a pre-production testing hook and
-# are reachable from config *and* from the environment
-# (KB_CONNECTOR_ENDPOINT_URL), which means a poisoned config file or an
-# inherited env var in CI is enough to redirect traffic. So overrides are
-# constrained to AWS-owned domains by default, and stepping outside that set
-# requires an explicit opt-in the operator has to type.
-_ALLOWED_ENDPOINT_SUFFIXES = (
-    ".amazonaws.com",
-    ".amazonaws.com.cn",
-    ".api.aws",
-    ".on.aws",
-)
-
-_ENDPOINT_OVERRIDE_ENV = "KB_CONNECTOR_ALLOW_INSECURE_ENDPOINT"
-
 # Retry defaults. Full-jitter exponential backoff capped at _RETRY_MAX_DELAY.
 _MAX_RETRIES = 4
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 20.0
 
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
-
-
-def validate_endpoint(endpoint: str, *, label: str = "endpoint") -> str:
-    """Validate and normalize an endpoint URL before anything is signed to it.
-
-    Enforces two properties:
-
-    1. **https only.** A plaintext endpoint would put the SigV4 Authorization
-       header and the request body on the wire in the clear.
-    2. **AWS-owned host.** See _ALLOWED_ENDPOINT_SUFFIXES for why the
-       destination is a security boundary rather than a cosmetic setting.
-
-    Returns the endpoint with any trailing slash removed.
-
-    Raises:
-        AwsError: when the endpoint is malformed, not https, or points outside
-            the allowlist without the opt-out set.
-    """
-    import os
-    from urllib.parse import urlparse
-
-    if not endpoint or not endpoint.strip():
-        raise AwsError(f"{label} is empty; expected an https:// URL.")
-
-    raw = endpoint.strip()
-    parsed = urlparse(raw)
-
-    if not parsed.scheme or not parsed.netloc:
-        raise AwsError(
-            f"{label} {raw!r} is not a valid absolute URL. Expected something "
-            f"like https://bedrock-agent.us-east-1.amazonaws.com"
-        )
-
-    if parsed.scheme != "https":
-        raise AwsError(
-            f"{label} {raw!r} uses scheme {parsed.scheme!r}, but only https is "
-            f"allowed. Requests to this endpoint carry a SigV4 signature "
-            f"computed from your AWS credentials; sending them over plaintext "
-            f"would expose that signature and the request body."
-        )
-
-    host = (parsed.hostname or "").lower()
-    allowed = host.endswith(_ALLOWED_ENDPOINT_SUFFIXES)
-    opted_out = os.environ.get(_ENDPOINT_OVERRIDE_ENV, "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-    if not allowed and not opted_out:
-        raise AwsError(
-            f"{label} {raw!r} points at {host!r}, which is not an AWS-owned "
-            f"endpoint.\n\n"
-            f"Every request this client sends is signed with your live AWS "
-            f"credentials. A non-AWS host receives a valid, replayable "
-            f"Authorization header for the bedrock service along with the "
-            f"request body — which includes secret ARNs. So the tool will not "
-            f"sign requests to arbitrary hosts.\n\n"
-            f"Allowed suffixes: {', '.join(_ALLOWED_ENDPOINT_SUFFIXES)}\n\n"
-            f"If you are deliberately testing against a private pre-production "
-            f"endpoint, set {_ENDPOINT_OVERRIDE_ENV}=1 to acknowledge the risk. "
-            f"Do not set it in a shared shell profile or CI configuration."
-        )
-
-    if not allowed and opted_out:
-        print(
-            f"  WARNING: signing requests to non-AWS endpoint {host!r} because "
-            f"{_ENDPOINT_OVERRIDE_ENV} is set. Your AWS credentials are being "
-            f"used to sign requests to a host outside AWS.",
-            file=sys.stderr,
-        )
-
-    return raw.rstrip("/")
 
 
 class _TransientError(Exception):
@@ -188,12 +92,8 @@ class SignedClient:
         self._region = region or session.region_name
         if not self._region:
             raise AwsError("No AWS region set for signing requests.")
-        self._buildtime = validate_endpoint(buildtime_endpoint, label="endpoint_url")
-        self._runtime = (
-            validate_endpoint(runtime_endpoint, label="runtime_endpoint_url")
-            if runtime_endpoint
-            else ""
-        )
+        self._buildtime = buildtime_endpoint.rstrip("/")
+        self._runtime = runtime_endpoint.rstrip("/") if runtime_endpoint else ""
         # Clamped so `range(self._max_retries + 1)` in _send always yields at
         # least one attempt. A negative value would skip the request entirely
         # and fall through to the failure path with nothing to report.
@@ -208,10 +108,7 @@ class SignedClient:
     def runtime(self, method: str, path: str, body: Any = None) -> Any:
         """Signed call against the runtime endpoint (retrieve)."""
         if not self._runtime:
-            raise AwsError(
-                "No runtime endpoint configured. Set runtime_endpoint_url "
-                "in config or pass --runtime-endpoint-url for retrieve operations."
-            )
+            raise AwsError("No runtime endpoint available for retrieve operations.")
         return self._send(method, self._runtime + path, body)
 
     # -- internals -----------------------------------------------------------

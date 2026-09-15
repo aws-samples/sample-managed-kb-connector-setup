@@ -21,6 +21,74 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
+# Services whose endpoint is worth reporting before a write: the two Bedrock
+# planes, and the three that carry or protect credential material.
+_ENDPOINT_SERVICES = (
+    "bedrock-agent",
+    "bedrock-agent-runtime",
+    "secretsmanager",
+    "s3",
+    "sts",
+)
+
+
+def _endpoint_pair(
+    session: Any, service: str, region: str | None, ignore_config: Any
+) -> tuple[str, str] | None:
+    """Resolved and region-default endpoint for a service, or None if unavailable.
+
+    A service this botocore cannot construct must not block setup; the call that
+    needs it will report the problem with better context than this would.
+    """
+    try:
+        return (
+            session.client(service, region_name=region).meta.endpoint_url,
+            session.client(
+                service, region_name=region, config=ignore_config
+            ).meta.endpoint_url,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def describe_endpoints(session: Any, region: str | None) -> list[str]:
+    """Describe where AWS calls will actually go, for display before a write.
+
+    Endpoints resolve from SDK configuration — `AWS_ENDPOINT_URL`, its
+    service-specific variants, and `endpoint_url` in the shared config file — so
+    an environment variable or a profile setting can send credential-bearing,
+    SigV4-signed requests somewhere unintended (T-01). Redirection is legitimate
+    for FIPS, VPC endpoints and pre-production testing, so this reports rather
+    than refuses.
+
+    A service is called redirected when its resolved endpoint differs from the
+    one the SDK would derive from the region alone. That comparison asks
+    botocore for its own default rather than reconstructing hostnames here.
+    """
+    from botocore.config import Config
+
+    # botocore accepts this option (it is in Config.OPTION_DEFAULTS) but
+    # botocore-stubs does not declare it yet, so the type check needs a waiver.
+    ignore_config = Config(  # type: ignore[call-arg]
+        ignore_configured_endpoint_urls=True
+    )
+    redirected: list[tuple[str, str]] = []
+    for service in _ENDPOINT_SERVICES:
+        pair = _endpoint_pair(session, service, region, ignore_config)
+        if pair is None:
+            continue
+        resolved, default = pair
+        if resolved != default:
+            redirected.append((service, resolved))
+
+    if not redirected:
+        return [f"AWS endpoints: default for {region or session.region_name}"]
+    lines = ["AWS endpoints: REDIRECTED by SDK configuration —"]
+    lines.extend(f"    {service}: {url}" for service, url in redirected)
+    lines.append("    Requests are signed with your credentials. Confirm this is intended.")
+    return lines
+
+
 @dataclass
 class CheckResult:
     """Result of a single diagnostic check."""

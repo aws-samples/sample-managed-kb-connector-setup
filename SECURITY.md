@@ -81,10 +81,11 @@ recognize it; a resource carrying another connector's tag is never reclaimed tha
 way. Resources the tool adopted rather than created are recorded as external and
 are not deleted unless you pass `--include-adopted`.
 
-Endpoint overrides (`endpoint_url`, `KB_CONNECTOR_ENDPOINT_URL`) are restricted
-to `https://` on AWS-owned domains. Every request is SigV4-signed with your live
-credentials, so an arbitrary destination would receive a replayable
-authorization header.
+Endpoints come from your AWS SDK configuration, not from tool-specific
+settings. Every request is SigV4-signed with your live credentials, so
+whichever host the SDK resolves receives a replayable authorization header —
+treat `AWS_ENDPOINT_URL` and `endpoint_url` in `~/.aws/config` as
+security-relevant settings.
 
 Diagnostics output may contain identifiers. When sharing the output of
 `diagnose` or `validate`, including `--json`, scrub tenant IDs, account IDs, and

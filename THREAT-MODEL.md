@@ -126,10 +126,10 @@ flowchart TB
 
 | ID | Boundary | Crossing |
 |---|---|---|
-| **TB-1** | Operator workstation | Local files are inputs the tool trusts for endpoint URLs, resource names, and API payloads (T-01, T-14). Values that become the *target* of a destructive AWS call are shape-checked rather than trusted (T-24), as are values interpolated into IAM policy ARNs (T-26). |
+| **TB-1** | Operator workstation | Local files are inputs the tool trusts for resource names and API payloads (T-14), and the AWS SDK's own configuration decides where signed requests go (T-01). Values that become the *target* of a destructive AWS call are shape-checked rather than trusted (T-24), as are values interpolated into IAM policy ARNs (T-26). |
 | **TB-2** | AI agent → MCP server | stdio, no authn of its own. Agent controls `profile`, `config_path`, `state_path`. Document content flows back into model context. |
 | **TB-3** | Tool → Microsoft Entra | Directory writes using the operator's full-privilege token. Creates standing capability that outlives the run. |
-| **TB-4** | Tool → AWS | SigV4-signed requests. Creates IAM roles and reads/writes secrets. |
+| **TB-4** | Tool → AWS | SigV4-signed requests, to whichever endpoint the SDK resolves (T-01). Creates IAM roles and reads/writes secrets. |
 | **TB-5** | Bedrock → source system | AWS-side crawl using AS-1. The tool configures this but is not on the path. |
 
 ---
@@ -155,24 +155,42 @@ grammar. Priority reflects likelihood × impact *for this tool's realistic
 deployment*, not raw severity. **Status** is one of Mitigated (addressed in
 code), Partially mitigated, or Accepted (documented, not fixed).
 
-### T-01 — Endpoint override exfiltrates signed AWS credentials
+### T-01 — SDK endpoint configuration exfiltrates signed AWS credentials
 **High · Spoofing/Information disclosure · TB-1→TB-4 · AS-3**
 
-A **TA-1** with the ability to set `endpoint_url` / `runtime_endpoint_url` in
-config, or `KB_CONNECTOR_ENDPOINT_URL` in the environment, can redirect every
-Bedrock control-plane and runtime request to a host they control, which yields a
-valid SigV4 `Authorization` header for service `bedrock` plus request bodies
-containing secret ARNs, negatively impacting the confidentiality of the
-operator's AWS credentials and enabling replay against the real endpoint inside
-the signing window.
+A **TA-1** able to set `AWS_ENDPOINT_URL`, a service-specific variant such as
+`AWS_ENDPOINT_URL_BEDROCK_AGENT`, or `endpoint_url` in the operator's
+`~/.aws/config` can redirect requests to a host they control, which yields a
+valid SigV4 `Authorization` header plus the request body, negatively impacting
+the confidentiality of the operator's AWS credentials and enabling replay
+against the real endpoint inside the signing window.
 
-**Status: Mitigated.** `core/signed_client.validate_endpoint` requires `https`
-and restricts hosts to `.amazonaws.com`, `.amazonaws.com.cn`, `.api.aws`,
-`.on.aws`. Suffix-lookalike hosts (`amazonaws.com.blocked.example`) are rejected —
-matching is on the parsed hostname, not a substring. Escaping the allowlist
-requires `KB_CONNECTOR_ALLOW_INSECURE_ENDPOINT=1`, which warns on every run.
-**Residual:** an attacker who can set that env var can still redirect; the
-pre-production testing use case requires keeping some escape hatch.
+**Status: Accepted.** Endpoint resolution is delegated to the AWS SDK, so this
+tool has no endpoint settings of its own and applies no host allowlist. Three
+reasons that is the right call rather than a gap:
+
+Every client here has always behaved this way. Secrets Manager, IAM, S3, STS,
+CloudTrail and CloudWatch Logs are ordinary boto3 clients and honour SDK
+endpoint configuration. A previous allowlist covered only `bedrock-agent`,
+whose request bodies carry secret *ARNs*, and left unguarded the Secrets
+Manager path — whose signed `GetSecretValue` can be replayed for AS-1 itself.
+The control protected the less sensitive path and misrepresented the rest.
+
+For the `~/.aws/config` vector the capability is already inside the boundary: a
+**TA-1** who can write that file can set `credential_process`, `role_arn` or
+`source_profile` and take over the credential chain outright, which is strictly
+more powerful than redirecting an endpoint.
+
+Suppressing SDK configuration (`ignore_configured_endpoint_urls`) would break
+FIPS endpoints, VPC endpoints and pre-production testing, and would make this
+sample model behaviour no other AWS tool exhibits.
+
+**Residual:** an inherited environment variable in CI redirects signed requests
+for every service, and nothing in the tool detects it. `setup` prints the
+resolved endpoint alongside the profile and caller ARN before its first write,
+so the redirection is visible in the run's own output, but that is detection
+rather than prevention. Operators who need prevention should constrain the
+environment the tool runs in.
 
 ### T-02 — Teardown destroys resources the tool did not create
 **High · Denial of service · TB-4 · AS-7**
@@ -732,7 +750,7 @@ half-provisioned run to clean up by hand.
 
 | ID | Threat | Priority | Status |
 |---|---|---|---|
-| T-01 | Endpoint override exfiltrates signed credentials | High | Mitigated |
+| T-01 | SDK endpoint config exfiltrates signed credentials | High | Accepted |
 | T-02 | Teardown destroys adopted resources | High | Mitigated |
 | T-03 | Name collision clobbers another workload | High | Mitigated |
 | T-04 | Orphaned Sites.Selected granter app | High | Mitigated |
@@ -803,7 +821,9 @@ Security-relevant behaviors that this model depends on:
   T-24.
 - `config.resolve_connector` → `_validate_derived_name_inputs` — the single
   choke point behind T-26.
-- `core/signed_client.validate_endpoint` — the allowlist behind T-01.
+- `diagnostics.describe_endpoints` — the pre-write endpoint report behind T-01.
+  It compares each resolved endpoint against botocore's own region-derived
+  default, so it catches a service-specific override as well as a global one.
 - `core/state.ConnectorState.is_tool_owned` — the teardown gate behind T-02, and
   the reason its default-`True` behavior is a documented residual there.
 - `setup._delete_granter_app` — the `finally` cleanup behind T-04.

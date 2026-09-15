@@ -593,16 +593,23 @@ error when the knowledge base is created or when a crawl first reads the
 secret, not as a configuration error at startup — the tool cannot tell in
 advance whether a key policy will admit a role that does not exist yet.
 
-### Endpoint overrides are constrained
+### Endpoints come from your AWS configuration
 
-`endpoint_url` / `runtime_endpoint_url` (and their `KB_CONNECTOR_*` environment
-equivalents) exist for testing against pre-production endpoints. Every request
-this tool sends is SigV4-signed with your live AWS credentials, so the
-destination is a security boundary: a non-AWS host would receive a valid,
-replayable `Authorization` header along with the request body. Overrides are
-therefore restricted to `https://` on AWS-owned domains. Pointing elsewhere
-requires setting `KB_CONNECTOR_ALLOW_INSECURE_ENDPOINT=1`, which also prints a
-warning on every run. Don't set it in a shell profile or CI config.
+The tool has no endpoint settings of its own. Every call resolves the endpoint
+the way any AWS SDK client does — from the region, and from the standard SDK
+configuration if you have set it: `AWS_ENDPOINT_URL`,
+`AWS_ENDPOINT_URL_BEDROCK_AGENT`, or `endpoint_url` in your `~/.aws/config`
+profile. That is what makes FIPS endpoints, VPC endpoints, and pre-production
+testing work without this tool inventing a parallel mechanism.
+
+Worth understanding what that means: every request carries a SigV4 signature
+computed from your live credentials, so whatever host the SDK resolves receives
+a replayable `Authorization` header along with the request body. That is true
+of every client here, not just Bedrock — including Secrets Manager, whose
+signed `GetSecretValue` is the one that would expose the connector's source
+credentials. Treat your SDK endpoint configuration as security-relevant, and
+don't set a global `AWS_ENDPOINT_URL` in a shell profile or CI config for
+reasons you can't name.
 
 ### What the caller needs
 

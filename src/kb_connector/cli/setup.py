@@ -20,6 +20,7 @@ from getpass import getpass
 from typing import Any
 
 from kb_connector.core import state as state_mod
+from kb_connector.core.diagnostics import describe_endpoints
 
 from kb_connector.core.config import ConnectorConfig, load_config
 from kb_connector.core.errors import AwsError, ConfigError, ConnectorError, StateError
@@ -142,6 +143,8 @@ def _aws_session_and_account(cfg: ConnectorConfig) -> tuple[Any, str]:
     session = boto3.Session(region_name=cfg.region, profile_name=cfg.profile)
     caller = session.client("sts").get_caller_identity()
     print(f"  AWS caller: {caller['Arn']}")
+    for line in describe_endpoints(session, cfg.region):
+        print(f"  {line}")
     return session, caller["Account"]
 
 
@@ -496,13 +499,7 @@ def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
 def _build_target(cfg: ConnectorConfig, session):
     """Construct the control-plane target for this connector's config."""
     from kb_connector.targets import get_target
-    return get_target(
-        "bmkb",
-        session=session,
-        region=cfg.region,
-        buildtime_endpoint=cfg.endpoint_url,
-        runtime_endpoint=cfg.runtime_endpoint_url,
-    )
+    return get_target("bmkb", session=session, region=cfg.region)
 
 
 def _provision_kb_and_ds(

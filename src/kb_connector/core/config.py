@@ -30,8 +30,6 @@ _ENV_VARS = {
     "AWS_REGION": "region",
     "AWS_PROFILE": "profile",
     "AZURE_TENANT_ID": "tenant_id",
-    "KB_CONNECTOR_ENDPOINT_URL": "endpoint_url",
-    "KB_CONNECTOR_RUNTIME_ENDPOINT_URL": "runtime_endpoint_url",
 }
 
 
@@ -71,10 +69,6 @@ class ConnectorConfig:
     # Exists for accounts running this tool more than once: two teams can use
     # the same connector name without colliding on `kb-connector-<name>-role`.
     resource_prefix: str | None = None
-
-    # Optional bedrock-agent endpoint overrides
-    endpoint_url: str | None = None
-    runtime_endpoint_url: str | None = None
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a value from the raw connector config."""
@@ -162,8 +156,6 @@ class ToolConfig:
             tags=_merge_tags(defaults, connector_raw),
             kms_key_arn=pick("kms_key_arn"),
             resource_prefix=pick("resource_prefix"),
-            endpoint_url=pick("endpoint_url"),
-            runtime_endpoint_url=pick("runtime_endpoint_url"),
         )
 
 

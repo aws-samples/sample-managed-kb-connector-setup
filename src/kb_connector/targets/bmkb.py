@@ -26,16 +26,12 @@ class BmkbTarget(Target):
         *,
         session: Any,
         region: str,
-        buildtime_endpoint: str | None = None,
-        runtime_endpoint: str | None = None,
     ) -> None:
         self._region = region
-        buildtime = buildtime_endpoint or _PUBLIC_BUILDTIME.format(region=region)
-        runtime = runtime_endpoint or _PUBLIC_RUNTIME.format(region=region)
         self._client = SignedClient(
             session=session,
-            buildtime_endpoint=buildtime,
-            runtime_endpoint=runtime,
+            buildtime_endpoint=_PUBLIC_BUILDTIME.format(region=region),
+            runtime_endpoint=_PUBLIC_RUNTIME.format(region=region),
             region=region,
         )
 
