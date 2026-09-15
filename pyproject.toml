@@ -37,19 +37,14 @@ dependencies = [
     # about what a resolver is allowed to install, and a fresh install with a
     # constraints file or an old distro base image will land exactly on it.
     #
-    # cryptography>=42.0.4  CVE-2024-26130, a NULL-pointer dereference in
-    #                       pkcs12.serialize_key_and_certificates — the exact
-    #                       call in providers/microsoft/certs.py. Not reachable
-    #                       as we use it (it needs a mismatched key/cert pair
-    #                       plus an hmac_hash override, and we pass a matching
-    #                       pair with no override), but the floor should not
-    #                       admit it. 42.0.4 also covers CVE-2024-0727, another
-    #                       PKCS12 parsing defect.
-    # requests>=2.32.4      CVE-2024-35195 (a Session stops verifying certs
-    #                       after one verify=False request) and CVE-2024-47081
-    #                       (.netrc credential leak via crafted URLs).
-    "cryptography>=42.0.4",
-    "requests>=2.32.4",
+    # The CI floors audit reports which advisory forces each number, so it is
+    # not repeated here. Worth recording is only what that audit cannot tell
+    # you: of the cryptography advisories below this floor, just the
+    # statically-linked OpenSSL ones are on a path we use. We sign a JWT client
+    # assertion (RSA) and build PKCS12 bundles; we do no X.509 chain
+    # verification, no ECDH and no PKCS#7 decryption.
+    "cryptography>=50.0.0",
+    "requests>=2.33.0",
     "tomli-w>=1.0",
 ]
 
@@ -60,7 +55,7 @@ Issues = "https://github.com/aws-samples/sample-managed-kb-connector-setup/issue
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-cov>=5.0",
     "pyflakes>=3.2",
     "mypy>=1.8",
