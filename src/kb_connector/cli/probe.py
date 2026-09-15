@@ -41,6 +41,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--kb-role-name", default="kb-connector-probe-role",
                         help="Role name for --create-kb-role")
     parser.add_argument("--kb-name", default="kb-connector-probe", help="Name for new KB")
+    parser.add_argument("--kms-key-arn",
+                        help="Encrypt the new KB with this customer-managed key")
     parser.add_argument("--ds-name", default="probe-ds", help="Data source name")
     parser.add_argument("--ingest", action="store_true", help="Start + poll ingestion")
     parser.add_argument("--retrieve-query", help="Run a retrieve with this query")
@@ -86,6 +88,7 @@ def _run_probe(args: argparse.Namespace) -> int:
         kb_role_arn=args.kb_role_arn,
         kb_role_name=args.kb_role_name,
         kb_name=args.kb_name,
+        kms_key_arn=args.kms_key_arn,
         data_source_name=args.ds_name,
         ingest=args.ingest,
         poll_interval_seconds=args.poll_interval,

@@ -176,9 +176,27 @@ def _validate_derived_name_inputs(
     """
     from kb_connector.core.errors import ConfigError, ConnectorError
     from kb_connector.core.identifiers import (
+        validate_arn,
         validate_name_component,
         validate_s3_key_prefix,
     )
+
+    # kms_key_arn is interpolated straight into the Resource of the KB role's
+    # KMS statement. Checked as a KMS ARN specifically, so an ARN for some other
+    # service cannot pass just because it parses; and rejected outright if it
+    # carries an IAM wildcard, since `key/*` would grant the role every key in
+    # the account rather than the one the connector needs.
+    kms_key_arn = connector_raw.get("kms_key_arn") or defaults.get("kms_key_arn")
+    if kms_key_arn is not None:
+        try:
+            checked = validate_arn(kms_key_arn, field="kms_key_arn", service="kms")
+        except ConnectorError as exc:
+            raise ConfigError(str(exc)) from exc
+        if "*" in checked or "?" in checked:
+            raise ConfigError(
+                f"kms_key_arn {kms_key_arn!r} contains an IAM wildcard. Give the "
+                f"ARN of the single key this connector should use."
+            )
 
     checks: list[tuple[str, object, bool]] = [
         (f"connector name {name!r}", name, False),

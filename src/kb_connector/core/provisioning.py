@@ -587,19 +587,26 @@ def build_inline_policy(
 
     if kms_key_arn:
         # Scoped to the one key, and further narrowed by ViaService so the
-        # grant only works when the request arrives through Secrets Manager or
-        # S3 — not as a standalone Decrypt call.
+        # grant only works when the request arrives through one of the three
+        # services that legitimately touch the key — never as a standalone
+        # Decrypt call.
+        #
+        # Bedrock is on that list because the key also encrypts the knowledge
+        # base itself, and GenerateDataKey is required for it: Decrypt alone
+        # covers reading an encrypted secret, but encrypting the knowledge base
+        # needs the write side of the key too.
         statements.append(
             {
                 "Sid": "KmsDecryptStatement",
                 "Effect": "Allow",
-                "Action": ["kms:Decrypt", "kms:DescribeKey"],
+                "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"],
                 "Resource": [kms_key_arn],
                 "Condition": {
                     "StringEquals": {
                         "kms:ViaService": [
                             f"secretsmanager.{region}.amazonaws.com",
                             f"s3.{region}.amazonaws.com",
+                            f"bedrock.{region}.amazonaws.com",
                         ]
                     }
                 },

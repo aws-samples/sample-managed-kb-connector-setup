@@ -62,6 +62,7 @@ class ProbeArgs:
     kb_role_arn: str | None = None
     kb_role_name: str = "kb-connector-probe-role"
     kb_name: str = "kb-connector-probe"
+    kms_key_arn: str | None = None
     data_source_name: str = "probe-ds"
     ingest: bool = False
     poll_interval_seconds: int = 10
@@ -290,6 +291,7 @@ def _resolve_kb(args, target, session, region, secret_arn, out_dir, events) -> s
             cert_key_prefix=args.cert_s3_key_prefix,
             connector_name=_PROBE_OWNER,
             adopt_existing=args.adopt_existing,
+            kms_key_arn=args.kms_key_arn,
         )
         kb_role_arn = role_res.arn
         events.append(
@@ -299,7 +301,9 @@ def _resolve_kb(args, target, session, region, secret_arn, out_dir, events) -> s
     if not kb_role_arn:
         raise ConnectorError("create_kb requires kb_role_arn or create_kb_role.")
 
-    created = target.create_knowledge_base(name=args.kb_name, role_arn=kb_role_arn)
+    created = target.create_knowledge_base(
+        name=args.kb_name, role_arn=kb_role_arn, kms_key_arn=args.kms_key_arn
+    )
     kb_id = _extract_id(created, "knowledgeBase", "knowledgeBaseId")
     target.wait_until_kb_active(kb_id)
     events.append(_Event("create-knowledge-base", True, detail=f"kb={kb_id}"))

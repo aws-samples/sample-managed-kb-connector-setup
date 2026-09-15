@@ -654,6 +654,34 @@ def test_inline_policy_adds_scoped_kms_decrypt_when_cmk_used():
     # ViaService keeps this from being a standalone Decrypt grant.
     via = kms[0]["Condition"]["StringEquals"]["kms:ViaService"]
     assert any("secretsmanager" in v for v in via)
+    # The key also encrypts the knowledge base, so Bedrock has to be able to
+    # reach it, and encrypting needs the write side of the key.
+    assert "bedrock.us-east-1.amazonaws.com" in via
+    assert "kms:GenerateDataKey" in kms[0]["Action"]
+
+
+def test_inline_policy_kms_grant_stays_narrow():
+    """The grant must not widen beyond the three services that use the key."""
+    policy = build_inline_policy(
+        account_id="111122223333",
+        region="us-east-1",
+        secret_arn="arn:aws:secretsmanager:us-east-1:111122223333:secret:s",
+        cert_bucket=None,
+        cert_key=None,
+        kms_key_arn="arn:aws:kms:us-east-1:111122223333:key/abc",
+    )
+    kms = [s for s in policy["Statement"] if s["Sid"] == "KmsDecryptStatement"][0]
+    assert set(kms["Condition"]["StringEquals"]["kms:ViaService"]) == {
+        "secretsmanager.us-east-1.amazonaws.com",
+        "s3.us-east-1.amazonaws.com",
+        "bedrock.us-east-1.amazonaws.com",
+    }
+    # No kms:* and no re-encrypt or key-management actions.
+    assert set(kms["Action"]) == {
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+    }
 
 
 def test_inline_policy_omits_kms_without_cmk():
@@ -665,6 +693,44 @@ def test_inline_policy_omits_kms_without_cmk():
         cert_key=None,
     )
     assert not [s for s in policy["Statement"] if s["Sid"] == "KmsDecryptStatement"]
+
+
+# --- T-26: kms_key_arn reaches a policy Resource, so it is shape-checked -----
+
+
+def _config_with_kms(tmp_path, value):
+    """Write a minimal config carrying the given kms_key_arn."""
+    path = tmp_path / "kb-connector.toml"
+    path.write_text(
+        '[defaults]\nregion = "us-west-2"\n'
+        f'kms_key_arn = "{value}"\n\n'
+        "[connectors.eng]\n"
+        'type = "sharepoint"\n'
+        'tenant_id = "11111111-1111-1111-1111-111111111111"\n'
+    )
+    return path
+
+
+@pytest.mark.parametrize("value", [
+    "*",
+    "arn:aws:kms:us-east-1:111122223333:key/*",
+    "arn:aws:kms:us-east-1:111122223333:key/ab?",
+    "arn:aws:s3:::not-a-kms-arn",
+    "not-an-arn",
+])
+def test_kms_key_arn_rejected_before_it_reaches_a_policy(tmp_path, value):
+    """A wildcard or wrong-service ARN here would widen the KB role's KMS grant."""
+    config = _config_with_kms(tmp_path, value)
+    with pytest.raises(ConfigError):
+        load_config(str(config)).resolve_connector("eng")
+
+
+def test_kms_key_arn_accepts_a_single_key():
+    """The legitimate shape still resolves."""
+    from kb_connector.core.identifiers import validate_arn
+
+    arn = "arn:aws:kms:us-east-1:111122223333:key/abc-123"
+    assert validate_arn(arn, field="kms_key_arn", service="kms") == arn
 
 
 def test_secret_grant_is_read_only_and_single_resource():
