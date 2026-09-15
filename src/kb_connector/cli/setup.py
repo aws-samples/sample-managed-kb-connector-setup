@@ -538,7 +538,11 @@ def _provision_kb_and_ds(
                 "No KB role available. Provide --kb-role-arn or let the tool create one."
             )
         kb_name = args.kb_name or f"kb-connector-{connector_name}"
-        created = target.create_knowledge_base(name=kb_name, role_arn=kb_role_arn)
+        created = target.create_knowledge_base(
+            name=kb_name,
+            role_arn=kb_role_arn,
+            kms_key_arn=getattr(args, "kms_key_arn", None) or cfg.kms_key_arn,
+        )
         kb_obj = created.get("knowledgeBase", created)
         kb_id = kb_obj.get("knowledgeBaseId") or kb_obj.get("id")
         print(f"  Created knowledge base: {kb_id}")

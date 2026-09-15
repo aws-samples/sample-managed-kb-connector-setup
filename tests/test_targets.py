@@ -197,13 +197,18 @@ def test_create_knowledge_base_passes_embedding_model_when_given():
     assert managed["embeddingModelArn"] == "arn:aws:bedrock:::foundation-model/titan"
 
 
-def test_create_knowledge_base_passes_kms_key_at_top_level():
+def test_create_knowledge_base_encrypts_with_customer_managed_key():
+    """A KMS key reaches the managed config block, not the request top level."""
     target = _bmkb(buildtime=[{}])
     target.create_knowledge_base(
         name="kb", role_arn="arn:role", kms_key_arn="arn:aws:kms:::key/k1"
     )
     _, _, body = target._client.calls[0]
-    assert body["kmsKeyArn"] == "arn:aws:kms:::key/k1"
+    managed = body["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
+    assert managed["serverSideEncryptionConfiguration"] == {
+        "kmsKeyArn": "arn:aws:kms:::key/k1"
+    }
+    assert "kmsKeyArn" not in body
 
 
 def test_get_knowledge_base_returns_response():

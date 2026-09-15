@@ -114,8 +114,9 @@ Other gaps worth knowing about:
 - **Knowledge base** creation uses the service-default embedding model and
   chunking strategy. There's no way to pick a specific embedder or override
   chunk size, overlap, or chunking type yet.
-- **Server-side encryption** (KMS key) on the data source and knowledge
-  base is not exposed.
+- **Server-side encryption** (KMS key) on the data source is not exposed.
+  `--kms-key-arn` covers the knowledge base, the connector secret, and the
+  certificate bucket.
 
 The current shape of the tool is "set up the connector with sensible
 defaults and run". To run a tuned ingest with custom filtering, the path

@@ -168,13 +168,21 @@ def test_build_kb_payload_minimal():
 
 
 def test_build_kb_payload_with_kms():
-    """KB payload includes kmsKeyArn when provided."""
+    """A customer-managed key encrypts the KB via the managed config block.
+
+    CreateKnowledgeBase has no top-level key field, so a kmsKeyArn placed there
+    is rejected by the service model.
+    """
     payload = build_knowledge_base_payload(
         name="test-kb",
         role_arn="arn:aws:iam::123456789012:role/test-role",
         kms_key_arn="arn:aws:kms:us-west-2:123456789012:key/abc-123",
     )
-    assert payload["kmsKeyArn"] == "arn:aws:kms:us-west-2:123456789012:key/abc-123"
+    managed = payload["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
+    assert managed["serverSideEncryptionConfiguration"] == {
+        "kmsKeyArn": "arn:aws:kms:us-west-2:123456789012:key/abc-123"
+    }
+    assert "kmsKeyArn" not in payload
 
 
 def test_build_ds_payload():
@@ -260,6 +268,43 @@ def test_kb_payload_matches_the_create_knowledge_base_model():
     assert body["name"] == "kb-connector-eng"
     assert body["roleArn"] == "arn:aws:iam::111122223333:role/r"
     assert body["knowledgeBaseConfiguration"]["type"] == "MANAGED"
+
+
+def test_kb_payload_with_kms_key_matches_the_model():
+    """The encryption block is where the model actually accepts a key.
+
+    A top-level kmsKeyArn fails validation outright, so this test is what keeps
+    the builder from drifting back to it.
+    """
+    payload = build_knowledge_base_payload(
+        name="kb",
+        role_arn="arn:aws:iam::111122223333:role/r",
+        kms_key_arn="arn:aws:kms:us-west-2:111122223333:key/abc-123",
+    )
+    _, _, body = _serialize("bedrock-agent", "create_knowledge_base", **payload)
+    managed = body["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
+    assert managed["serverSideEncryptionConfiguration"]["kmsKeyArn"] == (
+        "arn:aws:kms:us-west-2:111122223333:key/abc-123"
+    )
+
+
+def test_top_level_kms_key_is_rejected_by_the_model():
+    """Guards the regression this replaced: the field does not exist there."""
+    import pytest
+    from botocore.exceptions import ParamValidationError
+
+    with pytest.raises(ParamValidationError, match="kmsKeyArn"):
+        _serialize(
+            "bedrock-agent",
+            "create_knowledge_base",
+            name="kb",
+            roleArn="arn:aws:iam::111122223333:role/r",
+            knowledgeBaseConfiguration={
+                "type": "MANAGED",
+                "managedKnowledgeBaseConfiguration": {},
+            },
+            kmsKeyArn="arn:aws:kms:us-west-2:111122223333:key/abc-123",
+        )
 
 
 def test_creates_carry_an_idempotency_token():

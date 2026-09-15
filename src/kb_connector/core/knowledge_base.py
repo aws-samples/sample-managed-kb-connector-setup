@@ -29,13 +29,17 @@ def build_knowledge_base_payload(
     """CreateKnowledgeBase body for a MANAGED knowledge base.
 
     When embedding_model_arn is omitted, the service picks its own default
-    (managed embedding). When kms_key_arn is provided, it's set at the top
-    level as kmsKeyArn.
+    (managed embedding). A customer-managed kms_key_arn encrypts the knowledge
+    base through managedKnowledgeBaseConfiguration.
+    serverSideEncryptionConfiguration; CreateKnowledgeBase has no top-level
+    key field, so this is the only place it belongs.
     """
     config: dict = {}
     if embedding_model_arn:
         config["embeddingModelArn"] = embedding_model_arn
-    body: dict = {
+    if kms_key_arn:
+        config["serverSideEncryptionConfiguration"] = {"kmsKeyArn": kms_key_arn}
+    return {
         "name": name,
         "roleArn": role_arn,
         "knowledgeBaseConfiguration": {
@@ -43,9 +47,6 @@ def build_knowledge_base_payload(
             "managedKnowledgeBaseConfiguration": config,
         },
     }
-    if kms_key_arn:
-        body["kmsKeyArn"] = kms_key_arn
-    return body
 
 
 def build_data_source_payload(
