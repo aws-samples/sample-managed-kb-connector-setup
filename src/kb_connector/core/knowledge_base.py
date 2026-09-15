@@ -1,7 +1,9 @@
 """KB + data source create/get/update/delete operations.
 
-Uses the SigV4 signed client to drive KB lifecycle calls. Payload construction
-is separated from the API calls so shapes can be unit-tested without AWS access.
+Payload construction is separated from the calls that send it, so request
+shapes can be unit-tested without AWS access. The waiters below poll through
+the Target interface rather than a client, which keeps them independent of
+how a target reaches AWS.
 
 ACL field handling: `aclEnabled` at the connectorParameters top level is the
 toggle for document-level access control. `crawlIdentities` is set to the same
@@ -11,9 +13,9 @@ value so identity crawling stays consistent with the ACL setting.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from kb_connector.core.errors import AwsError
-from kb_connector.core.signed_client import SignedClient
 
 
 # --- Payload builders --------------------------------------------------------
@@ -71,44 +73,6 @@ def build_data_source_payload(
     }
 
 
-# --- API calls ---------------------------------------------------------------
-
-
-def create_knowledge_base(client: SignedClient, payload: dict) -> dict:
-    """PUT a new knowledge base; returns the created KB object."""
-    return client.buildtime("PUT", "/knowledgebases/", payload)
-
-
-def get_knowledge_base(client: SignedClient, kb_id: str) -> dict:
-    """GET a knowledge base by ID."""
-    return client.buildtime("GET", f"/knowledgebases/{kb_id}")
-
-
-def create_data_source(client: SignedClient, kb_id: str, payload: dict) -> dict:
-    """PUT a new data source under a knowledge base."""
-    return client.buildtime("PUT", f"/knowledgebases/{kb_id}/datasources", payload)
-
-
-def get_data_source(client: SignedClient, kb_id: str, ds_id: str) -> dict:
-    """GET a data source by KB + DS ID."""
-    return client.buildtime("GET", f"/knowledgebases/{kb_id}/datasources/{ds_id}")
-
-
-def start_ingestion_job(client: SignedClient, kb_id: str, ds_id: str) -> dict:
-    """PUT to start an ingestion job."""
-    return client.buildtime(
-        "PUT", f"/knowledgebases/{kb_id}/datasources/{ds_id}/ingestionjobs"
-    )
-
-
-def get_ingestion_job(client: SignedClient, kb_id: str, ds_id: str, job_id: str) -> dict:
-    """GET an ingestion job by ID."""
-    return client.buildtime(
-        "GET",
-        f"/knowledgebases/{kb_id}/datasources/{ds_id}/ingestionjobs/{job_id}",
-    )
-
-
 # --- Waiters -----------------------------------------------------------------
 
 
@@ -117,7 +81,7 @@ _DS_TERMINAL_BAD = {"DELETE_UNSUCCESSFUL", "FAILED"}
 
 
 def wait_until_kb_active(
-    client: SignedClient,
+    target: Any,
     kb_id: str,
     *,
     poll_interval_seconds: int = 5,
@@ -132,7 +96,7 @@ def wait_until_kb_active(
     deadline = time.time() + timeout_seconds
     last_status: str = ""
     while time.time() < deadline:
-        resp = get_knowledge_base(client, kb_id)
+        resp = target.get_knowledge_base(kb_id)
         kb = resp.get("knowledgeBase", resp)
         status = (kb.get("status") or "").upper()
         last_status = status
@@ -152,7 +116,7 @@ def wait_until_kb_active(
 
 
 def wait_until_ds_available(
-    client: SignedClient,
+    target: Any,
     kb_id: str,
     ds_id: str,
     *,
@@ -168,7 +132,7 @@ def wait_until_ds_available(
     deadline = time.time() + timeout_seconds
     last_status: str = ""
     while time.time() < deadline:
-        resp = get_data_source(client, kb_id, ds_id)
+        resp = target.get_data_source(kb_id, ds_id)
         ds = resp.get("dataSource", resp)
         status = (ds.get("status") or "").upper()
         last_status = status

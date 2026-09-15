@@ -22,9 +22,9 @@ from kb_connector.core.errors import ConnectorError
 
 
 def _fake_target_with_jobs(jobs: list[dict]) -> MagicMock:
-    """Build a fake target whose client.buildtime returns the given job list."""
+    """Build a fake target whose ListIngestionJobs returns the given jobs."""
     target = MagicMock()
-    target.client.buildtime.return_value = {"ingestionJobSummaries": jobs}
+    target.list_ingestion_jobs.return_value = {"ingestionJobSummaries": jobs}
     return target
 
 
@@ -63,7 +63,7 @@ def test_find_active_returns_none_on_no_jobs():
 def test_find_active_handles_lookup_error():
     """A failed list call shouldn't block teardown — return None and let it proceed."""
     target = MagicMock()
-    target.client.buildtime.side_effect = RuntimeError("network down")
+    target.list_ingestion_jobs.side_effect = RuntimeError("network down")
     with patch("kb_connector.targets.get_target", return_value=target):
         assert _find_active_ingestion_job(
             session=MagicMock(), region="us-west-2",
@@ -85,24 +85,22 @@ def test_terminal_states_set_includes_expected_values():
 def test_stop_and_wait_returns_when_terminal_observed(monkeypatch):
     """Once GET reports a terminal state, the polling loop returns."""
     target = MagicMock()
-    target.client.buildtime.side_effect = [
-        None,  # POST stop
-        {"ingestionJob": {"status": "STOPPED"}},  # GET status
-    ]
+    target.stop_ingestion_job.return_value = None
+    target.get_ingestion_job.return_value = {"ingestionJob": {"status": "STOPPED"}}
     monkeypatch.setattr("kb_connector.targets.get_target", lambda *a, **kw: target)
     monkeypatch.setattr("time.sleep", lambda _: None)
     _stop_and_wait_for_terminal(
         session=MagicMock(), region="us-west-2",
         kb_id="kb-1", ds_id="ds-1", job_id="JOB-1",
     )
-    # Should have made two calls (POST stop, GET status)
-    assert target.client.buildtime.call_count == 2
+    assert target.stop_ingestion_job.call_count == 1
+    assert target.get_ingestion_job.call_count == 1
 
 
 def test_stop_and_wait_proceeds_on_stop_failure(monkeypatch):
     """If StopIngestionJob fails, log and proceed — don't raise."""
     target = MagicMock()
-    target.client.buildtime.side_effect = RuntimeError("boom")
+    target.stop_ingestion_job.side_effect = RuntimeError("boom")
     monkeypatch.setattr("kb_connector.targets.get_target", lambda *a, **kw: target)
     # Should not raise
     _stop_and_wait_for_terminal(

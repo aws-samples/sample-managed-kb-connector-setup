@@ -1,7 +1,8 @@
 """Bedrock Agent API target (managed Knowledge Bases).
 
-Implements the Target interface against the bedrock-agent control plane,
-using the SigV4-signed client and the payload builders from core.knowledge_base.
+Implements the Target interface against the bedrock-agent control plane and the
+bedrock-agent-runtime data plane, using the payload builders from
+core.knowledge_base.
 """
 
 from __future__ import annotations
@@ -9,11 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from kb_connector.core import knowledge_base as kb
-from kb_connector.core.signed_client import SignedClient
 from kb_connector.targets.base import Target
-
-_PUBLIC_BUILDTIME = "https://bedrock-agent.{region}.amazonaws.com"
-_PUBLIC_RUNTIME = "https://bedrock-agent-runtime.{region}.amazonaws.com"
 
 
 class BmkbTarget(Target):
@@ -21,24 +18,13 @@ class BmkbTarget(Target):
 
     name = "bmkb"
 
-    def __init__(
-        self,
-        *,
-        session: Any,
-        region: str,
-    ) -> None:
+    def __init__(self, *, session: Any, region: str) -> None:
         self._region = region
-        self._client = SignedClient(
-            session=session,
-            buildtime_endpoint=_PUBLIC_BUILDTIME.format(region=region),
-            runtime_endpoint=_PUBLIC_RUNTIME.format(region=region),
-            region=region,
-        )
-
-    @property
-    def client(self) -> SignedClient:
-        """Expose the signed client for advanced/raw calls (e.g. probe)."""
-        return self._client
+        # Two clients because the control plane and the retrieve path are two
+        # services. Endpoints resolve from the session and the SDK's own
+        # configuration; this target has no endpoint settings of its own.
+        self._client = session.client("bedrock-agent", region_name=region)
+        self._runtime = session.client("bedrock-agent-runtime", region_name=region)
 
     # --- Knowledge base ------------------------------------------------------
 
@@ -56,22 +42,22 @@ class BmkbTarget(Target):
             embedding_model_arn=embedding_model_arn,
             kms_key_arn=kms_key_arn,
         )
-        return kb.create_knowledge_base(self._client, payload)
+        return self._client.create_knowledge_base(**payload)
 
     def get_knowledge_base(self, kb_id: str) -> dict:
-        return kb.get_knowledge_base(self._client, kb_id)
+        return self._client.get_knowledge_base(knowledgeBaseId=kb_id)
 
     def wait_until_kb_active(
         self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 300
     ) -> str:
         return kb.wait_until_kb_active(
-            self._client, kb_id,
+            self, kb_id,
             poll_interval_seconds=poll_interval_seconds,
             timeout_seconds=timeout_seconds,
         )
 
     def delete_knowledge_base(self, kb_id: str) -> None:
-        self._client.buildtime("DELETE", f"/knowledgebases/{kb_id}")
+        self._client.delete_knowledge_base(knowledgeBaseId=kb_id)
 
     # --- Data source ---------------------------------------------------------
 
@@ -81,34 +67,50 @@ class BmkbTarget(Target):
         payload = kb.build_data_source_payload(
             name=name, connector_parameters=connector_parameters
         )
-        return kb.create_data_source(self._client, kb_id, payload)
+        return self.create_data_source_raw(kb_id, payload)
 
     def create_data_source_raw(self, kb_id: str, payload: dict) -> dict:
         """Create a DS with a fully-formed payload (for non-managed shapes like S3)."""
-        return kb.create_data_source(self._client, kb_id, payload)
+        return self._client.create_data_source(knowledgeBaseId=kb_id, **payload)
 
     def get_data_source(self, kb_id: str, ds_id: str) -> dict:
-        return kb.get_data_source(self._client, kb_id, ds_id)
+        return self._client.get_data_source(
+            knowledgeBaseId=kb_id, dataSourceId=ds_id
+        )
 
     def wait_until_ds_available(
         self, kb_id: str, ds_id: str, *, poll_interval_seconds: int = 3, timeout_seconds: int = 120
     ) -> str:
         return kb.wait_until_ds_available(
-            self._client, kb_id, ds_id,
+            self, kb_id, ds_id,
             poll_interval_seconds=poll_interval_seconds,
             timeout_seconds=timeout_seconds,
         )
 
     def delete_data_source(self, kb_id: str, ds_id: str) -> None:
-        self._client.buildtime("DELETE", f"/knowledgebases/{kb_id}/datasources/{ds_id}")
+        self._client.delete_data_source(knowledgeBaseId=kb_id, dataSourceId=ds_id)
 
     # --- Ingestion -----------------------------------------------------------
 
     def start_ingestion_job(self, kb_id: str, ds_id: str) -> dict:
-        return kb.start_ingestion_job(self._client, kb_id, ds_id)
+        return self._client.start_ingestion_job(
+            knowledgeBaseId=kb_id, dataSourceId=ds_id
+        )
 
     def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
-        return kb.get_ingestion_job(self._client, kb_id, ds_id, job_id)
+        return self._client.get_ingestion_job(
+            knowledgeBaseId=kb_id, dataSourceId=ds_id, ingestionJobId=job_id
+        )
+
+    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+        return self._client.list_ingestion_jobs(
+            knowledgeBaseId=kb_id, dataSourceId=ds_id, maxResults=max_results
+        )
+
+    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+        return self._client.stop_ingestion_job(
+            knowledgeBaseId=kb_id, dataSourceId=ds_id, ingestionJobId=job_id
+        )
 
     # --- Retrieve ------------------------------------------------------------
 
@@ -120,18 +122,21 @@ class BmkbTarget(Target):
         user_id: str | None = None,
         filter: dict | None = None,
     ) -> dict:
-        body: dict = {"retrievalQuery": {"text": query}}
+        request: dict = {
+            "knowledgeBaseId": kb_id,
+            "retrievalQuery": {"text": query},
+        }
         if user_id:
             # Top-level userContext for ACL-aware retrieval. Per the Bedrock
             # managed-KB docs the userId is the user's universal email
             # address associated with the underlying data source.
-            body["userContext"] = {"userId": user_id}
+            request["userContext"] = {"userId": user_id}
         if filter:
             # Managed knowledge bases take managedSearchConfiguration. The
             # vectorSearchConfiguration shape used by vector KBs is rejected
             # outright here ("not supported for managed knowledge bases"), so
             # this is not an alias — sending the wrong one fails the call.
-            body["retrievalConfiguration"] = {
+            request["retrievalConfiguration"] = {
                 "managedSearchConfiguration": {"filter": filter}
             }
-        return self._client.runtime("POST", f"/knowledgebases/{kb_id}/retrieve", body)
+        return self._runtime.retrieve(**request)

@@ -73,6 +73,12 @@ class QuickTarget(Target):
     def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
         raise NotImplementedError(_NOT_AVAILABLE)
 
+    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+        raise NotImplementedError(_NOT_AVAILABLE)
+
+    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+        raise NotImplementedError(_NOT_AVAILABLE)
+
     def retrieve(
         self,
         kb_id: str,

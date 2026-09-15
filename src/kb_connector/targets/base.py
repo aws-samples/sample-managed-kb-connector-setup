@@ -86,6 +86,20 @@ class Target(ABC):
         ...
 
     @abstractmethod
+    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+        """List recent ingestion jobs, newest first."""
+        ...
+
+    @abstractmethod
+    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+        """Request that a running ingestion job stop.
+
+        The stop is asynchronous: the job moves to STOPPING and reaches
+        STOPPED on its own.
+        """
+        ...
+
+    @abstractmethod
     def retrieve(
         self,
         kb_id: str,

@@ -358,12 +358,7 @@ def _find_active_ingestion_job(session, region, kb_id, ds_id) -> str | None:
     try:
         # Look at the most recent few jobs only — running jobs are always
         # near the top, and ListIngestionJobs is unfiltered by status.
-        client = target.client
-        resp = client.buildtime(
-            "POST",
-            f"/knowledgebases/{kb_id}/datasources/{ds_id}/ingestionjobs/",
-            {"maxResults": 5},
-        )
+        resp = target.list_ingestion_jobs(kb_id, ds_id, max_results=5)
         for job in resp.get("ingestionJobSummaries", [])[:5]:
             status = (job.get("status") or "").upper()
             if status not in _TERMINAL_INGESTION_STATES:
@@ -397,13 +392,8 @@ def _stop_and_wait_for_terminal(session, region, kb_id, ds_id, job_id) -> None:
     import time
     from kb_connector.targets import get_target
     target = get_target("bmkb", session=session, region=region)
-    client = target.client
     try:
-        client.buildtime(
-            "POST",
-            f"/knowledgebases/{kb_id}/datasources/{ds_id}/ingestionjobs/{job_id}/stop",
-            None,
-        )
+        target.stop_ingestion_job(kb_id, ds_id, job_id)
     except Exception as exc:
         print(f"    (stop request failed: {exc} — proceeding anyway)")
         return
@@ -411,11 +401,7 @@ def _stop_and_wait_for_terminal(session, region, kb_id, ds_id, job_id) -> None:
     deadline = time.time() + 180
     while time.time() < deadline:
         try:
-            resp = client.buildtime(
-                "GET",
-                f"/knowledgebases/{kb_id}/datasources/{ds_id}/ingestionjobs/{job_id}",
-                None,
-            )
+            resp = target.get_ingestion_job(kb_id, ds_id, job_id)
             status = (resp.get("ingestionJob", {}).get("status") or "").upper()
             if status in _TERMINAL_INGESTION_STATES:
                 print(f"    ingestion job reached {status}")

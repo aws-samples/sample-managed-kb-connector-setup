@@ -14,6 +14,9 @@ class _FakeSession:
 
     region_name = "us-west-2"
 
+    def client(self, service_name, **kwargs):
+        return _FakeClient()
+
     def get_credentials(self):
         class _Creds:
             def get_frozen_credentials(self):
@@ -25,32 +28,34 @@ class _FakeSession:
 
 
 class _FakeClient:
-    """Stands in for the transport underneath BmkbTarget.
+    """Stands in for a boto3 client underneath BmkbTarget.
 
-    Returns scripted responses in order and records every call. This class is
-    the only thing in this file that knows how the target reaches AWS; the
-    operation tests below assert behavior, so they hold whatever the transport
-    is.
+    Returns scripted responses in order and records every call as
+    (operation, kwargs). This class is the only thing in this file that knows
+    how the target reaches AWS; the operation tests below assert behavior, so
+    they hold whatever the transport is.
     """
 
-    def __init__(self, buildtime=None, runtime=None):
-        self._buildtime = list(buildtime or [])
-        self._runtime = list(runtime or [])
-        self.calls: list[tuple] = []
+    def __init__(self, responses=None):
+        self._responses = list(responses or [])
+        self.calls: list[tuple[str, dict]] = []
 
-    def buildtime(self, method, path, body=None):
-        self.calls.append((method, path, body))
-        return self._buildtime.pop(0) if self._buildtime else None
+    def __getattr__(self, operation):
+        def call(**kwargs):
+            self.calls.append((operation, kwargs))
+            return self._responses.pop(0) if self._responses else None
 
-    def runtime(self, method, path, body=None):
-        self.calls.append((method, path, body))
-        return self._runtime.pop(0) if self._runtime else None
+        return call
 
 
 def _bmkb(*, buildtime=None, runtime=None):
-    """A BmkbTarget wired to scripted responses instead of AWS."""
+    """A BmkbTarget wired to scripted responses instead of AWS.
+
+    `buildtime` scripts the control-plane client, `runtime` the retrieve path.
+    """
     target = BmkbTarget(session=_FakeSession(), region="us-west-2")
-    target._client = _FakeClient(buildtime=buildtime, runtime=runtime)
+    target._client = _FakeClient(buildtime)
+    target._runtime = _FakeClient(runtime)
     return target
 
 
@@ -96,12 +101,6 @@ def test_quick_raises_not_implemented():
         target.retrieve("kb-1", query="test")
 
 
-def test_bmkb_exposes_client():
-    """The target exposes its client for raw calls (probe uses this)."""
-    target = get_target("bmkb", session=_FakeSession(), region="us-west-2")
-    assert target.client is not None
-
-
 # --- Knowledge base operations -----------------------------------------------
 
 
@@ -117,7 +116,7 @@ def test_create_knowledge_base_omits_embedding_model_unless_given():
     """No embedding model means the service picks its managed default."""
     target = _bmkb(buildtime=[{}])
     target.create_knowledge_base(name="kb", role_arn="arn:role")
-    _, _, body = target._client.calls[0]
+    _, body = target._client.calls[0]
     managed = body["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
     assert managed == {}
     assert body["knowledgeBaseConfiguration"]["type"] == "MANAGED"
@@ -131,7 +130,7 @@ def test_create_knowledge_base_passes_embedding_model_when_given():
         role_arn="arn:role",
         embedding_model_arn="arn:aws:bedrock:::foundation-model/titan",
     )
-    _, _, body = target._client.calls[0]
+    _, body = target._client.calls[0]
     managed = body["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
     assert managed["embeddingModelArn"] == "arn:aws:bedrock:::foundation-model/titan"
 
@@ -142,7 +141,7 @@ def test_create_knowledge_base_encrypts_with_customer_managed_key():
     target.create_knowledge_base(
         name="kb", role_arn="arn:role", kms_key_arn="arn:aws:kms:::key/k1"
     )
-    _, _, body = target._client.calls[0]
+    _, body = target._client.calls[0]
     managed = body["knowledgeBaseConfiguration"]["managedKnowledgeBaseConfiguration"]
     assert managed["serverSideEncryptionConfiguration"] == {
         "kmsKeyArn": "arn:aws:kms:::key/k1"
@@ -232,7 +231,7 @@ def test_create_data_source_wraps_connector_parameters():
         "KB123456789", name="eng-ds", connector_parameters=params
     )
     assert result["dataSource"]["dataSourceId"] == "DS123456789"
-    _, _, body = target._client.calls[0]
+    _, body = target._client.calls[0]
     dsc = body["dataSourceConfiguration"]
     assert dsc["type"] == "MANAGED_KNOWLEDGE_BASE_CONNECTOR"
     assert dsc["managedKnowledgeBaseConnectorConfiguration"][
@@ -244,7 +243,7 @@ def test_create_data_source_omits_chunking_configuration():
     """A managed-embedding KB rejects an explicit chunkingConfiguration."""
     target = _bmkb(buildtime=[{}])
     target.create_data_source("KB123456789", name="ds", connector_parameters={})
-    _, _, body = target._client.calls[0]
+    _, body = target._client.calls[0]
     assert "vectorIngestionConfiguration" not in body
     assert "chunkingConfiguration" not in body
 
@@ -254,8 +253,9 @@ def test_create_data_source_raw_passes_payload_through():
     target = _bmkb(buildtime=[{"dataSource": {}}])
     payload = {"name": "s3-ds", "dataSourceConfiguration": {"type": "S3"}}
     target.create_data_source_raw("KB123456789", payload)
-    _, _, body = target._client.calls[0]
-    assert body == payload
+    _, body = target._client.calls[0]
+    # The payload reaches the API untouched; the KB id rides alongside it.
+    assert body == {"knowledgeBaseId": "KB123456789", **payload}
 
 
 def test_get_data_source_returns_response():
@@ -322,6 +322,63 @@ def test_get_ingestion_job_returns_job():
     assert got["ingestionJob"]["status"] == "COMPLETE"
 
 
+def test_identifiers_map_to_the_right_parameters():
+    """Each operation must put each id in the right parameter.
+
+    Return values alone would not catch this: swapping knowledgeBaseId and
+    dataSourceId still returns the scripted response, so the ids are asserted
+    directly.
+    """
+    kb_id, ds_id, job_id = "KB123456789", "DS123456789", "JOB1"
+    cases = [
+        (lambda t: t.get_knowledge_base(kb_id),
+         "get_knowledge_base", {"knowledgeBaseId": kb_id}),
+        (lambda t: t.delete_knowledge_base(kb_id),
+         "delete_knowledge_base", {"knowledgeBaseId": kb_id}),
+        (lambda t: t.get_data_source(kb_id, ds_id),
+         "get_data_source", {"knowledgeBaseId": kb_id, "dataSourceId": ds_id}),
+        (lambda t: t.delete_data_source(kb_id, ds_id),
+         "delete_data_source", {"knowledgeBaseId": kb_id, "dataSourceId": ds_id}),
+        (lambda t: t.start_ingestion_job(kb_id, ds_id),
+         "start_ingestion_job", {"knowledgeBaseId": kb_id, "dataSourceId": ds_id}),
+        (lambda t: t.get_ingestion_job(kb_id, ds_id, job_id),
+         "get_ingestion_job",
+         {"knowledgeBaseId": kb_id, "dataSourceId": ds_id, "ingestionJobId": job_id}),
+        (lambda t: t.stop_ingestion_job(kb_id, ds_id, job_id),
+         "stop_ingestion_job",
+         {"knowledgeBaseId": kb_id, "dataSourceId": ds_id, "ingestionJobId": job_id}),
+    ]
+    for invoke, want_operation, want_kwargs in cases:
+        target = _bmkb(buildtime=[{}])
+        invoke(target)
+        assert target._client.calls == [(want_operation, want_kwargs)]
+
+
+def test_retrieve_identifies_the_knowledge_base():
+    target = _bmkb(runtime=[{"retrievalResults": []}])
+    target.retrieve("KB123456789", query="q")
+    operation, body = target._runtime.calls[0]
+    assert operation == "retrieve"
+    assert body["knowledgeBaseId"] == "KB123456789"
+
+
+def test_list_ingestion_jobs_passes_max_results():
+    """Teardown's precheck reads only the newest few jobs."""
+    target = _bmkb(buildtime=[{"ingestionJobSummaries": [{"status": "COMPLETE"}]}])
+    got = target.list_ingestion_jobs("KB123456789", "DS123456789", max_results=5)
+    assert got["ingestionJobSummaries"] == [{"status": "COMPLETE"}]
+    _, body = target._client.calls[0]
+    assert body["maxResults"] == 5
+
+
+def test_stop_ingestion_job_targets_the_job():
+    target = _bmkb(buildtime=[{"ingestionJob": {"status": "STOPPING"}}])
+    target.stop_ingestion_job("KB123456789", "DS123456789", "JOB1")
+    operation, body = target._client.calls[0]
+    assert operation == "stop_ingestion_job"
+    assert body["ingestionJobId"] == "JOB1"
+
+
 # --- Retrieve and the ACL contract -------------------------------------------
 
 
@@ -329,7 +386,7 @@ def test_retrieve_sends_query():
     target = _bmkb(runtime=[{"retrievalResults": [{"id": 1}]}])
     got = target.retrieve("KB123456789", query="who won")
     assert got["retrievalResults"] == [{"id": 1}]
-    _, _, body = target._client.calls[0]
+    _, body = target._runtime.calls[0]
     assert body["retrievalQuery"] == {"text": "who won"}
 
 
@@ -337,7 +394,7 @@ def test_retrieve_without_user_id_omits_user_context():
     """The no-user leg of the ACL trio must send no userContext at all."""
     target = _bmkb(runtime=[{"retrievalResults": []}])
     target.retrieve("KB123456789", query="q")
-    _, _, body = target._client.calls[0]
+    _, body = target._runtime.calls[0]
     assert "userContext" not in body
 
 
@@ -345,7 +402,7 @@ def test_retrieve_with_user_id_sets_top_level_user_context():
     """ACL-aware retrieval keys off a top-level userContext.userId."""
     target = _bmkb(runtime=[{"retrievalResults": []}])
     target.retrieve("KB123456789", query="q", user_id="alice@example.com")
-    _, _, body = target._client.calls[0]
+    _, body = target._runtime.calls[0]
     assert body["userContext"] == {"userId": "alice@example.com"}
 
 
@@ -355,7 +412,7 @@ def test_retrieve_filter_uses_managed_search_configuration():
     target.retrieve(
         "KB123456789", query="q", filter={"equals": {"key": "k", "value": "v"}}
     )
-    _, _, body = target._client.calls[0]
+    _, body = target._runtime.calls[0]
     assert body["retrievalConfiguration"] == {
         "managedSearchConfiguration": {"filter": {"equals": {"key": "k", "value": "v"}}}
     }
@@ -364,5 +421,5 @@ def test_retrieve_filter_uses_managed_search_configuration():
 def test_retrieve_omits_retrieval_configuration_without_filter():
     target = _bmkb(runtime=[{"retrievalResults": []}])
     target.retrieve("KB123456789", query="q")
-    _, _, body = target._client.calls[0]
+    _, body = target._runtime.calls[0]
     assert "retrievalConfiguration" not in body
