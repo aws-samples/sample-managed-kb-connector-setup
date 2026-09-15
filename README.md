@@ -503,8 +503,8 @@ Be clear about what that implies: **any principal in the account holding
 source-system credentials** — and for SharePoint or OneDrive those credentials
 are a tenant-wide read identity. If you want a second authorization gate, pass
 `--kms-key-arn` (or set `kms_key_arn` in config) to use a customer-managed key,
-whose key policy is then evaluated in addition to IAM. The tool grants the KB
-role `kms:Decrypt` on that key automatically, restricted by `kms:ViaService`.
+whose key policy is then evaluated in addition to IAM. See
+[Using a customer-managed key](#using-a-customer-managed-key).
 
 The secret's field layout (`privateKey` and `certificatePassword` in the same
 secret) is set by the Bedrock connector contract, not by this tool, so splitting
@@ -531,6 +531,67 @@ private key into a bucket that isn't protected — override with
 `--allow-unhardened-cert-bucket` only when equivalent controls are enforced
 elsewhere. The certificate password lives in Secrets Manager, and the bucket
 holds the only artifact that carries the private key.
+
+### Using a customer-managed key
+
+`--kms-key-arn` (or `kms_key_arn` in config) points the tool at one existing
+KMS key. It applies to three things: the connector secret in Secrets Manager,
+the PKCS#12 certificate object in S3, and the knowledge base itself.
+
+Bring your own key. The tool never creates, aliases, or deletes a KMS key, and
+that is deliberate: a key cannot be deleted immediately, since
+`ScheduleKeyDeletion` enforces a waiting period of 7 to 30 days, so a tool that
+created one could not honestly clean it up in `teardown`. Create the key
+yourself and pass its ARN. Give the ARN of a single key; a wildcard is
+rejected, because it would widen the role's grant to every key the allowed
+services can reach.
+
+The tool grants the knowledge base role `kms:Decrypt`, `kms:DescribeKey`, and
+`kms:GenerateDataKey` on that one key, conditioned on `kms:ViaService` so the
+grant only applies when the request arrives through Secrets Manager, S3, or
+Bedrock — never as a standalone `Decrypt`. `GenerateDataKey` is there because
+encrypting the knowledge base needs the write side of the key, not just the
+read side that an encrypted secret needs.
+
+**What the tool does not do is edit your key policy.** A KMS key policy is
+authoritative: an IAM grant alone is not enough if the key policy doesn't also
+allow the principal. So the key needs a statement for the knowledge base role,
+which is named `kb-connector-<connector>-role` unless you set `resource_prefix`
+or pass `--kb-role-arn`. Because the role is created during `setup`, the usual
+order is to create the key with a policy covering the account root, run
+`setup`, then scope the statement to the role ARN it printed:
+
+```json
+{
+  "Sid": "AllowKbConnectorRole",
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::111122223333:role/kb-connector-engineering-sp-role"
+  },
+  "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"],
+  "Resource": "*"
+}
+```
+
+`Resource: "*"` inside a key policy means "this key", not every key.
+
+The operator running `setup` needs the key too, since setup writes the
+encrypted secret and uploads the encrypted certificate. This is the KMS
+statement the scoped caller policy below refers to:
+
+```json
+{
+  "Sid": "ConnectorKmsKey",
+  "Effect": "Allow",
+  "Action": ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+  "Resource": "arn:aws:kms:us-west-2:111122223333:key/abcd1234-..."
+}
+```
+
+If the key policy is missing the role, the failure shows up as an authorization
+error when the knowledge base is created or when a crawl first reads the
+secret, not as a configuration error at startup — the tool cannot tell in
+advance whether a key policy will admit a role that does not exist yet.
 
 ### Endpoint overrides are constrained
 
