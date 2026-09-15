@@ -7,10 +7,30 @@ core.knowledge_base.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kb_connector.core import knowledge_base as kb
 from kb_connector.targets.base import Target
+
+if TYPE_CHECKING:
+    # Type-only imports: boto3 stays off the import path for --help and
+    # pure-logic runs, and the stub packages are dev-only dependencies. Naming
+    # the client types is what makes the SDK's response TypedDicts visible here
+    # rather than collapsing to Any.
+    from boto3 import Session
+    from mypy_boto3_bedrock_agent import AgentsforBedrockClient
+    from mypy_boto3_bedrock_agent.type_defs import (
+        CreateDataSourceResponseTypeDef,
+        CreateKnowledgeBaseResponseTypeDef,
+        GetDataSourceResponseTypeDef,
+        GetIngestionJobResponseTypeDef,
+        GetKnowledgeBaseResponseTypeDef,
+        ListIngestionJobsResponseTypeDef,
+        StartIngestionJobResponseTypeDef,
+        StopIngestionJobResponseTypeDef,
+    )
+    from mypy_boto3_bedrock_agent_runtime import AgentsforBedrockRuntimeClient
+    from mypy_boto3_bedrock_agent_runtime.type_defs import RetrieveResponseTypeDef
 
 
 class BmkbTarget(Target):
@@ -18,13 +38,17 @@ class BmkbTarget(Target):
 
     name = "bmkb"
 
-    def __init__(self, *, session: Any, region: str) -> None:
+    def __init__(self, *, session: Session, region: str) -> None:
         self._region = region
         # Two clients because the control plane and the retrieve path are two
         # services. Endpoints resolve from the session and the SDK's own
         # configuration; this target has no endpoint settings of its own.
-        self._client = session.client("bedrock-agent", region_name=region)
-        self._runtime = session.client("bedrock-agent-runtime", region_name=region)
+        self._client: AgentsforBedrockClient = session.client(
+            "bedrock-agent", region_name=region
+        )
+        self._runtime: AgentsforBedrockRuntimeClient = session.client(
+            "bedrock-agent-runtime", region_name=region
+        )
 
     # --- Knowledge base ------------------------------------------------------
 
@@ -35,7 +59,7 @@ class BmkbTarget(Target):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
-    ) -> dict:
+    ) -> CreateKnowledgeBaseResponseTypeDef:
         payload = kb.build_knowledge_base_payload(
             name=name,
             role_arn=role_arn,
@@ -44,7 +68,7 @@ class BmkbTarget(Target):
         )
         return self._client.create_knowledge_base(**payload)
 
-    def get_knowledge_base(self, kb_id: str) -> dict:
+    def get_knowledge_base(self, kb_id: str) -> GetKnowledgeBaseResponseTypeDef:
         return self._client.get_knowledge_base(knowledgeBaseId=kb_id)
 
     def wait_until_kb_active(
@@ -62,18 +86,20 @@ class BmkbTarget(Target):
     # --- Data source ---------------------------------------------------------
 
     def create_data_source(
-        self, kb_id: str, *, name: str, connector_parameters: dict
-    ) -> dict:
+        self, kb_id: str, *, name: str, connector_parameters: dict[str, Any]
+    ) -> CreateDataSourceResponseTypeDef:
         payload = kb.build_data_source_payload(
             name=name, connector_parameters=connector_parameters
         )
         return self.create_data_source_raw(kb_id, payload)
 
-    def create_data_source_raw(self, kb_id: str, payload: dict) -> dict:
+    def create_data_source_raw(
+        self, kb_id: str, payload: dict[str, Any]
+    ) -> CreateDataSourceResponseTypeDef:
         """Create a DS with a fully-formed payload (for non-managed shapes like S3)."""
         return self._client.create_data_source(knowledgeBaseId=kb_id, **payload)
 
-    def get_data_source(self, kb_id: str, ds_id: str) -> dict:
+    def get_data_source(self, kb_id: str, ds_id: str) -> GetDataSourceResponseTypeDef:
         return self._client.get_data_source(
             knowledgeBaseId=kb_id, dataSourceId=ds_id
         )
@@ -92,22 +118,30 @@ class BmkbTarget(Target):
 
     # --- Ingestion -----------------------------------------------------------
 
-    def start_ingestion_job(self, kb_id: str, ds_id: str) -> dict:
+    def start_ingestion_job(
+        self, kb_id: str, ds_id: str
+    ) -> StartIngestionJobResponseTypeDef:
         return self._client.start_ingestion_job(
             knowledgeBaseId=kb_id, dataSourceId=ds_id
         )
 
-    def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def get_ingestion_job(
+        self, kb_id: str, ds_id: str, job_id: str
+    ) -> GetIngestionJobResponseTypeDef:
         return self._client.get_ingestion_job(
             knowledgeBaseId=kb_id, dataSourceId=ds_id, ingestionJobId=job_id
         )
 
-    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+    def list_ingestion_jobs(
+        self, kb_id: str, ds_id: str, *, max_results: int
+    ) -> ListIngestionJobsResponseTypeDef:
         return self._client.list_ingestion_jobs(
             knowledgeBaseId=kb_id, dataSourceId=ds_id, maxResults=max_results
         )
 
-    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def stop_ingestion_job(
+        self, kb_id: str, ds_id: str, job_id: str
+    ) -> StopIngestionJobResponseTypeDef:
         return self._client.stop_ingestion_job(
             knowledgeBaseId=kb_id, dataSourceId=ds_id, ingestionJobId=job_id
         )
@@ -120,9 +154,9 @@ class BmkbTarget(Target):
         *,
         query: str,
         user_id: str | None = None,
-        filter: dict | None = None,
-    ) -> dict:
-        request: dict = {
+        filter: dict[str, Any] | None = None,
+    ) -> RetrieveResponseTypeDef:
+        request: dict[str, Any] = {
             "knowledgeBaseId": kb_id,
             "retrievalQuery": {"text": query},
         }

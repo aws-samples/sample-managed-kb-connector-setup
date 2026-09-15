@@ -11,7 +11,9 @@ matter of swapping the API calls, not redesigning.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
+
 
 from kb_connector.targets.base import Target
 
@@ -37,10 +39,10 @@ class QuickTarget(Target):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
-    ) -> dict:
+    ) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def get_knowledge_base(self, kb_id: str) -> dict:
+    def get_knowledge_base(self, kb_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
     def wait_until_kb_active(
@@ -49,11 +51,11 @@ class QuickTarget(Target):
         raise NotImplementedError(_NOT_AVAILABLE)
 
     def create_data_source(
-        self, kb_id: str, *, name: str, connector_parameters: dict
-    ) -> dict:
+        self, kb_id: str, *, name: str, connector_parameters: dict[str, Any]
+    ) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def get_data_source(self, kb_id: str, ds_id: str) -> dict:
+    def get_data_source(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
     def wait_until_ds_available(
@@ -67,16 +69,16 @@ class QuickTarget(Target):
     def delete_knowledge_base(self, kb_id: str) -> None:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def start_ingestion_job(self, kb_id: str, ds_id: str) -> dict:
+    def start_ingestion_job(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
-    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
     def retrieve(
@@ -85,6 +87,6 @@ class QuickTarget(Target):
         *,
         query: str,
         user_id: str | None = None,
-        filter: dict | None = None,
-    ) -> dict:
+        filter: dict[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)

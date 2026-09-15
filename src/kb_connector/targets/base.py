@@ -15,6 +15,8 @@ through this interface, never directly to a specific backend's API.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from typing import Any
 
 
 class Target(ABC):
@@ -30,12 +32,12 @@ class Target(ABC):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
-    ) -> dict:
+    ) -> Mapping[str, Any]:
         """Create a knowledge base; return the created KB object."""
         ...
 
     @abstractmethod
-    def get_knowledge_base(self, kb_id: str) -> dict:
+    def get_knowledge_base(self, kb_id: str) -> Mapping[str, Any]:
         """Get a knowledge base by ID."""
         ...
 
@@ -48,13 +50,13 @@ class Target(ABC):
 
     @abstractmethod
     def create_data_source(
-        self, kb_id: str, *, name: str, connector_parameters: dict
-    ) -> dict:
+        self, kb_id: str, *, name: str, connector_parameters: dict[str, Any]
+    ) -> Mapping[str, Any]:
         """Create a managed-connector data source; return the created DS."""
         ...
 
     @abstractmethod
-    def get_data_source(self, kb_id: str, ds_id: str) -> dict:
+    def get_data_source(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         """Get a data source by KB + DS ID."""
         ...
 
@@ -76,22 +78,22 @@ class Target(ABC):
         ...
 
     @abstractmethod
-    def start_ingestion_job(self, kb_id: str, ds_id: str) -> dict:
+    def start_ingestion_job(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         """Start an ingestion job; return the job object."""
         ...
 
     @abstractmethod
-    def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def get_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> Mapping[str, Any]:
         """Get an ingestion job by ID."""
         ...
 
     @abstractmethod
-    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> dict:
+    def list_ingestion_jobs(self, kb_id: str, ds_id: str, *, max_results: int) -> Mapping[str, Any]:
         """List recent ingestion jobs, newest first."""
         ...
 
     @abstractmethod
-    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> dict:
+    def stop_ingestion_job(self, kb_id: str, ds_id: str, job_id: str) -> Mapping[str, Any]:
         """Request that a running ingestion job stop.
 
         The stop is asynchronous: the job moves to STOPPING and reaches
@@ -106,8 +108,8 @@ class Target(ABC):
         *,
         query: str,
         user_id: str | None = None,
-        filter: dict | None = None,
-    ) -> dict:
+        filter: dict[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
         """Send a retrieve request; return the results.
 
         Pass user_id to enable ACL-aware retrieval (the value goes into

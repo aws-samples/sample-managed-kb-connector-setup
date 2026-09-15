@@ -8,8 +8,9 @@ the last observed status.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from kb_connector.core.errors import AwsError
 from kb_connector.targets.base import Target
@@ -137,10 +138,10 @@ def _parse_stats(job: dict) -> IngestionStats:
     )
 
 
-def _extract_job_id(resp: dict) -> str:
+def _extract_job_id(resp: Mapping[str, Any]) -> str:
     """Extract ingestionJobId from a StartIngestionJob response."""
     job = resp.get("ingestionJob", resp)
     jid = job.get("ingestionJobId")
     if not jid:
         raise AwsError(f"Could not find ingestionJobId in response: {resp}")
-    return jid
+    return str(jid)
