@@ -705,15 +705,20 @@ known vulnerability in a code path the tool exercises — for `cryptography`, th
 `pkcs12.serialize_key_and_certificates` call that builds the PKCS#12 bundle.
 
 **Status: Mitigated.** Floors are set to the first release clear of known
-advisories rather than the oldest compatible one: `cryptography>=42.0.4`
-(CVE-2024-26130 in `pkcs12.serialize_key_and_certificates`, plus CVE-2024-0727 in
-PKCS#12 parsing), `requests>=2.32.4`, `mcp>=1.28.1` (five HIGH-severity transport
-advisories). CI runs `pip-audit` against both the resolved tree and the declared
+advisories rather than the oldest compatible one: `cryptography>=50.0.0`,
+`requests>=2.33.0`, `pytest>=9.0.3`, and `mcp>=1.28.1` (five HIGH-severity
+transport advisories). `pyproject.toml` records which advisory forces each
+number, and CI runs `pip-audit` against both the resolved tree and the declared
 floors, so a new advisory against a floor becomes visible rather than dormant.
 
-Note that CVE-2024-26130 is not reachable the way this tool calls the API — it
-requires a mismatched certificate/key pair together with an `hmac_hash` override,
-and the call passes a matching pair with no override. The floor is raised anyway:
+`boto3>=1.43.32` is the exception: that floor is a capability requirement, not
+an advisory one. It is the first release whose service model contains the
+managed-connector data-source envelope, knowledge-base encryption, and the
+top-level `userContext` on Retrieve, so an older botocore fails parameter
+validation rather than admitting a vulnerability.
+
+Of the `cryptography` advisories below the current floor, only the statically
+linked OpenSSL ones sit on a path this tool uses. The floor is raised anyway:
 a sample should not tell its users that a vulnerable release is acceptable.
 
 **Accepted:** supply-chain integrity of these packages themselves remains out of
