@@ -4,7 +4,10 @@ from kb_connector.providers.microsoft.permissions import (
     build_plan, SHAREPOINT_APP_ID,
 )
 from kb_connector.providers.microsoft.certs import generate_self_signed, certificate_der_b64
-from kb_connector.providers.microsoft.token_mint import decode_jwt_claims, token_endpoint
+from kb_connector.core.errors import GraphError
+from kb_connector.providers.microsoft.token_mint import (
+    _build_client_assertion, decode_jwt_claims, token_endpoint,
+)
 
 
 # --- Permissions plans -------------------------------------------------------
@@ -133,3 +136,55 @@ def test_decode_jwt_claims_malformed():
     """decode_jwt_claims returns error dict on bad input."""
     claims = decode_jwt_claims("not-a-jwt")
     assert "_decode_error" in claims
+
+
+def _private_key_pem(key):
+    """PKCS8 PEM for a generated private key, as _build_client_assertion expects."""
+    from cryptography.hazmat.primitives import serialization
+
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def test_build_client_assertion_rsa():
+    """An RSA key yields a three-part RS256 JWT carrying the cert thumbprint."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    assertion = _build_client_assertion(
+        tenant_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        client_id="11111111-2222-3333-4444-555555555555",
+        private_key_pem=_private_key_pem(key),
+        thumbprint_b64url="dGh1bWJwcmludA",
+    )
+
+    assert assertion.count(".") == 2
+    claims = decode_jwt_claims(assertion)
+    assert claims["iss"] == "11111111-2222-3333-4444-555555555555"
+    assert claims["sub"] == "11111111-2222-3333-4444-555555555555"
+    assert claims["aud"] == token_endpoint("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    assert claims["exp"] > claims["nbf"]
+
+
+def test_build_client_assertion_rejects_non_rsa():
+    """A non-RSA key is rejected up front, not deep inside cryptography.
+
+    Entra certificate assertions are signed RS256, so only RSA keys are usable.
+    Without the explicit guard this surfaced as a TypeError or AttributeError
+    from the sign() call, which reads like a defect in this tool rather than a
+    misconfigured key file.
+    """
+    import pytest
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    with pytest.raises(GraphError, match="must be RSA"):
+        _build_client_assertion(
+            tenant_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            client_id="11111111-2222-3333-4444-555555555555",
+            private_key_pem=_private_key_pem(key),
+            thumbprint_b64url="dGh1bWJwcmludA",
+        )

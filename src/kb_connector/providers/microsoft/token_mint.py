@@ -107,9 +107,20 @@ def _build_client_assertion(
     *, tenant_id: str, client_id: str, private_key_pem: str, thumbprint_b64url: str
 ) -> str:
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
     key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+    # load_pem_private_key returns any key type, but the assertion below is
+    # signed RS256 with PKCS1v15 padding, which only RSA keys support. Reject a
+    # non-RSA key here: without this the failure surfaces as a TypeError or
+    # AttributeError from inside cryptography, which reads like a bug in this
+    # tool rather than the wrong key file being configured.
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise GraphError(
+            f"Certificate private key must be RSA, got {type(key).__name__}. "
+            f"Entra certificate client assertions are signed with RS256, so "
+            f"generate the app's certificate with an RSA key pair."
+        )
 
     now = _dt.datetime.now(_dt.timezone.utc)
     header = {"alg": "RS256", "typ": "JWT", "x5t": thumbprint_b64url}
