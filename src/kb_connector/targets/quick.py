@@ -46,7 +46,7 @@ class QuickTarget(Target):
         raise NotImplementedError(_NOT_AVAILABLE)
 
     def wait_until_kb_active(
-        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 300
+        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 600
     ) -> str:
         raise NotImplementedError(_NOT_AVAILABLE)
 

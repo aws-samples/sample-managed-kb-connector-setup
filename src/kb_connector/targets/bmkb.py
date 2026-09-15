@@ -72,7 +72,7 @@ class BmkbTarget(Target):
         return self._client.get_knowledge_base(knowledgeBaseId=kb_id)
 
     def wait_until_kb_active(
-        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 300
+        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 600
     ) -> str:
         return kb.wait_until_kb_active(
             self, kb_id,

@@ -43,9 +43,15 @@ class Target(ABC):
 
     @abstractmethod
     def wait_until_kb_active(
-        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 300
+        self, kb_id: str, *, poll_interval_seconds: int = 5, timeout_seconds: int = 600
     ) -> str:
-        """Poll until the KB is ACTIVE; return the final status."""
+        """Poll until the KB is ACTIVE; return the final status.
+
+        The budget is generous because an encrypted knowledge base takes
+        materially longer to become ACTIVE than an unencrypted one — measured
+        past five minutes — and timing out on a KB that then succeeds leaves a
+        real resource behind.
+        """
         ...
 
     @abstractmethod

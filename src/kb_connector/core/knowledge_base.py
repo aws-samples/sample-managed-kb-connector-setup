@@ -85,7 +85,7 @@ def wait_until_kb_active(
     kb_id: str,
     *,
     poll_interval_seconds: int = 5,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 600,
 ) -> str:
     """Poll GetKnowledgeBase until status is ACTIVE.
 
