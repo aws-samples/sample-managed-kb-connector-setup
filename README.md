@@ -896,8 +896,8 @@ python -m pytest
 ```
 
 The committed suite is unit tests only: pure logic with no network that runs in
-under a second. It covers parameter builders, secret schemas, config resolution,
-state management, the retry policy, and output formatting, plus the
+under three seconds. It covers parameter builders, secret schemas, config
+resolution, state management, the retry policy, and output formatting, plus the
 security-relevant controls in [THREAT-MODEL.md](THREAT-MODEL.md) — endpoint
 allowlisting, resource ownership and tagging, the teardown ownership gate, file
 permissions, and log redaction. Where a check needs an AWS client, tests use

@@ -51,7 +51,7 @@ To send us a pull request, please:
    python -m pytest
    ```
 4. Add unit tests for new behavior. This project ships **unit tests only**:
-   pure logic that runs in under a second with no network, covering params
+   pure logic that runs in under three seconds with no network, covering params
    builders, secret schemas, config resolution, and output formatting.
    Maintainers run live validation against a test account, so please don't add
    networked integration tests to the committed suite.
