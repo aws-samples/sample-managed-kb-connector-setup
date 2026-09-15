@@ -1,0 +1,177 @@
+# KB Connector Helper — Configuration File (PRIMARY config)
+#
+# This TOML file is the main way to configure the tool. It defines your
+# connectors and shared defaults. Copy it to ./kb-connector.toml and fill in
+# your values, or run `kb-connector init` to generate one interactively.
+#
+# Relationship to .env (see .env.example):
+#   • This file = primary, structured config (the only place that can define
+#     per-connector settings under [connectors.<name>]).
+#   • Environment variables = optional, low-priority fallback for a few values
+#     (region, profile, tenant_id, endpoints) — used mainly in CI.
+#   • Precedence: CLI flag > [connectors.<name>] > [defaults] > env var.
+#     A value here ALWAYS beats the matching environment variable, so the two
+#     never conflict.
+#
+# Location precedence (where the tool looks for your real config):
+#   1. --config <path>            (explicit flag)
+#   2. ./kb-connector.toml        (project-local — primary)
+#   3. ~/.config/kb-connector/config.toml  (user-global defaults)
+
+# ─── Defaults (apply to all connectors unless overridden) ────────────────────
+
+[defaults]
+region = "us-west-2"
+# profile = "my-aws-profile"      # AWS CLI profile name (blank = default chain)
+# owner = "myalias"               # suffixes default resource names
+# cert_s3_bucket = "123456789012-kb-certs"   # optional. If unset the tool uses
+#                                            # kb-connector-certs-<account>-<region>
+#                                            # (creates the bucket if missing).
+# cert_s3_key_prefix = "kb-connector/"
+#
+# resource_prefix — prefixes the derived secret and role names. Set a distinct
+# one per person/team if several of you run this tool in the same AWS account,
+# so `kb-connector-<name>-role` can't collide. This is also the right control
+# when your account forbids tagging, since it prevents collisions outright
+# rather than detecting them afterwards.
+# resource_prefix = "team-a"
+
+# ─── Your own tags (optional) ────────────────────────────────────────────────
+# Applied to every resource the tool creates, on top of the ownership tags it
+# sets itself (ManagedBy, KbConnectorName). Add these if your organization
+# mandates tags — particularly if an SCP or tag policy denies creates without
+# them, which would otherwise stop the tool from provisioning at all.
+#
+# Merged across [defaults.tags] and [connectors.<name>.tags], connector wins.
+# `ManagedBy` and `KbConnectorName` are reserved and will be rejected; so are
+# keys using the AWS-reserved `aws:` prefix.
+# [defaults.tags]
+# CostCenter = "1234"
+# Owner = "platform-team"
+
+# Microsoft Entra defaults (for SharePoint/OneDrive connectors)
+[defaults.microsoft]
+# tenant_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# auth_method = "az"              # "az" (Azure CLI) | "device_code"
+# device_code_client_id = "..."   # only needed if auth_method = "device_code"
+
+# Google Workspace defaults (future)
+# [defaults.google]
+# project_id = "my-gcp-project"
+
+# ─── Connector definitions ───────────────────────────────────────────────────
+#
+# Each [connectors.<name>] section defines one data source connector.
+# The <name> is your short label — used in commands like:
+#   kb-connector setup <name>
+#   kb-connector monitor <name>
+#   kb-connector diagnose <name>
+
+# ─── Ready to run (the README quick-start uses this one) ─────────────────────
+#
+# This is the only connector defined rather than commented out, so that copying
+# this file to ./kb-connector.toml gives you something `kb-connector setup
+# docs-site` can actually resolve. The web crawler is the lightest starting
+# point: no identity provider, no certificate, just AWS credentials and a URL.
+#
+# >>> EDIT seed_urls FIRST. The placeholder below is not a real site, so setup
+# >>> would create a knowledge base and then index nothing. Point it at a site
+# >>> you own or are permitted to crawl.
+[connectors.docs-site]
+type = "web"
+seed_urls = ["https://docs.example.com"]   # <<< replace before running
+crawl_depth = 2
+# sync_scope = "SUB_DOMAINS"      # how far to follow links — see the web
+#                                 # template further down for the valid values
+
+# Everything below is reference: uncomment and adapt whichever you need.
+
+# Example: SharePoint connector with certificate auth and ACL
+# [connectors.engineering-sp]
+# type = "sharepoint"
+# credential = "cert"             # SharePoint app-only auth requires "cert".
+#                                 # "client_secret" is not usable for SharePoint:
+#                                 # the connector requires a certificate, so
+#                                 # setup rejects that combination early.
+# acl = true                      # enable document-level access control
+# sharepoint_host = "contoso.sharepoint.com"
+# site_urls = [
+#     "https://contoso.sharepoint.com/sites/engineering",
+# ]
+# sites_selected = false          # true = least-privilege Sites.Selected grants
+# crawl_files = true              # crawl files in document libraries
+# crawl_pages = true              # crawl SharePoint pages
+#
+# Optional [validation] block — `kb-connector validate` reads these to run a
+# structured retrieve test. For ACL connectors this drives the trio of
+# authorized / unauthorized / no-user retrieves. Skip the block if you'd
+# rather pass the values via CLI flags.
+# [connectors.engineering-sp.validation]
+# query = "team roadmap"          # something that should match indexed content
+# authorized_user = "alice@contoso.com"      # expected to get results
+# unauthorized_user = "outsider@contoso.com" # expected to get zero
+
+# Example: OneDrive connector
+# [connectors.company-drive]
+# type = "onedrive"
+# credential = "cert"
+# acl = true
+# crawl_personal_drives = true              # crawl every user's personal drive
+# crawl_shared_with_me = false              # crawl items shared with each user
+# inclusion_user_emails = [                 # optional — limit to specific users
+#     "alice@contoso.com",
+# ]
+
+# Example: S3 connector (no provider needed)
+# [connectors.public-docs]
+# type = "s3"
+# bucket_name = "my-docs-bucket"
+# acl = false
+
+# Example: Web crawler connector (no provider needed)
+# [connectors.team-site]
+# type = "web"
+# seed_urls = ["https://docs.example.com"]
+# crawl_depth = 3
+# sync_scope = "SUB_DOMAINS"      # how far to follow links. Valid values:
+#                                 #   PATH_SPECIFIC — only the exact seed paths
+#                                 #   SUB_DOMAINS   — the seed host + its subdomains
+#                                 #   ALL_DOMAINS   — follow links to any domain
+#                                 #   DOMAINS_ONLY  — the seed domains only
+#                                 # (invalid values are rejected before the API call)
+
+# Example: Confluence connector (guided setup)
+# [connectors.product-wiki]
+# type = "confluence"
+# credential = "oauth2"
+# host_url = "https://mycompany.atlassian.net/wiki"
+
+# Example: Google Drive connector (guided setup, future)
+# [connectors.team-drive]
+# type = "googledrive"
+# credential = "oauth2"
+
+
+# ─── Long-tail connector params (override-dict passthrough) ─────────────────
+#
+# The curated builders surface the common knobs (auth, ACL, site URLs, crawl
+# toggles, etc.) but not every field the underlying Bedrock connector accepts.
+# For anything the builder doesn't surface (filterConfiguration, advanced
+# indexing, document deletion safeguard, etc.), drop into a
+# [connectors.<name>.connector_params_overrides] table. The dict deep-merges
+# onto the params the builder produced before the data source is created.
+#
+# Example: a SharePoint date filter that only includes content modified after
+# Jan 1, 2025. The filterConfiguration block isn't in the curated SP fields,
+# so it goes through the override.
+#
+# [connectors.engineering-sp.connector_params_overrides.filterConfiguration]
+# modifiedDateAfter = "2025-01-01T00:00:00Z"
+# # modifiedDateBefore = "2026-12-31T23:59:59Z"
+# # inclusionItemPaths = [
+# #     "/sites/engineering/Shared Documents/2025",
+# # ]
+#
+# Anything the API accepts becomes available without code changes. The override
+# path is intentionally unvalidated — using it means knowing the API JSON
+# shape; the curated fields above are still where to look first.

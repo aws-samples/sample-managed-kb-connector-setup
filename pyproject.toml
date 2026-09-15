@@ -1,0 +1,141 @@
+[build-system]
+# The setuptools floor is a hard requirement, not a preference: `license =
+# "MIT-0"` below is the PEP 639 string form, and only setuptools 77.0.1 and
+# later accept it. Anything older fails metadata generation with
+# "project.license must be valid exactly by one definition".
+requires = ["setuptools>=77.0.1", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb-connector"
+version = "1.0.0"
+description = "CLI tool for setting up, monitoring, validating, and diagnosing AWS Bedrock Knowledge Base connectors"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT-0"
+authors = [{ name = "Amazon.com, Inc. or its affiliates" }]
+keywords = [
+    "aws", "bedrock", "knowledge-base", "rag", "connector",
+    "sharepoint", "onedrive", "confluence", "google-drive",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "boto3>=1.34.0",
+    # Floors are set to the first release without a known CVE, not to the
+    # oldest version whose API we happen to use. A `>=` floor is a statement
+    # about what a resolver is allowed to install, and a fresh install with a
+    # constraints file or an old distro base image will land exactly on it.
+    #
+    # cryptography>=42.0.4  CVE-2024-26130, a NULL-pointer dereference in
+    #                       pkcs12.serialize_key_and_certificates — the exact
+    #                       call in providers/microsoft/certs.py. Not reachable
+    #                       as we use it (it needs a mismatched key/cert pair
+    #                       plus an hmac_hash override, and we pass a matching
+    #                       pair with no override), but the floor should not
+    #                       admit it. 42.0.4 also covers CVE-2024-0727, another
+    #                       PKCS12 parsing defect.
+    # requests>=2.32.4      CVE-2024-35195 (a Session stops verifying certs
+    #                       after one verify=False request) and CVE-2024-47081
+    #                       (.netrc credential leak via crafted URLs).
+    "cryptography>=42.0.4",
+    "requests>=2.32.4",
+    "tomli-w>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/aws-samples/sample-managed-kb-connector-setup"
+Source = "https://github.com/aws-samples/sample-managed-kb-connector-setup"
+Issues = "https://github.com/aws-samples/sample-managed-kb-connector-setup/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pyflakes>=3.2",
+    "mypy>=1.8",
+    "boto3-stubs[bedrock-agent,secretsmanager,iam,s3,sts,logs,cloudtrail]>=1.34.0",
+]
+mcp = [
+    # Lower bound is the first release clear of five HIGH-severity transport
+    # advisories, including CVE-2026-52869 (HTTP transports serving session
+    # requests without verifying the authenticated principal) and
+    # CVE-2025-66416 (DNS-rebinding protection off by default).
+    #
+    # Upper bound is a hard API constraint, not caution: mcp 2.x renames
+    # FastMCP to MCPServer and reshapes the surrounding APIs, so
+    # mcp_server/server.py does not import under 2.x. Lift it as part of that
+    # migration, not ahead of it.
+    "mcp>=1.28.1,<2",
+]
+
+[project.scripts]
+kb-connector = "kb_connector.cli.main:main"
+kb-connector-mcp = "kb_connector.mcp_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.bandit]
+# This is the only bandit config, and it must be passed explicitly — bandit
+# does not auto-discover pyproject.toml, so a plain `bandit -r src/` ignores
+# every skip below and reports the justified findings as live. Run it the way
+# CI does:
+#   bandit -c pyproject.toml -r src/
+#
+# Do not add a root-level `.bandit` file as an alternative: `-c` parses YAML and
+# rejects that format outright, leaving only the deprecated `--ini` flag.
+#
+# Skip findings that are repeatable false positives in this codebase. See
+# the inline justifications. These do NOT skip test code wholesale; they
+# scope each rule to where the false-positive pattern lives.
+exclude_dirs = ["tests"]              # B105/B106 noise on test fixtures (string
+                                      # literals named like 'arn', 'cs', 'pw',
+                                      # 'token123' that bandit flags as hardcoded
+                                      # passwords). Tests don't need src-grade
+                                      # security analysis.
+skips = [
+    "B311",   # random.random() jitter for retry backoff (signed_client.py),
+              # not used for any cryptographic purpose.
+    "B404",   # subprocess module import (microsoft/client.py) for the `az`
+              # token flow. Subprocess use is intentional and validated.
+    "B603",   # subprocess.run with the user's `az` CLI path. The command and
+              # arguments are static; no untrusted input flows in.
+    "B607",   # partial-path `az` invocation. We intentionally rely on the
+              # user's PATH so we pick up whichever az they have installed.
+]
+# Inline `# nosec` suppressions, listed here because they do not appear in the
+# skips above and so are invisible to anyone auditing this file alone. Audit
+# them with: bandit -c pyproject.toml -r src/ --ignore-nosec
+#
+#   B303  providers/microsoft/certs.py — SHA-1 over the certificate DER. This
+#         is the highest-severity finding in the codebase (MEDIUM) and is
+#         suppressed inline, so it is called out explicitly here. SHA-1 is the
+#         algorithm Microsoft requires for a keyCredential's
+#         customKeyIdentifier / x5t thumbprint; it identifies which uploaded
+#         certificate is which and is not relied on for any security property.
+#         Signatures use SHA-256.
+#   B105  core/state.py, probe/driver.py, connectors/{sharepoint,onedrive}.py,
+#         core/provisioning.py — constant names and API enum values that bandit
+#         reads as passwords ("secret", "__SECRET_ARN__", "ENTRA_APP_ID",
+#         False). None is credential material.
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

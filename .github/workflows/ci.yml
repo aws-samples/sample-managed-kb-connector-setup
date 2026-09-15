@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint + unit tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The mcp extra is installed so tests/test_mcp_server.py actually runs.
+      # Without it that module importorskips, and a broken MCP server surface
+      # would pass CI as a silent skip.
+      - name: Install (with dev and mcp extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mcp]"
+
+      - name: Lint (pyflakes)
+        run: python -m pyflakes src/ tests/
+
+      # -p no:randomly is not needed, but --strict-markers and a skip guard are:
+      # fail if the MCP tests were skipped, since that means the extra did not
+      # resolve to a version this code supports.
+      - name: Unit tests (pytest)
+        run: python -m pytest --cov=kb_connector --cov-report=term-missing
+
+      - name: Confirm the MCP server tests were not skipped
+        run: |
+          python -m pytest tests/test_mcp_server.py -q -rs > /tmp/mcp.txt 2>&1 || true
+          cat /tmp/mcp.txt
+          if grep -q "skipped" /tmp/mcp.txt; then
+            echo "::error::MCP server tests were skipped — the 'mcp' extra did not resolve to a supported version."
+            exit 1
+          fi
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # advisory until annotations are complete
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - run: python -m mypy src/
+
+  # Blocking, not advisory. A security config that nothing executes is not a
+  # control: bandit silently ignores its skips when the config is not passed
+  # explicitly, and a malformed gitleaks allowlist makes gitleaks exit without
+  # scanning at all. This job is what keeps both configs honest.
+  security:
+    name: Security scan (bandit + gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks needs full history for the history scan
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install bandit
+        run: |
+          python -m pip install --upgrade pip
+          pip install "bandit>=1.8"
+
+      # -c pyproject.toml is required: bandit does not auto-discover it, and
+      # without it every documented skip is ignored.
+      - name: Static analysis (bandit)
+        run: python -m bandit -c pyproject.toml -r src/
+
+      # p/python is a subset of what a CI scanner may run — organization
+      # rulesets carry additional rules, and a rule absent here can still fire
+      # downstream. So treat a clean run as "no known pattern", and prefer
+      # restructuring code over adding a `# nosemgrep` when the finding points
+      # at something genuinely ambiguous to a reader.
+      - name: Static analysis (semgrep)
+        run: |
+          pip install semgrep
+          semgrep scan --config=p/python --error --metrics=off \
+            --exclude=build --exclude=__pycache__ src/ tests/
+
+      # Implicit string concatenation inside a list is indistinguishable from a
+      # missing comma, and these lists hold IAM actions and policy resources
+      # where a silently merged element changes a grant. Semgrep's rule for this
+      # is not in p/python, so check it directly.
+      - name: No implicit string concatenation in collection literals
+        run: python scripts/check_implicit_concat.py src tests
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks version
+
+      # Both scans must pass. A config that fails to parse exits non-zero
+      # having scanned nothing, so a broken allowlist fails the build here
+      # instead of silently disabling secret scanning.
+      - name: Secret scan — working tree (gitleaks)
+        run: /tmp/gitleaks detect --no-git --redact -v
+
+      - name: Secret scan — full history (gitleaks)
+        run: /tmp/gitleaks detect --redact -v
+
+  # Advisory: a new advisory against a pinned floor should be visible without
+  # blocking an unrelated change. Review the output when this job goes red.
+  audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      # Audits the resolved tree, which is what a fresh `pip install` produces.
+      - name: Audit resolved dependencies
+        run: |
+          pip install -e ".[dev,mcp]"
+          pip-audit --strict --desc
+
+      # Audits the declared *floors*, which is what a constraints file or an
+      # older base image resolves to. A floor that admits a vulnerable release
+      # is invisible to the resolved-tree audit above, since a fresh install
+      # picks the newest compatible version.
+      - name: Audit declared minimum versions
+        run: |
+          python - <<'PY' > /tmp/floors.txt
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              data = tomllib.load(fh)
+          specs = list(data["project"]["dependencies"])
+          for extra in data["project"].get("optional-dependencies", {}).values():
+              specs.extend(extra)
+          for spec in specs:
+              if ">=" in spec:
+                  name, _, floor = spec.partition(">=")
+                  print(f"{name.strip()}=={floor.strip()}")
+          PY
+          cat /tmp/floors.txt
+          pip-audit --strict --desc -r /tmp/floors.txt --no-deps

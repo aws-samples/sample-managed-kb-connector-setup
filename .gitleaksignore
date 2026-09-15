@@ -1,0 +1,39 @@
+# Accepted gitleaks findings, by fingerprint.
+#
+# A fingerprint is commit:path:rule:line. It pins a finding to the commit that
+# introduced it, so an entry here stays necessary even after the offending line
+# is changed — the secret scanner walks history, not just the working tree.
+#
+# Every entry below is a test fixture password for local certificate
+# generation. None is a real credential: each value existed only to be passed
+# into `generate_self_signed` and asserted on in the same test, and none was
+# ever accepted by a real Azure tenant or AWS account.
+#
+# The current tests no longer contain literals of this shape at all — the
+# fixtures in tests/conftest.py generate their values at run time, which removes
+# the pattern rather than suppressing the alert. These entries cover only the
+# historical commits.
+
+# tests/test_microsoft.py — pkcs12_password fixture in test_generate_self_signed
+e9ab953bf5e53f373e48cd6623a5cf566a9abdd6:tests/test_microsoft.py:hashicorp-tf-password:88
+
+# tests/test_security.py — pkcs12_password fixture and its assertion in
+# test_generated_certificate_repr_hides_key_material
+55c7966df3bd78e105ec7c4f51b0b4c89fae40e5:tests/test_security.py:hashicorp-tf-password:271
+55c7966df3bd78e105ec7c4f51b0b4c89fae40e5:tests/test_security.py:hashicorp-tf-password:277
+
+# The entries below are the same fixtures again, reported by this repo's own
+# `credential-named-literal` rule (see .gitleaks.toml). A fingerprint includes
+# the rule id, so one line matched by two rules needs one entry per rule.
+#
+# tests/test_connectors.py — client_secret, refresh_token and api_token fixtures,
+# each asserted on in the same test that sets it.
+e9ab953bf5e53f373e48cd6623a5cf566a9abdd6:tests/test_connectors.py:credential-named-literal:177
+e9ab953bf5e53f373e48cd6623a5cf566a9abdd6:tests/test_connectors.py:credential-named-literal:225
+e9ab953bf5e53f373e48cd6623a5cf566a9abdd6:tests/test_connectors.py:credential-named-literal:449
+
+# tests/test_microsoft.py — pkcs12_password fixture
+e9ab953bf5e53f373e48cd6623a5cf566a9abdd6:tests/test_microsoft.py:credential-named-literal:85
+
+# tests/test_security.py — pkcs12_password fixture
+55c7966df3bd78e105ec7c4f51b0b4c89fae40e5:tests/test_security.py:credential-named-literal:271

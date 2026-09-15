@@ -1,0 +1,108 @@
+# gitleaks configuration — extends the default ruleset with a small allowlist
+# for known false positives in this repo. Each entry below has been verified by
+# inspection. None of them are real secret leaks.
+#
+# Verify a change to this file with:
+#   gitleaks detect --no-git --redact -v      # working tree
+#   gitleaks detect --redact -v               # full history
+#
+# Both must exit 0. A malformed allowlist makes gitleaks exit 1 with
+# "FTL Failed to load config" and scan *nothing* — which in a busy log reads
+# much like a clean run while verifying absolutely nothing. Treat a config
+# error here as a failure, never as a pass. CI runs both commands.
+
+# A clean run here is necessary but not sufficient. Secret-scanning rulesets
+# differ between tools and versions, and an organization's CI scanner may carry
+# rules — or looser variants of rules — that the bundled default set does not.
+# So a literal this config passes can still be flagged downstream, and the
+# finding is pinned to the commit that introduced it, meaning it outlives the
+# line. Treat "gitleaks is green" as "no known pattern", not "no pattern".
+#
+# The practical consequence, and the reason tests/conftest.py generates its
+# credential-shaped fixtures at run time: prefer removing a secret-shaped
+# pattern over allowlisting it. An allowlist entry only teaches one ruleset.
+
+# Inherit the bundled default rules.
+[extend]
+useDefault = true
+
+# Credential-named assignment with a quoted literal on the right-hand side.
+# The bundled ruleset's coverage of this shape varies by version, so it is
+# declared explicitly: it is the pattern most likely to be reintroduced by a
+# well-meaning test fixture, and catching it here is cheaper than catching it in
+# an organization's CI after the commit has landed in history.
+[[rules]]
+id = "credential-named-literal"
+description = "Credential-named variable assigned a quoted literal"
+# Three parts, each load-bearing:
+#
+#  (?:^|[\s,({\[])  the name must sit at a statement or argument boundary, not
+#                   inside a string. Without it the pattern spans two adjacent
+#                   string literals in ordinary code, matching for example
+#                   `startswith("secret:") or resource == "` as an assignment.
+#  [\w.-]*          an optional identifier prefix, so a compound name such as
+#                   `pkcs12_password` or `cert_password` is covered. A bare \b
+#                   would not match these: the credential word is preceded by
+#                   `_`, which is a word character, so there is no boundary.
+#  value charset    excludes whitespace, parentheses and operators, which keeps
+#                   the match inside a single literal.
+regex = '''(?i)(?:^|[\s,({\[])[\w.-]*(?:pass(?:wd|word)?|passphrase|secret|api_?key|token)\s*[:=]\s*["'][^"'\s\n$%{}()=,;]{6,64}["']'''
+tags = ["fixture-risk"]
+[rules.allowlist]
+# Values that are plainly placeholders rather than credentials, plus the
+# AWS/Bedrock API enum values that happen to sit under credential-ish keys.
+regexTarget = "match"
+regexes = [
+    '''["'](?:ENTRA_[A-Z_]+|OAUTH2(?:_APP)?|NO_AUTH|BASIC|SHAREPOINT_[A-Z_]+)["']''',
+    '''(?i)["'](?:x{3,}|redacted|changeme|placeholder|example|dummy|fake|none|null|todo)["']''',
+    '''\$\{''',            # template interpolation
+    '''["']<[^"']+>["']''',  # <angle-bracket placeholders>
+    # Resource-kind labels in core/state.py. `RESOURCE_SECRET = "secret"` names
+    # a category of resource for the ownership map; the value is the label
+    # itself, which is why it reads as a credential assignment and is not one.
+    '''RESOURCE_SECRET\s*=\s*["']secret["']''',
+]
+
+[allowlist]
+description = "Known false-positive matches, each verified and pinned below"
+
+# Which part of a finding `regexes` are tested against: the whole source line,
+# so an entry can pin the exact statement it exempts.
+#
+# Note this is a single string field on the allowlist. Declaring it as
+# [[allowlist.regexTarget]] — an array of tables — makes gitleaks fail to load
+# the config entirely rather than fall back to a default.
+regexTarget = "line"
+
+regexes = [
+    # The well-known PUBLIC Azure CLI first-party application id, published by
+    # Microsoft. Used for the device-code flow when the operator doesn't pass
+    # an explicit --device-client-id. Not a secret.
+    # https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code
+    '''AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"''',
+
+    # Entropy hits on *identifier* names in the setup flow, not on literal
+    # values: each of these lines assigns from a runtime value or forwards a
+    # keyword argument.
+    #
+    # These pin specific statements on purpose. Do not replace them with a
+    # `paths` entry for src/kb_connector/cli/setup.py: that module is the one
+    # place that legitimately handles live credential material, so exempting it
+    # wholesale would suppress findings in exactly the file most worth
+    # scanning, including any real leak introduced there later.
+    '''private_key_b64 = cert\.private_key_b64_pkcs8''',
+    '''cs\._(p12_bytes|cert_password|private_key_b64|client_secret) = ''',
+    '''cert_key_prefix=cfg\.cert_s3_key_prefix if uses_cert else None''',
+]
+
+# Generated trees. `detect --no-git` does not consult .gitignore, so without
+# these a build/ snapshot gets scanned alongside src/, reporting findings
+# against generated copies that are not part of the repo.
+paths = [
+    '''^build/''',
+    '''^dist/''',
+    '''\.egg-info/''',
+    '''^\.pytest_cache/''',
+    '''__pycache__/''',
+    '''\.pyc$''',
+]

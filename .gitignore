@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and config (may contain tenant-specific values)
+.env
+kb-connector.toml
+kb-connector.state.json
+*.handoff.json
+
+# State and artifacts
+.bmkb-artifacts/
+kb-connector-probe-runs/
+*.p12
+*.pem
+
+# Internal development notes
+.internal/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
