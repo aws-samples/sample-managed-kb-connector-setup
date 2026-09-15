@@ -188,6 +188,205 @@ def test_build_ds_payload():
     assert inner == params
 
 
+# --- Payload conformance against the bedrock-agent model ---------------------
+#
+# The builders above produce request bodies. These tests run those bodies
+# through botocore's serializer, which validates them against the service
+# model, so a field name or nesting level that the API would reject fails here
+# instead of on a live call. CONTRIBUTING asks for parameter shapes to be
+# validated against the API before they're relied on; this is the offline half
+# of that.
+
+
+class _CapturedRequest(Exception):
+    """Raised from a before-send hook once a request has been serialized."""
+
+    def __init__(self, request):
+        super().__init__("captured")
+        self.request = request
+
+
+def _serialize(service, operation, **params):
+    """Return (method, path, body) for a call, without leaving the process.
+
+    Runs the real client path including model validation, then aborts at the
+    transport rather than faking a response.
+    """
+    import json
+    from urllib.parse import urlsplit
+
+    import boto3
+
+    client = boto3.client(
+        service,
+        region_name="us-west-2",
+        aws_access_key_id="AKIA_TEST",
+        aws_secret_access_key="secret",
+    )
+    client.meta.events.register(
+        "before-send.*.*", lambda request, **_: _raise_captured(request)
+    )
+    try:
+        getattr(client, operation)(**params)
+    except _CapturedRequest as exc:
+        body = exc.request.body
+        if isinstance(body, bytes):
+            body = body.decode()
+        return (
+            exc.request.method,
+            urlsplit(exc.request.url).path,
+            json.loads(body) if body else None,
+        )
+    raise AssertionError(f"{operation} was not captured")
+
+
+def _raise_captured(request):
+    raise _CapturedRequest(request)
+
+
+_KB_ID = "KBABC123XYZ"
+_DS_ID = "DSABC123XYZ"
+
+
+def test_kb_payload_matches_the_create_knowledge_base_model():
+    """build_knowledge_base_payload output is valid CreateKnowledgeBase input."""
+    payload = build_knowledge_base_payload(
+        name="kb-connector-eng", role_arn="arn:aws:iam::111122223333:role/r"
+    )
+    method, path, body = _serialize(
+        "bedrock-agent", "create_knowledge_base", **payload
+    )
+    assert (method, path) == ("PUT", "/knowledgebases/")
+    assert body["name"] == "kb-connector-eng"
+    assert body["roleArn"] == "arn:aws:iam::111122223333:role/r"
+    assert body["knowledgeBaseConfiguration"]["type"] == "MANAGED"
+
+
+def test_creates_carry_an_idempotency_token():
+    """The SDK fills clientToken, so a retried create cannot duplicate a resource.
+
+    Serialization happens once per call, ahead of the retry loop, so every
+    attempt of one call reuses this token and the service de-duplicates.
+    """
+    payload = build_knowledge_base_payload(name="kb", role_arn="arn:role")
+    _, _, body = _serialize("bedrock-agent", "create_knowledge_base", **payload)
+    assert body["clientToken"]
+
+
+def test_ds_payload_matches_the_create_data_source_model():
+    """The MANAGED_KNOWLEDGE_BASE_CONNECTOR envelope survives serialization."""
+    params = {"sharePointConfiguration": {"aclEnabled": True}}
+    payload = build_data_source_payload(name="eng-ds", connector_parameters=params)
+    method, path, body = _serialize(
+        "bedrock-agent", "create_data_source", knowledgeBaseId=_KB_ID, **payload
+    )
+    assert (method, path) == ("PUT", f"/knowledgebases/{_KB_ID}/datasources/")
+    config = body["dataSourceConfiguration"]
+    assert config["type"] == "MANAGED_KNOWLEDGE_BASE_CONNECTOR"
+    inner = config["managedKnowledgeBaseConnectorConfiguration"]["connectorParameters"]
+    assert inner == params, "connectorParameters must stay a JSON object, not a string"
+
+
+def test_ds_payload_passes_unmodeled_override_keys_through():
+    """connectorParameters is a free-form document, which is what makes
+    connector_params_overrides work: a field the builders don't model reaches
+    the API unchanged rather than being dropped or rejected.
+    """
+    params = {
+        "sharePointConfiguration": {"aclEnabled": True},
+        "someFieldWeDoNotModel": {"nested": ["a", 1, True]},
+    }
+    payload = build_data_source_payload(name="eng-ds", connector_parameters=params)
+    _, _, body = _serialize(
+        "bedrock-agent", "create_data_source", knowledgeBaseId=_KB_ID, **payload
+    )
+    inner = body["dataSourceConfiguration"][
+        "managedKnowledgeBaseConnectorConfiguration"
+    ]["connectorParameters"]
+    assert inner["someFieldWeDoNotModel"] == {"nested": ["a", 1, True]}
+
+
+def test_structure_outside_connector_parameters_is_validated():
+    """The free-form pass-through stops at connectorParameters.
+
+    Everything wrapping it is modeled, so a wrong field name there fails
+    locally instead of on a live call. This is the boundary the override
+    escape hatch lives inside.
+    """
+    import pytest
+    from botocore.exceptions import ParamValidationError
+
+    with pytest.raises(ParamValidationError):
+        _serialize(
+            "bedrock-agent",
+            "create_data_source",
+            knowledgeBaseId=_KB_ID,
+            name="ds",
+            dataSourceConfiguration={
+                "type": "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
+                "managedKnowledgeBaseConnectorConfiguration": {
+                    "connectorParameters": {},
+                    "deletionProtectionConfiguration": {"enabled": False},
+                },
+            },
+        )
+
+
+def test_retrieve_user_context_is_top_level():
+    """ACL-aware retrieval needs userContext beside retrievalQuery, not inside it."""
+    method, path, body = _serialize(
+        "bedrock-agent-runtime",
+        "retrieve",
+        knowledgeBaseId=_KB_ID,
+        retrievalQuery={"text": "who won"},
+        userContext={"userId": "alice@example.com"},
+    )
+    assert (method, path) == ("POST", f"/knowledgebases/{_KB_ID}/retrieve")
+    assert body["userContext"] == {"userId": "alice@example.com"}
+    assert "userContext" not in body["retrievalQuery"]
+
+
+def test_retrieve_managed_search_configuration_is_accepted():
+    """Managed KBs take managedSearchConfiguration; the vector shape is rejected."""
+    _, _, body = _serialize(
+        "bedrock-agent-runtime",
+        "retrieve",
+        knowledgeBaseId=_KB_ID,
+        retrievalQuery={"text": "q"},
+        retrievalConfiguration={
+            "managedSearchConfiguration": {
+                "filter": {"equals": {"key": "k", "value": "v"}}
+            }
+        },
+    )
+    assert body["retrievalConfiguration"]["managedSearchConfiguration"]["filter"] == {
+        "equals": {"key": "k", "value": "v"}
+    }
+
+
+def test_read_and_delete_operations_map_to_expected_paths():
+    """Every remaining operation the tool calls, and the route it serializes to."""
+    cases = [
+        ("get_knowledge_base", {"knowledgeBaseId": _KB_ID},
+         "GET", f"/knowledgebases/{_KB_ID}"),
+        ("delete_knowledge_base", {"knowledgeBaseId": _KB_ID},
+         "DELETE", f"/knowledgebases/{_KB_ID}"),
+        ("get_data_source", {"knowledgeBaseId": _KB_ID, "dataSourceId": _DS_ID},
+         "GET", f"/knowledgebases/{_KB_ID}/datasources/{_DS_ID}"),
+        ("delete_data_source", {"knowledgeBaseId": _KB_ID, "dataSourceId": _DS_ID},
+         "DELETE", f"/knowledgebases/{_KB_ID}/datasources/{_DS_ID}"),
+        ("start_ingestion_job", {"knowledgeBaseId": _KB_ID, "dataSourceId": _DS_ID},
+         "PUT", f"/knowledgebases/{_KB_ID}/datasources/{_DS_ID}/ingestionjobs/"),
+        ("get_ingestion_job",
+         {"knowledgeBaseId": _KB_ID, "dataSourceId": _DS_ID, "ingestionJobId": "JOB1"},
+         "GET",
+         f"/knowledgebases/{_KB_ID}/datasources/{_DS_ID}/ingestionjobs/JOB1"),
+    ]
+    for operation, params, want_method, want_path in cases:
+        method, path, _ = _serialize("bedrock-agent", operation, **params)
+        assert (method, path) == (want_method, want_path), operation
+
+
 # --- Provisioning policies ---------------------------------------------------
 
 
