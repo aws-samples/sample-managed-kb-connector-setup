@@ -886,22 +886,6 @@ Each connector implements an open-ended `ConnectorSpec` interface that declares
 its own config fields, auth modes, setup steps, and parameter builder. Adding a
 field or a new connector touches that one file, not the core.
 
-### Why raw SigV4 for `bedrock-agent`
-
-Most AWS calls go through boto3 (IAM, S3, Secrets Manager, STS, CloudTrail).
-The bedrock-agent control plane and runtime are an exception: the tool talks
-to them with a small SigV4-signing client (`SignedClient`) and a hand-built
-JSON body. The reason is that the public boto3 model did not expose the
-`MANAGED_KNOWLEDGE_BASE_CONNECTOR` data-source envelope or the top-level
-`userContext` field on Retrieve until boto3 1.43.32. The signing client is
-what has been validated end-to-end, so it is what ships.
-
-A future release will retire it in favour of typed boto3 calls, with a
-higher boto3 floor and curated TOML fields for the typed knobs that come
-with it (deletion protection, media extraction). The
-`connector_params_overrides` escape hatch stays either way, since
-`connectorParameters` is a free-form structure.
-
 ---
 
 ## MCP server
@@ -965,10 +949,11 @@ python -m pytest
 
 The committed suite is unit tests only: pure logic with no network that runs in
 under three seconds. It covers parameter builders, secret schemas, config
-resolution, state management, the retry policy, and output formatting, plus the
-security-relevant controls in [THREAT-MODEL.md](THREAT-MODEL.md) — endpoint
-allowlisting, resource ownership and tagging, the teardown ownership gate, file
-permissions, and log redaction. Where a check needs an AWS client, tests use
+resolution, state management, and output formatting, plus request shapes
+checked against the `bedrock-agent` service model, and the security-relevant
+controls in [THREAT-MODEL.md](THREAT-MODEL.md) — endpoint reporting, resource
+ownership and tagging, the teardown ownership gate, file permissions, and log
+redaction. Where a check needs an AWS client, tests use
 small in-process fakes rather than reaching the network. Maintainers run live
 validation against a real account before releases.
 

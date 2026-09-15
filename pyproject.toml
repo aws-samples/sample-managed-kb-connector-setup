@@ -104,8 +104,6 @@ exclude_dirs = ["tests"]              # B105/B106 noise on test fixtures (string
                                       # passwords). Tests don't need src-grade
                                       # security analysis.
 skips = [
-    "B311",   # random.random() jitter for retry backoff (signed_client.py),
-              # not used for any cryptographic purpose.
     "B404",   # subprocess module import (microsoft/client.py) for the `az`
               # token flow. Subprocess use is intentional and validated.
     "B603",   # subprocess.run with the user's `az` CLI path. The command and
