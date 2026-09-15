@@ -151,10 +151,17 @@ jobs:
           pip install pip-audit
 
       # Audits the resolved tree, which is what a fresh `pip install` produces.
+      #
+      # --skip-editable excludes this project's own editable install, which has
+      # no PyPI record and therefore cannot be audited. Note that --strict is
+      # deliberately NOT used here: it fails the run on any skipped dependency,
+      # including one skipped on purpose, so the two flags cannot be combined.
+      # --strict is still applied to the declared-floors audit below, where the
+      # requirements file contains no self-reference.
       - name: Audit resolved dependencies
         run: |
           pip install -e ".[dev,mcp]"
-          pip-audit --strict --desc
+          pip-audit --desc --skip-editable
 
       # Audits the declared *floors*, which is what a constraints file or an
       # older base image resolves to. A floor that admits a vulnerable release
