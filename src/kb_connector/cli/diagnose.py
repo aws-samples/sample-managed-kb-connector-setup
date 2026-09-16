@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     # Annotation-only: diagnostics pulls in botocore, and this module is on the
     # --help path.
     from kb_connector.core.diagnostics import CheckResult
+    from kb_connector.core.state import ConnectorState
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -41,6 +42,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--lookback", type=int, default=60,
         help="CloudTrail and log lookback in minutes (default: 60)",
+    )
+    parser.add_argument(
+        "--auth-method", choices=["az", "device_code"], default="az",
+        help=(
+            "Graph token acquisition for the certificate check (default: az). "
+            "Without Graph access that one check reports as unverified and the "
+            "rest of the diagnosis still runs."
+        ),
+    )
+    parser.add_argument(
+        "--device-client-id",
+        help="Public client app id for --auth-method device_code",
     )
     parser.add_argument(
         "--logs", action="store_true",
@@ -80,7 +93,8 @@ def run(args: argparse.Namespace) -> int:
 def _run_diagnose(args: argparse.Namespace) -> int:
     from kb_connector.core.diagnostics import (
         CheckResult, build_diagnose_result,
-        check_cert_expiry, check_cloudtrail_permissions, check_ingestion_logs,
+        check_cert_expiry, check_certificate_installed,
+        check_cloudtrail_permissions, check_ingestion_logs,
         check_secret_validity, default_log_group_name,
     )
     import boto3
@@ -157,6 +171,18 @@ def _run_diagnose(args: argparse.Namespace) -> int:
         checks.append(check)
         _print_check(check)
 
+    # 2b. Is that certificate still the one the app trusts? Expiry is read from
+    # state, so it says nothing about whether the directory still carries the
+    # certificate — the two halves of the credential can drift apart.
+    if credential == "cert" and cs and cs.client_app_object_id:
+        print("  Checking the certificate is installed on the app...")
+        check = check_certificate_installed(
+            recorded_thumbprint=cs.cert_thumbprint_b64url,
+            installed_thumbprints=_installed_thumbprints(args, cs),
+        )
+        checks.append(check)
+        _print_check(check)
+
     # 3. CloudTrail permission check
     role_arn = cs.kb_role_arn if cs else None
     print("  Scanning CloudTrail for permission issues...")
@@ -229,6 +255,35 @@ def _run_diagnose(args: argparse.Namespace) -> int:
         print(json.dumps(output, indent=2))
 
     return 0 if result.status == "healthy" else 1
+
+
+def _installed_thumbprints(
+    args: argparse.Namespace, cs: ConnectorState
+) -> list[str] | None:
+    """Read the app's certificate thumbprints, or None if the directory is
+    unreachable.
+
+    Returning None rather than raising is deliberate: an operator diagnosing the
+    AWS side of a connector often has no Graph access at all, and one
+    unverifiable check should not take the whole diagnosis down. The caller turns
+    None into an "unverified" result.
+    """
+    if not cs.tenant_id or not cs.client_app_object_id:
+        return None
+    try:
+        from kb_connector.providers.microsoft.apps import (
+            list_certificate_thumbprints,
+        )
+        from kb_connector.providers.microsoft.client import GraphClient
+
+        graph = GraphClient.from_auth(
+            method=getattr(args, "auth_method", "az"),
+            tenant_id=cs.tenant_id,
+            device_client_id=getattr(args, "device_client_id", None),
+        )
+        return list_certificate_thumbprints(graph, cs.client_app_object_id)
+    except Exception:  # noqa: BLE001 - no Graph access is an expected outcome
+        return None
 
 
 def _print_check(check: CheckResult) -> None:

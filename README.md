@@ -316,7 +316,9 @@ stops the run before any Entra work if it doesn't. Registering an app and
 consenting its permissions can't be undone, so a run that would be refused on the
 AWS side shouldn't leave those behind. You'll see every conflicting resource at
 once, each with the reason and the ways forward. A standalone `--stage 1` skips
-the preflight, since it has no AWS credentials by design.
+the preflight, since it has no AWS credentials by design — and for SharePoint and
+OneDrive it is refused outright, because the credential Stage 1 creates cannot
+reach Stage 2 in another process.
 
 If `cert_s3_bucket` isn't set in your config, setup derives a default name
 from the AWS account and region (`kb-connector-certs-<account>-<region>`),
@@ -333,7 +335,7 @@ deep-merges onto the built params before the data source is created. See
 ```bash
 kb-connector setup engineering-sp                 # both stages
 kb-connector setup engineering-sp --sync          # plus first ingestion
-kb-connector setup engineering-sp --stage 1       # source-side only
+kb-connector setup engineering-sp --rotate-cert    # issue a new certificate
 kb-connector setup engineering-sp --kb EPS06WSNZU # attach to an existing KB
 
 # Encrypt the secret + certificate with your own KMS key instead of the
@@ -464,24 +466,37 @@ the AWS admin, and the tool supports that split directly.
 
 ```bash
 # Identity admin runs Stage 1, then exports for the AWS admin:
-kb-connector setup engineering-sp --stage 1
-kb-connector handoff engineering-sp --to aws        # writes engineering-sp.handoff.json
+kb-connector setup engineering-confluence --stage 1
+kb-connector handoff engineering-confluence --to aws   # writes the handoff JSON
 
 # AWS admin imports it and runs Stage 2:
-kb-connector setup engineering-sp --from-handoff ./engineering-sp.handoff.json --stage 2
+kb-connector setup engineering-confluence --from-handoff ./engineering-confluence.handoff.json --stage 2
 
 # Reverse direction (AWS admin shares KB/DS IDs back so the identity admin can validate):
-kb-connector handoff engineering-sp --to source
+kb-connector handoff engineering-confluence --to source
 ```
 
 The handoff file carries only what the next person needs, the IDs and non-secret
-configuration. It never pulls secrets out of AWS.
+configuration. It never pulls secrets out of AWS, and it never carries a
+credential.
 
-Because the handoff never carries secrets, the split works for certificate-based
-SharePoint and OneDrive: the certificate goes to S3 and Secrets Manager during
-Stage 2, and Stage 1 hands off only IDs. It does not work for client-secret or
-OAuth auth, where the secret is generated in Stage 1 and never written to state
-or the handoff file. For those, run `setup --stage both` in a single process.
+That last point bounds where the split applies. It works for connectors whose
+credential is supplied to Stage 2 directly — Confluence, Google Drive, and web
+basic auth, where the AWS admin enters the token or password when Stage 2 prompts
+for it.
+
+It does not complete the setup for SharePoint or OneDrive in any credential mode.
+Stage 1 creates the credential there — a certificate private key, or a client
+secret — and holds it only in memory, so Stage 2 in a second process has nothing
+to store in Secrets Manager. `setup --stage 1` is refused for those connectors
+rather than left to half-run; use `--stage both` in one process, where the
+credential passes between stages in memory. See KNOWN-LIMITATIONS.md for what to
+do when the two roles must be different people.
+
+`handoff` is still worth running for SharePoint and OneDrive for what it does
+carry: tenant and app IDs out to the AWS admin, and knowledge base and data
+source IDs back, so each side can configure and validate without holding the
+other's credentials.
 
 ---
 

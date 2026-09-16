@@ -64,6 +64,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--app-name", help="Entra app display name override")
     parser.add_argument("--cert-valid-days", type=int, default=365,
                         help="Certificate validity in days (default: 365)")
+    parser.add_argument("--rotate-cert", action="store_true",
+                        help="Issue a new certificate instead of keeping the "
+                             "one already installed on the app. Replaces the "
+                             "app's certificate and rewrites the secret and the "
+                             "S3 copy, so an ingestion running at the time will "
+                             "fail to authenticate; start it when no crawl is "
+                             "in flight.")
     parser.add_argument("--sites-selected", action="store_true",
                         help="Use Sites.Selected (SharePoint least-privilege)")
     # AWS-side options
@@ -752,9 +759,29 @@ def _setup_microsoft(
             "KNOWN-LIMITATIONS.md."
         )
 
-    # Check AWS-side ownership before doing any irreversible Entra work. Only
-    # meaningful when both stages run in this process: a standalone `--stage 1`
-    # legitimately has no AWS credentials (the split-admin workflow), and
+    # Stage 1 mints the connector's credential — a certificate private key, or a
+    # client secret — and holds it only in memory. It is never written to state
+    # and never travels in a handoff document, both of which carry identifiers
+    # only. So Stage 2 in a second process has nothing to write to Secrets
+    # Manager, and a Stage 1 that runs alone cannot lead to a working connector
+    # for any Microsoft credential mode.
+    #
+    # Refused up front rather than allowed to half-run, because Stage 1 replaces
+    # the application's certificate on the way: an operator who runs it against a
+    # working connector leaves the directory trusting a certificate whose private
+    # key AWS does not have, and the next ingestion fails to authenticate.
+    if stage == "1":
+        raise ConfigError(
+            f"`--stage 1` alone cannot set up a {cfg.type} connector. The "
+            f"credential Stage 1 creates exists only in memory — it is never "
+            f"written to the state file or a handoff document — so Stage 2 in a "
+            f"separate process has nothing to store in Secrets Manager. Run "
+            f"`--stage both` instead. If the identity and AWS work must be done "
+            f"by different people, see the split-admin notes in "
+            f"KNOWN-LIMITATIONS.md."
+        )
+
+    # Check AWS-side ownership before doing any irreversible Entra work.
     # --from-handoff skips Stage 1 entirely, so there is nothing to protect.
     if stage == "both" and not args.from_handoff:
         _preflight_aws_ownership(args, cfg, cs, connector_name, uses_cert=uses_cert)
@@ -805,18 +832,39 @@ def _setup_microsoft(
         cert_password = None
         private_key_b64 = None
         if uses_cert:
-            cert_password = _secrets.token_urlsafe(24)
-            cert = certs.generate_self_signed(
-                common_name=app_name,
-                valid_days=args.cert_valid_days,
-                pkcs12_password=cert_password,
-            )
-            apps.upload_certificate(graph, reg.object_id, cert)
-            cert_thumbprint = cert.thumbprint_b64url
-            cert_not_after = cert.not_after
-            p12_bytes = cert.pkcs12_bytes
-            private_key_b64 = cert.private_key_b64_pkcs8
-            print(f"  Generated + uploaded certificate (expires {cert.not_after})")
+            # Ask the directory which certificates the app actually carries. A
+            # failure here is not fatal: it only means reuse cannot be confirmed,
+            # and issuing a new certificate is the outcome that leaves both halves
+            # of the credential in step.
+            try:
+                installed = apps.list_certificate_thumbprints(graph, reg.object_id)
+            except Exception as exc:  # noqa: BLE001 - degrade to issuing a new cert
+                print(f"  Could not read the app's certificates ({exc});")
+                print("  issuing a new certificate.")
+                installed = []
+
+            if _should_reuse_certificate(
+                cs, installed_thumbprints=installed, rotate=args.rotate_cert
+            ):
+                cert_thumbprint = cs.cert_thumbprint_b64url
+                cert_not_after = cs.cert_not_after
+                print(
+                    f"  Keeping the existing certificate (expires {cert_not_after}). "
+                    f"Pass --rotate-cert to replace it."
+                )
+            else:
+                cert_password = _secrets.token_urlsafe(24)
+                cert = certs.generate_self_signed(
+                    common_name=app_name,
+                    valid_days=args.cert_valid_days,
+                    pkcs12_password=cert_password,
+                )
+                apps.upload_certificate(graph, reg.object_id, cert)
+                cert_thumbprint = cert.thumbprint_b64url
+                cert_not_after = cert.not_after
+                p12_bytes = cert.pkcs12_bytes
+                private_key_b64 = cert.private_key_b64_pkcs8
+                print(f"  Generated + uploaded certificate (expires {cert.not_after})")
 
         # OneDrive needs a client secret even in cert mode (its ACL path mints a
         # Graph token with it), and the non-cert modes use it as the primary
@@ -929,8 +977,24 @@ def _setup_microsoft(
                 "state file, so it can't cross a process or machine boundary."
             )
 
+        # Set only when the recorded certificate is being kept, in which case it
+        # names the secret already holding the matching private key. Stage 1 keeps
+        # the certificate when it is still installed on the app and both AWS-side
+        # copies are recorded, so there is no new material to write and the stored
+        # copies already match what the directory trusts. Rewriting them is not
+        # possible anyway: the private key and its password exist only in the
+        # process that generated them.
+        kept_secret_arn: str | None = None
+        if uses_cert and not p12_bytes and cs.cert_thumbprint_b64url and cs.cert_s3_key:
+            kept_secret_arn = cs.secret_arn
+
         # Upload certificate to S3
-        if uses_cert:
+        if uses_cert and kept_secret_arn:
+            print(
+                f"  Certificate and secret unchanged "
+                f"(s3://{cs.cert_s3_bucket}/{cs.cert_s3_key})"
+            )
+        elif uses_cert:
             if not p12_bytes:
                 raise StateError(
                     "Certificate material not available. Run Stage 1 in this "
@@ -963,38 +1027,43 @@ def _setup_microsoft(
             cs.cert_s3_key = cert_s3_key
             cs.record_owned(state_mod.RESOURCE_CERT)
 
-        # Write the connector secret
-        if cfg.type == "sharepoint":
-            secret_body = sp_secret(
-                credential=credential,
-                client_id=client_id,
-                client_secret=client_secret,
-                certificate_password=cert_password,
-                private_key_b64_pkcs8=private_key_b64,
-            )
-        else:  # onedrive
-            secret_body = od_secret(
-                credential=credential,
-                client_id=client_id,
-                client_secret=client_secret,
-                certificate_password=cert_password,
-                private_key_b64_pkcs8=private_key_b64,
-            )
+        # Write the connector secret. Skipped alongside the certificate: its whole
+        # contents for cert auth are the certificate password and private key, so
+        # keeping one means keeping the other.
+        if kept_secret_arn:
+            secret_arn = kept_secret_arn
+        else:
+            if cfg.type == "sharepoint":
+                secret_body = sp_secret(
+                    credential=credential,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    certificate_password=cert_password,
+                    private_key_b64_pkcs8=private_key_b64,
+                )
+            else:  # onedrive
+                secret_body = od_secret(
+                    credential=credential,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    certificate_password=cert_password,
+                    private_key_b64_pkcs8=private_key_b64,
+                )
 
-        secret_res = provisioning.put_secret(
-            session=session, name=secret_name, body=secret_body,
-            description=f"KB connector credentials for {connector_name}",
-            connector_name=connector_name,
-            tags_enabled=opts.tags_enabled,
-            extra_tags=opts.tags,
-            adopt_existing=opts.adopt_existing,
-            kms_key_arn=opts.kms_key_arn,
-            created_untagged=cs.created_untagged(state_mod.RESOURCE_SECRET),
-        )
-        secret_arn = secret_res.arn
-        print(f"  Wrote secret: {secret_arn}")
-        cs.secret_arn = secret_arn
-        cs.record_ownership(state_mod.RESOURCE_SECRET, secret_res.state_marker)
+            secret_res = provisioning.put_secret(
+                session=session, name=secret_name, body=secret_body,
+                description=f"KB connector credentials for {connector_name}",
+                connector_name=connector_name,
+                tags_enabled=opts.tags_enabled,
+                extra_tags=opts.tags,
+                adopt_existing=opts.adopt_existing,
+                kms_key_arn=opts.kms_key_arn,
+                created_untagged=cs.created_untagged(state_mod.RESOURCE_SECRET),
+            )
+            secret_arn = secret_res.arn
+            print(f"  Wrote secret: {secret_arn}")
+            cs.secret_arn = secret_arn
+            cs.record_ownership(state_mod.RESOURCE_SECRET, secret_res.state_marker)
 
         # IAM role
         kb_id = args.knowledge_base_id or cs.knowledge_base_id
@@ -1075,6 +1144,31 @@ def _setup_microsoft(
         )
 
         print("  Stage 2 complete")
+
+
+def _should_reuse_certificate(
+    cs: ConnectorState, *, installed_thumbprints: list[str], rotate: bool
+) -> bool:
+    """Whether the recorded certificate can be kept instead of issuing a new one.
+
+    A certificate is one credential split across two systems: the directory holds
+    the public certificate, and Secrets Manager plus S3 hold the private key. They
+    are only usable together, so replacing one half without the other breaks
+    authentication. Issuing a new certificate is therefore something to do when
+    asked for, not on every run.
+
+    Reuse requires all three records to agree — the thumbprint, the S3 object, and
+    the secret — plus confirmation from the directory that the recorded
+    certificate is still installed. Anything missing means the halves may already
+    disagree, and issuing a fresh certificate is what puts them back in step,
+    since Stage 2 writes both sides from the same material.
+    """
+    if rotate:
+        return False
+    recorded = cs.cert_thumbprint_b64url
+    if not recorded or not cs.cert_s3_key or not cs.secret_arn:
+        return False
+    return recorded in installed_thumbprints
 
 
 def _record_reused_resource(

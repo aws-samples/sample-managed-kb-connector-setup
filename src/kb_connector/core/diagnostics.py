@@ -404,6 +404,80 @@ def check_ingestion_logs(
 # --- Certificate expiry check ------------------------------------------------
 
 
+def check_certificate_installed(
+    *,
+    recorded_thumbprint: str | None,
+    installed_thumbprints: list[str] | None,
+) -> CheckResult:
+    """Check the certificate the connector authenticates with is on the app.
+
+    A certificate is one credential split across two systems: the directory holds
+    the public certificate, and Secrets Manager plus S3 hold the private key. They
+    are only usable together, so if the directory no longer carries the recorded
+    certificate the connector cannot authenticate — and nothing on the AWS side
+    reveals that, because the private key is still perfectly intact.
+
+    `installed_thumbprints` is None when the directory could not be read at all,
+    which is a normal outcome: an operator diagnosing the AWS side may hold no
+    Graph access. That reports as unverified rather than as a failure, so the rest
+    of the diagnosis still runs. The caller does the Graph read; this function is
+    given the answer so it stays independent of how the directory is reached.
+    """
+    if installed_thumbprints is None:
+        return CheckResult(
+            name="certificate_installed",
+            passed=True,
+            details=(
+                "Not verified: could not read the app's certificates from "
+                "Microsoft Graph. Sign in with `az login` (or pass "
+                "--auth-method device_code) to check that the directory still "
+                "trusts the certificate this connector uses."
+            ),
+            data={"verified": False},
+            side="source",
+        )
+
+    if not recorded_thumbprint:
+        return CheckResult(
+            name="certificate_installed",
+            passed=True,
+            details=(
+                "No certificate thumbprint tracked in state (non-cert credential "
+                "or fresh setup)."
+            ),
+            data={"verified": False},
+            side="source",
+        )
+
+    if recorded_thumbprint in installed_thumbprints:
+        return CheckResult(
+            name="certificate_installed",
+            passed=True,
+            details="The certificate this connector uses is installed on the app.",
+            data={"verified": True, "thumbprint": recorded_thumbprint},
+            side="source",
+        )
+
+    return CheckResult(
+        name="certificate_installed",
+        passed=False,
+        details=(
+            f"The app does not carry the certificate this connector uses "
+            f"(thumbprint {recorded_thumbprint}). The directory holds "
+            f"{len(installed_thumbprints)} other certificate(s), so authentication "
+            f"will fail even though the private key in Secrets Manager is intact. "
+            f"Re-run `setup --stage both --rotate-cert` to issue a new certificate "
+            f"and write both halves together."
+        ),
+        data={
+            "verified": True,
+            "thumbprint": recorded_thumbprint,
+            "installed_count": len(installed_thumbprints),
+        },
+        side="source",
+    )
+
+
 def check_cert_expiry(
     *,
     cert_not_after: str | None,

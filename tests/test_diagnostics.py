@@ -6,6 +6,7 @@ from kb_connector.core.diagnostics import (
     CheckResult,
     build_diagnose_result,
     check_cert_expiry,
+    check_certificate_installed,
 )
 from kb_connector.core.log_analysis import (
     DocumentEvent,
@@ -124,3 +125,66 @@ def test_analyze_logs_empty():
     assert result.total_events == 0
     assert result.indexed_count == 0
     assert result.groups == []
+
+
+# --- The certificate the connector uses is still on the app -------------------
+#
+# Expiry is read from state, so it cannot tell you whether the directory still
+# carries the certificate. The private key in Secrets Manager stays perfectly
+# intact when the app's certificate is replaced, so the AWS side looks healthy
+# while authentication is broken. This is the check that catches that.
+
+_RECORDED = "MU2ZxMbvstlL9kFKLLyYrg6QF50"
+_OTHER = "ZZZZxMbvstlL9kFKLLyYrg6QF50"
+
+
+def test_certificate_installed_passes_when_the_app_carries_it():
+    check = check_certificate_installed(
+        recorded_thumbprint=_RECORDED, installed_thumbprints=[_OTHER, _RECORDED]
+    )
+    assert check.passed
+    assert check.data["verified"] is True
+
+
+def test_certificate_installed_fails_when_the_app_carries_a_different_one():
+    """The desync: AWS holds a private key the directory no longer trusts."""
+    check = check_certificate_installed(
+        recorded_thumbprint=_RECORDED, installed_thumbprints=[_OTHER]
+    )
+    assert not check.passed
+    assert "--rotate-cert" in check.details
+
+
+def test_certificate_installed_fails_when_the_app_carries_none():
+    check = check_certificate_installed(
+        recorded_thumbprint=_RECORDED, installed_thumbprints=[]
+    )
+    assert not check.passed
+
+
+def test_certificate_unreadable_reports_unverified_rather_than_failing():
+    """An operator diagnosing the AWS side may hold no Graph access at all, and
+    one unverifiable check must not fail the whole diagnosis."""
+    check = check_certificate_installed(
+        recorded_thumbprint=_RECORDED, installed_thumbprints=None
+    )
+    assert check.passed
+    assert check.data["verified"] is False
+    assert "Not verified" in check.details
+
+
+def test_certificate_check_is_inert_without_a_recorded_thumbprint():
+    check = check_certificate_installed(
+        recorded_thumbprint=None, installed_thumbprints=[_OTHER]
+    )
+    assert check.passed
+    assert check.data["verified"] is False
+
+
+def test_a_failing_certificate_check_is_attributed_to_the_source_side():
+    """Attribution drives the diagnosis summary; this failure is not AWS's."""
+    check = check_certificate_installed(
+        recorded_thumbprint=_RECORDED, installed_thumbprints=[_OTHER]
+    )
+    assert check.side == "source"
+    assert build_diagnose_result("c", [check]).status != "healthy"

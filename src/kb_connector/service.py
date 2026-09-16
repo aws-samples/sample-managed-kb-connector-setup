@@ -423,26 +423,24 @@ def validate(
     checks: list[CheckResult] = []
     notes: list[str] = []
 
-    # Token mint is informational only — minting a cert token requires the
-    # private key, which isn't kept in state. We surface that fact rather
-    # than pretending to check it.
+    # Validate reaches AWS and the connector's own state; it does not sign in to
+    # the identity provider. So the source side is reported as a note rather than
+    # a check: a check that cannot fail counts toward the healthy total and makes
+    # the result look better evidenced than it is. `diagnose` holds the check that
+    # does reach Microsoft Graph and can fail — it confirms the directory still
+    # carries the certificate this connector authenticates with.
     if cfg and cfg.type in ("sharepoint", "onedrive"):
         tenant_id = cfg.tenant_id or (cs.tenant_id if cs else None)
         client_id = cs.client_app_id if cs else None
         if tenant_id and client_id:
-            checks.append(CheckResult(
-                name="token_mint",
-                passed=True,
-                details=(
-                    "Token mint requires live credentials (not stored in "
-                    f"state). App {client_id} in tenant {tenant_id} — "
-                    "use diagnose for deeper checks."
-                ),
-                side="source",
-            ))
+            notes.append(
+                f"Source side not checked here: app {client_id} in tenant "
+                f"{tenant_id}. Run `kb-connector diagnose` to verify the "
+                f"certificate against the directory."
+            )
         else:
             notes.append(
-                "Skipped token_mint: tenant_id or client_app_id unavailable."
+                "Source side not checked: tenant_id or client_app_id unavailable."
             )
 
     target_kb = kb_id or (cs.knowledge_base_id if cs else None)

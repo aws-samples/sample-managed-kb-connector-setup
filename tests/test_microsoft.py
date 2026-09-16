@@ -100,3 +100,108 @@ def test_certificate_der_b64():
     b64 = certificate_der_b64(cert.certificate_der)
     decoded = base64.b64decode(b64)
     assert decoded == cert.certificate_der
+
+
+# --- Reading the certificates installed on an app -----------------------------
+
+
+def _graph_returning(key_credentials):
+    class _Graph:
+        def get(self, path, **params):
+            assert params == {"$select": "keyCredentials"}, params
+            return {"keyCredentials": key_credentials}
+
+    return _Graph()
+
+
+def _as_hex(thumbprint_b64url):
+    """Uppercase hex, which is what Graph returned from a live tenant."""
+    import base64
+
+    padded = thumbprint_b64url + "=" * (-len(thumbprint_b64url) % 4)
+    return base64.urlsafe_b64decode(padded).hex().upper()
+
+
+def _as_base64(thumbprint_b64url):
+    """Standard base64, the other form the field is documented to take."""
+    import base64
+
+    padded = thumbprint_b64url + "=" * (-len(thumbprint_b64url) % 4)
+    return base64.b64encode(base64.urlsafe_b64decode(padded)).decode("ascii")
+
+
+def test_thumbprints_round_trip_a_hex_identifier():
+    """Graph returned uppercase hex from a live tenant, and the value read back
+    has to equal what state stores so the two compare directly."""
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    cert = generate_self_signed(common_name="t", pkcs12_password="pw")
+    graph = _graph_returning([
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": _as_hex(cert.thumbprint_b64url)}
+    ])
+    assert list_certificate_thumbprints(graph, "obj") == [cert.thumbprint_b64url]
+
+
+def test_a_hex_identifier_is_not_read_as_base64():
+    """A 40-character hex digest is also valid base64, and decoding it that way
+    yields 30 meaningless bytes instead of an error. Reading it as base64 would
+    silently produce a thumbprint that matches nothing."""
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    cert = generate_self_signed(common_name="t", pkcs12_password="pw")
+    hex_identifier = _as_hex(cert.thumbprint_b64url)
+    assert len(hex_identifier) == 40 and len(hex_identifier) % 4 == 0
+
+    graph = _graph_returning([
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": hex_identifier}
+    ])
+    got = list_certificate_thumbprints(graph, "obj")
+    assert got == [cert.thumbprint_b64url], got
+
+
+def test_thumbprints_round_trip_a_base64_identifier():
+    """The field is documented as base64, so both encodings are accepted."""
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    cert = generate_self_signed(common_name="t", pkcs12_password="pw")
+    graph = _graph_returning([
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": _as_base64(cert.thumbprint_b64url)}
+    ])
+    assert list_certificate_thumbprints(graph, "obj") == [cert.thumbprint_b64url]
+
+
+def test_thumbprints_ignore_entries_that_are_not_certificates():
+    """An app may also hold client secrets; the caller asked for certificates."""
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    cert = generate_self_signed(common_name="t", pkcs12_password="pw")
+    graph = _graph_returning([
+        {"type": "Symmetric", "customKeyIdentifier": _as_hex(cert.thumbprint_b64url)},
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": _as_hex(cert.thumbprint_b64url)},
+    ])
+    assert list_certificate_thumbprints(graph, "obj") == [cert.thumbprint_b64url]
+
+
+def test_thumbprints_skip_unusable_entries_instead_of_raising():
+    """A missing, malformed, or wrong-length identifier must not take the whole
+    read down, and must not contribute a bogus thumbprint."""
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    cert = generate_self_signed(common_name="t", pkcs12_password="pw")
+    graph = _graph_returning([
+        {"type": "AsymmetricX509Cert"},
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": None},
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": "!!not base64!!"},
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": "   "},
+        # Valid base64, but not a 20-byte SHA-1 digest.
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": "aGVsbG8="},
+        "not-a-dict",
+        {"type": "AsymmetricX509Cert", "customKeyIdentifier": _as_hex(cert.thumbprint_b64url)},
+    ])
+    assert list_certificate_thumbprints(graph, "obj") == [cert.thumbprint_b64url]
+
+
+def test_thumbprints_of_an_app_with_no_credentials():
+    from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+
+    assert list_certificate_thumbprints(_graph_returning([]), "obj") == []

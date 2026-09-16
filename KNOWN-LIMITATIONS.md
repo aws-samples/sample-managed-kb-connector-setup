@@ -159,11 +159,62 @@ client secret. There's no `rotate` command yet, so when either is near expiry,
 plan on tearing the connector down and re-running setup, or rotate manually
 through the Azure portal and S3.
 
+`setup --stage both --rotate-cert` will issue a fresh certificate, but it is not
+a substitute for a rotation command, because it replaces the credential with a
+gap. A certificate is one credential split across two systems: the directory
+holds the public certificate, and Secrets Manager plus S3 hold the private key.
+`--rotate-cert` writes the directory first and AWS second, so between those two
+writes the directory trusts a certificate whose private key AWS does not yet
+have, and an ingestion running at that moment fails to authenticate. Run it when
+no crawl is in flight.
+
+Closing that gap needs overlap: add the new certificate to the app *alongside*
+the old one, write the new private key to AWS, then remove the superseded entry.
+Both certificates are trusted in the middle, so there is no moment where the two
+halves disagree. That is the intended shape of a future `rotate` command. It is
+not what `--rotate-cert` does today, and it carries its own tradeoff — during the
+overlap the old certificate is still accepted, so rotating away from a credential
+you believe is compromised would not revoke it until the final step.
+
+Without `--rotate-cert`, setup keeps the certificate already installed on the
+app: it re-runs without touching a working credential, and without opening that
+gap. Re-running is therefore safe.
+
 `diagnose` flags expiring certs (warns at 30 days, fails on expiry) so
-you'll see the issue before retrieve breaks. There's no equivalent check for the
-client secret's expiry. The security consequence of no rotation path is that a
-credential you suspect is compromised stays valid until you rebuild the
+you'll see the issue before retrieve breaks. It also confirms the directory still
+carries the certificate the connector authenticates with, which expiry alone
+cannot tell you — the two halves can drift apart, and the AWS side looks healthy
+either way. That check needs Graph access; without it the check reports as
+unverified and the rest of the diagnosis still runs. There's no equivalent check
+for the client secret's expiry. The security consequence of no rotation path is
+that a credential you suspect is compromised stays valid until you rebuild the
 connector.
+
+### The split-admin handoff does not carry a Microsoft credential
+
+`handoff` moves identifiers and non-secret configuration between the identity
+admin and the AWS admin, and deliberately never carries a secret. For
+SharePoint and OneDrive that means the split cannot be completed by handoff
+alone, whichever credential mode you choose: Stage 1 creates the certificate
+private key or the client secret and holds it only in memory, so Stage 2 in a
+second process has nothing to write to Secrets Manager.
+
+`setup --stage 1` is refused for these connectors for that reason. It would
+leave the directory holding a certificate whose private key never reaches AWS,
+and against an already-working connector it would replace a certificate that AWS
+still depends on. Run `--stage both` in one process, where the credential passes
+between the stages in memory and never touches disk.
+
+Where the two roles genuinely have to be separate people, the workable path today
+is that the AWS admin runs `--stage both` with directory permissions delegated
+for the duration, or the identity admin runs it with AWS credentials scoped to
+the connector's resources. Making the split work end to end would mean the tool
+handing the private key to the operator to transfer — a deliberate credential
+export, which is the thing the handoff format is designed to avoid.
+
+`handoff` remains useful in both directions for what it does carry: tenant and
+app ids to the AWS admin, and knowledge base and data source ids back, so each
+side can configure and validate without the other's credentials.
 
 ### Group-based ACL is unvalidated
 

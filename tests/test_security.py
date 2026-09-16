@@ -59,7 +59,10 @@ from kb_connector.core.tagging import (
     normalize_tags,
     validate_extra_tags,
 )
-from kb_connector.cli.setup import _record_reused_resource
+from kb_connector.cli.setup import (
+    _record_reused_resource,
+    _should_reuse_certificate,
+)
 from kb_connector.providers.microsoft.apps import escape_odata_literal
 
 
@@ -324,6 +327,90 @@ def test_an_untagged_tool_created_resource_is_still_ours(resource, field_name):
 def test_no_id_to_compare_is_never_claimed(resource, field_name):
     cs = _state_recording(resource, field_name, OWNER_TOOL)
     assert not cs.is_recorded_ours(resource, None)
+
+
+# --- AS-2: a certificate is one credential split across two systems -----------
+#
+# The directory holds the public certificate; Secrets Manager and S3 hold the
+# private key. Replacing one half without the other breaks authentication while
+# leaving both halves individually intact, so a new certificate is issued only
+# when asked for or when the halves cannot be confirmed to agree.
+
+_INSTALLED = "MU2ZxMbvstlL9kFKLLyYrg6QF50"
+
+
+def _state_with_certificate(thumbprint=_INSTALLED, *, s3_key="k.p12", secret="arn:s"):
+    cs = ConnectorState()
+    cs.cert_thumbprint_b64url = thumbprint
+    cs.cert_s3_key = s3_key
+    cs.secret_arn = secret
+    return cs
+
+
+def test_a_certificate_still_installed_is_kept():
+    """A re-run must not replace a working credential."""
+    assert _should_reuse_certificate(
+        _state_with_certificate(), installed_thumbprints=[_INSTALLED], rotate=False
+    )
+
+
+def test_rotate_always_issues_a_new_certificate():
+    assert not _should_reuse_certificate(
+        _state_with_certificate(), installed_thumbprints=[_INSTALLED], rotate=True
+    )
+
+
+def test_a_certificate_the_app_no_longer_carries_is_reissued():
+    """The halves already disagree, and reissuing is what puts them back in step."""
+    assert not _should_reuse_certificate(
+        _state_with_certificate(), installed_thumbprints=["other"], rotate=False
+    )
+
+
+def test_nothing_recorded_means_a_certificate_must_be_issued():
+    assert not _should_reuse_certificate(
+        ConnectorState(), installed_thumbprints=[_INSTALLED], rotate=False
+    )
+
+
+def test_a_certificate_missing_from_s3_is_reissued():
+    """Stage 1 recorded a thumbprint but Stage 2 never stored the private key."""
+    cs = _state_with_certificate(s3_key=None)
+    assert not _should_reuse_certificate(
+        cs, installed_thumbprints=[_INSTALLED], rotate=False
+    )
+
+
+def test_a_certificate_with_no_secret_recorded_is_reissued():
+    cs = _state_with_certificate(secret=None)
+    assert not _should_reuse_certificate(
+        cs, installed_thumbprints=[_INSTALLED], rotate=False
+    )
+
+
+def test_an_unreadable_directory_reissues_rather_than_assuming():
+    """Reuse cannot be confirmed, so the safe outcome is a fresh certificate
+    written to both halves together."""
+    assert not _should_reuse_certificate(
+        _state_with_certificate(), installed_thumbprints=[], rotate=False
+    )
+
+
+def test_stage_one_alone_is_refused_for_a_microsoft_connector():
+    """Stage 1 holds the credential only in memory, so running it alone cannot
+    produce a working connector — and it would replace a certificate that AWS
+    still depends on."""
+    import argparse
+
+    from kb_connector.cli.setup import _setup_microsoft
+    from kb_connector.core.config import ConnectorConfig
+
+    cfg = ConnectorConfig(
+        name="c", type="sharepoint", credential="cert", tenant_id="t", region="us-west-2"
+    )
+    args = argparse.Namespace(from_handoff=None)
+    with pytest.raises(ConfigError, match="cannot set up"):
+        _setup_microsoft(args, cfg, ConnectorState(), "c", "1")
 
 
 def test_a_resource_kind_without_a_tracked_id_is_never_claimed():

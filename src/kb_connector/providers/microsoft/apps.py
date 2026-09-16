@@ -186,6 +186,77 @@ def upload_certificate(
     graph.patch(f"/applications/{app_object_id}", {"keyCredentials": [credential]})
 
 
+def list_certificate_thumbprints(graph: GraphClient, app_object_id: str) -> list[str]:
+    """Return the SHA-1 thumbprints of the certificates installed on an app.
+
+    Thumbprints come back base64url without padding, matching
+    `GeneratedCertificate.thumbprint_b64url` and `state.cert_thumbprint_b64url`
+    so they compare directly. Each identifier is decoded to the raw SHA-1 bytes
+    and re-encoded rather than compared as text, because Graph does not report
+    them in the form state stores.
+
+    This is the only way to tell whether the certificate the tool recorded is
+    still the one the application will accept. The private key lives in Secrets
+    Manager and S3, so the two halves of the credential can drift apart, and only
+    the directory can confirm its side.
+
+    Entries that are not certificates, or that carry no usable identifier, are
+    skipped: an application may also hold client secrets, and the caller is
+    asking which certificates are present.
+    """
+    resp = graph.get(
+        f"/applications/{app_object_id}", **{"$select": "keyCredentials"}
+    )
+    thumbprints: list[str] = []
+    for credential in (resp or {}).get("keyCredentials") or []:
+        if not isinstance(credential, dict):
+            continue
+        if credential.get("type") != "AsymmetricX509Cert":
+            continue
+        raw = _decode_thumbprint(credential.get("customKeyIdentifier"))
+        if raw is None:
+            continue
+        thumbprints.append(_b64url_no_padding(raw))
+    return thumbprints
+
+
+def _decode_thumbprint(identifier: object) -> bytes | None:
+    """Decode a `customKeyIdentifier` to raw SHA-1 bytes, or None if unusable.
+
+    Graph reports this field as hex in some tenants and base64 in others, so both
+    are accepted. Hex is tried first: a 40-character hex string is also valid
+    base64, and decoding it that way yields 30 meaningless bytes rather than an
+    error, which would silently produce a thumbprint that matches nothing.
+
+    The length check is what makes that safe in general. A SHA-1 digest is 20
+    bytes, so anything else means the value was not the digest this is looking
+    for, whichever encoding produced it.
+    """
+    import base64
+    import binascii
+
+    if not isinstance(identifier, str) or not identifier.strip():
+        return None
+    text = identifier.strip()
+
+    raw: bytes | None = None
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        try:
+            raw = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+    return raw if len(raw) == 20 else None
+
+
+def _b64url_no_padding(raw: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
 def add_client_secret(
     graph: GraphClient,
     app_object_id: str,
