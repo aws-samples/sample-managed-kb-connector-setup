@@ -502,7 +502,7 @@ def _delete_role(session, role_arn):
     iam.delete_role(RoleName=role_name)
 
 
-def _delete_cert(session, bucket: str, key: str) -> None:
+def _delete_cert(session, bucket: str | None, key: str | None) -> None:
     """Delete the certificate object from S3.
 
     The cert bucket itself is shared across connectors and is left in place;
@@ -510,7 +510,8 @@ def _delete_cert(session, bucket: str, key: str) -> None:
 
     Bucket and key come from the state file, so both are shape-checked before
     the delete: an unchecked pair aims DeleteObject at any object the caller's
-    credentials can reach.
+    credentials can reach. A missing value fails the same check rather than
+    reaching S3, which is why the parameters admit None.
     """
     s3 = session.client("s3")
     s3.delete_object(

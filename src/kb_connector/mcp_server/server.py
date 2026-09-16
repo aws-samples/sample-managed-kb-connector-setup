@@ -28,10 +28,17 @@ from __future__ import annotations
 
 import sys
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from kb_connector import __version__, service
 from kb_connector.core.errors import ConnectorError
+
+# The handoff directions an agent may ask for. Doubles as the validator: a
+# lookup miss is the rejection, so no unvalidated string reaches the library.
+_HANDOFF_DIRECTIONS: dict[str, Literal["aws", "source"]] = {
+    "aws": "aws",
+    "source": "source",
+}
 
 
 def _build_server() -> Any:
@@ -242,7 +249,11 @@ def _build_server() -> Any:
         config_path: str | None = None,
         state_path: str | None = None,
     ) -> dict:
-        if direction not in ("aws", "source"):
+        # An agent supplies this as a free-form string, so the mapping is both
+        # the validation and the narrowing: anything absent from it is rejected
+        # before reaching the library, with no unchecked assertion in between.
+        checked = _HANDOFF_DIRECTIONS.get(direction)
+        if checked is None:
             return {
                 "error": f"Unknown direction {direction!r}; expected 'aws' or 'source'.",
                 "error_type": "ConfigError",
@@ -250,7 +261,7 @@ def _build_server() -> Any:
         try:
             result = service.handoff(
                 connector_name=connector_name,
-                direction=direction,
+                direction=checked,
                 config_path=config_path,
                 state_path=state_path,
             )

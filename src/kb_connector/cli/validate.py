@@ -70,7 +70,7 @@ def _run_validate(args: argparse.Namespace) -> int:
     if args.all:
         from kb_connector.core.config import load_config
         config = load_config(config_path)
-        names = config.connector_names()
+        names: list[str | None] = list(config.connector_names())
         if not names:
             print("Error: No connectors in config to validate.", file=sys.stderr)
             return 1

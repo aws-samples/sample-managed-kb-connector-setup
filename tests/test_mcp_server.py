@@ -110,3 +110,57 @@ def test_handoff_tool_returns_document(tmp_path: Path):
     assert structured["direction"] == "source-to-aws"
     assert structured["connector"] == "eng"
     assert structured["document"]["source"]["client_id"] == "app-12345"
+
+
+def test_handoff_direction_map_admits_only_known_values():
+    """The mapping is what narrows agent input to the two accepted directions.
+
+    Kept as a direct check because an end-to-end call cannot distinguish this
+    from the library's own validation — both surface the same ConfigError.
+    """
+    from kb_connector.mcp_server.server import _HANDOFF_DIRECTIONS
+
+    assert _HANDOFF_DIRECTIONS == {"aws": "aws", "source": "source"}
+    for rejected in ("upload", "AWS", "Source", "", "both"):
+        assert _HANDOFF_DIRECTIONS.get(rejected) is None
+
+
+def test_handoff_tool_reports_a_bad_direction_without_raising(tmp_path: Path):
+    """A rejected direction comes back as a structured error, not an exception.
+
+    Agents consume the return value, so an exception escaping the tool is a
+    worse failure than a bad argument.
+    """
+    config = tmp_path / "kb-connector.toml"
+    config.write_text(
+        "[defaults]\nregion = \"us-west-2\"\n\n"
+        "[connectors.eng]\n"
+        'type = "sharepoint"\n'
+        'tenant_id = "11111111-1111-1111-1111-111111111111"\n'
+    )
+    state = tmp_path / "kb-connector.state.json"
+    state.write_text(json.dumps({"connectors": {"eng": {"connector_type": "sharepoint"}}}))
+
+    server = _build_server()
+    result = asyncio.run(server.call_tool(
+        "kb_connector_handoff",
+        {
+            "connector_name": "eng",
+            "direction": "upload",
+            "config_path": str(config),
+            "state_path": str(state),
+        },
+    ))
+    content = result[0] if isinstance(result, tuple) else result
+    structured = None
+    if isinstance(result, tuple) and len(result) > 1 and isinstance(result[1], dict):
+        structured = result[1]
+    if structured is None:
+        for item in content:
+            text = getattr(item, "text", None)
+            if text:
+                structured = json.loads(text)
+                break
+    assert structured is not None, f"could not extract result from {result!r}"
+    assert structured["error_type"] == "ConfigError"
+    assert "upload" in structured["error"]

@@ -1027,7 +1027,7 @@ def _setup_microsoft(
                 cert_s3_key=cert_s3_key if uses_cert else None,
                 crawl_files=cfg.get("crawl_files", True),
                 crawl_pages=cfg.get("crawl_pages", True),
-                filter_config=sp_filter_config(cfg),
+                filter_config=sp_filter_config(cfg.raw),
             )
         else:  # onedrive
             connector_params = od_params(
@@ -1526,6 +1526,7 @@ def _setup_guided(
     Stage 1: Print instructions, wait for user to confirm, validate.
     Stage 2: Write secret + create AWS resources (automated).
     """
+    from kb_connector.connectors.base import ConnectorSpec
     from kb_connector.connectors.confluence import (
         ConfluenceConnector,
         build_connector_params as conf_params,
@@ -1544,6 +1545,7 @@ def _setup_guided(
     if stage in ("1", "both"):
         print(f"\n── Stage 1: Source-side ({connector_type}) — GUIDED ──")
 
+        connector_impl: ConnectorSpec
         if connector_type == "confluence":
             connector_impl = ConfluenceConnector()
         else:

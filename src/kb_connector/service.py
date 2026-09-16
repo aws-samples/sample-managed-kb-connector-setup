@@ -253,7 +253,7 @@ def diagnose(
     )
     cs = state_file.connectors.get(name) if name != "_direct" else None
     credential = (cfg.credential if cfg else None) or "cert"
-    connector_type = cfg.type if cfg else (cs.connector_type if cs else "sharepoint")
+    connector_type = cfg.type if cfg else ((cs.connector_type if cs else None) or "sharepoint")
 
     factory = session_factory or _default_session_factory
     session = factory(region, profile)

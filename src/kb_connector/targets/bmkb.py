@@ -38,7 +38,7 @@ class BmkbTarget(Target):
 
     name = "bmkb"
 
-    def __init__(self, *, session: Session, region: str) -> None:
+    def __init__(self, *, session: Session, region: str | None) -> None:
         self._region = region
         # Two clients because the control plane and the retrieve path are two
         # services. Endpoints resolve from the session and the SDK's own

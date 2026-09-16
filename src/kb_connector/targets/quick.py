@@ -28,7 +28,7 @@ class QuickTarget(Target):
 
     name = "quick"
 
-    def __init__(self, *, session: Any, region: str, **kwargs: Any) -> None:
+    def __init__(self, *, session: Any, region: str | None, **kwargs: Any) -> None:
         self._region = region
         self._session = session
 

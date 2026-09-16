@@ -10,13 +10,13 @@ from typing import Any
 from kb_connector.targets.base import Target
 
 
-def get_target(target_name: str, *, session: Any, region: str) -> Target:
+def get_target(target_name: str, *, session: Any, region: str | None) -> Target:
     """Construct a Target for the named backend.
 
     Args:
         target_name: "bmkb" (default) or "quick".
         session: boto3 session.
-        region: AWS region.
+        region: AWS region, or None to let the SDK resolve it.
 
     Raises:
         ValueError: for an unknown target name.

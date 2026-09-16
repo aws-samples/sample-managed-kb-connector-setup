@@ -215,8 +215,9 @@ def run_probe(args: ProbeArgs, *, session: Any, region: str) -> ProbeResult:
 
     # 6. Optional retrieve.
     if args.retrieve_query:
+        query = args.retrieve_query
         retr_ok, retr_resp = _attempt(
-            lambda: target.retrieve(kb_id, query=args.retrieve_query)
+            lambda: target.retrieve(kb_id, query=query)
         )
         _write_json(out_dir, "06-retrieve.resp.json", retr_resp)
         count = len(((retr_resp or {}).get("retrievalResults")) or []) if retr_ok else 0
