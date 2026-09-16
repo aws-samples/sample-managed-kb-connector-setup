@@ -105,3 +105,50 @@ def test_diff_round_trip_detects_injected(tmp_path):
     _diff_round_trip(sent, get_resp, str(tmp_path), events)
     diff = json.loads((tmp_path / "03b-round-trip-diff.json").read_text())
     assert "version" in diff["injected_by_service"]
+
+
+# --- Capturing a failed step --------------------------------------------------
+
+
+def _target_whose_calls_fail():
+    """A real BmkbTarget whose SDK client fails every operation."""
+    from botocore.exceptions import ClientError
+
+    from kb_connector.targets.bmkb import BmkbTarget
+
+    error = ClientError(
+        {"Error": {"Code": "ValidationException", "Message": "bad input"}},
+        "CreateDataSource",
+    )
+
+    class _RaisingClient:
+        def __getattr__(self, operation):
+            def call(**kwargs):
+                raise error
+
+            return call
+
+    class _FakeSession:
+        def client(self, service_name, **kwargs):
+            return _RaisingClient()
+
+    target = BmkbTarget(session=_FakeSession(), region="us-west-2")
+    target._client = _RaisingClient()
+    target._runtime = _RaisingClient()
+    return target
+
+
+def test_attempt_captures_a_service_failure_instead_of_letting_it_escape():
+    """A probe run exists to record what the service did, so a failing call has
+    to be captured rather than abort the run before the summary is written.
+
+    This goes through a real target on purpose: capturing depends on the target
+    reporting SDK failures as AwsError, and if that translation is dropped the
+    exception escapes here and the run produces no summary at all.
+    """
+    from kb_connector.probe.driver import _attempt
+
+    target = _target_whose_calls_fail()
+    ok, resp = _attempt(lambda: target.create_data_source_raw("KB123456789", {}))
+    assert ok is False
+    assert "ValidationException" in resp["error"]

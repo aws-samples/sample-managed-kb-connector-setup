@@ -29,8 +29,21 @@ def _render_known_error(exc: BaseException, *, profile: str | None) -> str | Non
     — for example an expired SSO token or a transient socket error raised by
     botocore before library code wraps it.
     """
-    # ConnectorError already carries an operator-actionable message.
+    login_hint = (
+        f"aws sso login --profile {profile}" if profile else "aws sso login"
+    )
+
+    # ConnectorError already carries an operator-actionable message. The one
+    # exception is an expired token: an AwsError wrapping that failure keeps the
+    # service's code, and the next step (log in again) appears nowhere in the
+    # service's own wording, so it has to be re-derived here. Other codes carry
+    # their next step in the message itself and need no special case.
     if isinstance(exc, ConnectorError):
+        if getattr(exc, "code", None) in ("ExpiredToken", "ExpiredTokenException"):
+            return (
+                "AWS security token expired. "
+                f"Run `{login_hint}` and try again."
+            )
         return str(exc)
 
     # botocore is imported lazily so --help and pure-logic paths don't pay the
@@ -39,10 +52,6 @@ def _render_known_error(exc: BaseException, *, profile: str | None) -> str | Non
         from botocore import exceptions as bexc
     except ImportError:
         return None
-
-    login_hint = (
-        f"aws sso login --profile {profile}" if profile else "aws sso login"
-    )
 
     # Expired or unavailable credentials.
     if isinstance(

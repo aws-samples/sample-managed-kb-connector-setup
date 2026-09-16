@@ -31,7 +31,39 @@ class StateError(ConnectorError):
 
 
 class AwsError(ConnectorError):
-    """An AWS-side operation (Secrets Manager, S3, IAM, bedrock-agent) failed."""
+    """An AWS-side operation (Secrets Manager, S3, IAM, bedrock-agent) failed.
+
+    Carries the service's error code when the failure came from an AWS API, so
+    the CLI can still recognize the codes that have an obvious next step — an
+    expired token, an access denial — after library code has wrapped the
+    original exception.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def aws_error_from(exc: Exception) -> AwsError:
+    """Wrap a botocore exception as an AwsError, keeping its error code.
+
+    The botocore shape is read by duck typing rather than by importing
+    botocore, which keeps this module free of the dependency and importable on
+    the `--help` path. A structured API failure carries
+    `response["Error"]["Code"]`; anything else (a connection or timeout error)
+    has no code and falls back to its string form.
+
+    The message mirrors the format the CLI uses for an unwrapped botocore
+    error, so the code and the service's own wording both survive wrapping.
+    """
+    response = getattr(exc, "response", None)
+    err = response.get("Error", {}) if isinstance(response, dict) else {}
+    code = err.get("Code") or None
+    message = err.get("Message") or str(exc)
+    return AwsError(
+        f"AWS error ({code}): {message}" if code else f"AWS error: {message}",
+        code=code,
+    )
 
 
 class GraphError(ConnectorError):

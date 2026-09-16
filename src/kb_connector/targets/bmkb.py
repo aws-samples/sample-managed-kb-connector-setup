@@ -7,10 +7,48 @@ core.knowledge_base.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import functools
+from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
 
 from kb_connector.core import knowledge_base as kb
+from kb_connector.core.errors import aws_error_from
 from kb_connector.targets.base import Target
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _as_aws_error(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Translate botocore exceptions from this boundary into `AwsError`.
+
+    Callers up the stack catch `AwsError` to enrich or record a failure —
+    probe captures the response to disk, setup turns a data-source name
+    collision into guidance. boto3 raises `ClientError`, so without this
+    translation those handlers never run and the failure escapes to the CLI's
+    top-level instead: the enrichment is silently lost, and probe writes no
+    summary for the run that failed.
+
+    `ParamSpec` keeps each method's signature intact, so the precise response
+    TypeDefs survive the decorator.
+
+    botocore is imported inside the handler rather than at module scope so this
+    module stays off the botocore import path for `--help`. By the time any
+    exception can arrive here `__init__` has already built two clients, so the
+    import is a dictionary lookup.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            from botocore.exceptions import BotoCoreError, ClientError
+
+            if isinstance(exc, (ClientError, BotoCoreError)):
+                raise aws_error_from(exc) from exc
+            raise
+
+    return wrapper
 
 if TYPE_CHECKING:
     # Type-only imports: boto3 stays off the import path for --help and
@@ -52,6 +90,7 @@ class BmkbTarget(Target):
 
     # --- Knowledge base ------------------------------------------------------
 
+    @_as_aws_error
     def create_knowledge_base(
         self,
         *,
@@ -68,6 +107,7 @@ class BmkbTarget(Target):
         )
         return self._client.create_knowledge_base(**payload)
 
+    @_as_aws_error
     def get_knowledge_base(self, kb_id: str) -> GetKnowledgeBaseResponseTypeDef:
         return self._client.get_knowledge_base(knowledgeBaseId=kb_id)
 
@@ -80,6 +120,7 @@ class BmkbTarget(Target):
             timeout_seconds=timeout_seconds,
         )
 
+    @_as_aws_error
     def delete_knowledge_base(self, kb_id: str) -> None:
         self._client.delete_knowledge_base(knowledgeBaseId=kb_id)
 
@@ -93,12 +134,14 @@ class BmkbTarget(Target):
         )
         return self.create_data_source_raw(kb_id, payload)
 
+    @_as_aws_error
     def create_data_source_raw(
         self, kb_id: str, payload: dict[str, Any]
     ) -> CreateDataSourceResponseTypeDef:
         """Create a DS with a fully-formed payload (for non-managed shapes like S3)."""
         return self._client.create_data_source(knowledgeBaseId=kb_id, **payload)
 
+    @_as_aws_error
     def get_data_source(self, kb_id: str, ds_id: str) -> GetDataSourceResponseTypeDef:
         return self._client.get_data_source(
             knowledgeBaseId=kb_id, dataSourceId=ds_id
@@ -113,11 +156,13 @@ class BmkbTarget(Target):
             timeout_seconds=timeout_seconds,
         )
 
+    @_as_aws_error
     def delete_data_source(self, kb_id: str, ds_id: str) -> None:
         self._client.delete_data_source(knowledgeBaseId=kb_id, dataSourceId=ds_id)
 
     # --- Ingestion -----------------------------------------------------------
 
+    @_as_aws_error
     def start_ingestion_job(
         self, kb_id: str, ds_id: str
     ) -> StartIngestionJobResponseTypeDef:
@@ -125,6 +170,7 @@ class BmkbTarget(Target):
             knowledgeBaseId=kb_id, dataSourceId=ds_id
         )
 
+    @_as_aws_error
     def get_ingestion_job(
         self, kb_id: str, ds_id: str, job_id: str
     ) -> GetIngestionJobResponseTypeDef:
@@ -132,6 +178,7 @@ class BmkbTarget(Target):
             knowledgeBaseId=kb_id, dataSourceId=ds_id, ingestionJobId=job_id
         )
 
+    @_as_aws_error
     def list_ingestion_jobs(
         self, kb_id: str, ds_id: str, *, max_results: int
     ) -> ListIngestionJobsResponseTypeDef:
@@ -139,6 +186,7 @@ class BmkbTarget(Target):
             knowledgeBaseId=kb_id, dataSourceId=ds_id, maxResults=max_results
         )
 
+    @_as_aws_error
     def stop_ingestion_job(
         self, kb_id: str, ds_id: str, job_id: str
     ) -> StopIngestionJobResponseTypeDef:
@@ -148,6 +196,7 @@ class BmkbTarget(Target):
 
     # --- Retrieve ------------------------------------------------------------
 
+    @_as_aws_error
     def retrieve(
         self,
         kb_id: str,

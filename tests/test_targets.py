@@ -423,3 +423,107 @@ def test_retrieve_omits_retrieval_configuration_without_filter():
     target.retrieve("KB123456789", query="q")
     _, body = target._runtime.calls[0]
     assert "retrievalConfiguration" not in body
+
+
+# --- AWS SDK error translation ------------------------------------------------
+#
+# Callers up the stack catch AwsError to enrich or record a failure: probe
+# captures the response for the run, setup turns a data-source name collision
+# into guidance. The SDK raises botocore exceptions, so the target has to
+# translate them or none of those handlers ever run.
+
+
+class _RaisingClient:
+    """Stands in for a boto3 client whose every operation fails."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def __getattr__(self, operation):
+        def call(**kwargs):
+            raise self._exc
+
+        return call
+
+
+def _client_error(code, message="something the service said"):
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {"Error": {"Code": code, "Message": message}}, "SomeOperation"
+    )
+
+
+def _bmkb_raising(exc):
+    target = BmkbTarget(session=_FakeSession(), region="us-west-2")
+    target._client = _RaisingClient(exc)
+    target._runtime = _RaisingClient(exc)
+    return target
+
+
+# Every operation that issues an SDK call. Parametrized rather than spot-checked
+# so that a new operation added without the translation is caught here instead
+# of silently disabling a caller's error handling.
+_SDK_OPERATIONS = {
+    "create_knowledge_base": lambda t: t.create_knowledge_base(
+        name="kb", role_arn="arn:aws:iam::123456789012:role/r"
+    ),
+    "get_knowledge_base": lambda t: t.get_knowledge_base("KB123456789"),
+    "delete_knowledge_base": lambda t: t.delete_knowledge_base("KB123456789"),
+    "create_data_source": lambda t: t.create_data_source(
+        "KB123456789", name="ds", connector_parameters={"type": "SHAREPOINT"}
+    ),
+    "create_data_source_raw": lambda t: t.create_data_source_raw(
+        "KB123456789", {"name": "ds"}
+    ),
+    "get_data_source": lambda t: t.get_data_source("KB123456789", "DS123456789"),
+    "delete_data_source": lambda t: t.delete_data_source(
+        "KB123456789", "DS123456789"
+    ),
+    "start_ingestion_job": lambda t: t.start_ingestion_job(
+        "KB123456789", "DS123456789"
+    ),
+    "get_ingestion_job": lambda t: t.get_ingestion_job(
+        "KB123456789", "DS123456789", "JOB1234567"
+    ),
+    "list_ingestion_jobs": lambda t: t.list_ingestion_jobs(
+        "KB123456789", "DS123456789", max_results=5
+    ),
+    "stop_ingestion_job": lambda t: t.stop_ingestion_job(
+        "KB123456789", "DS123456789", "JOB1234567"
+    ),
+    "retrieve": lambda t: t.retrieve("KB123456789", query="q"),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(_SDK_OPERATIONS))
+def test_every_sdk_operation_reports_a_service_failure_as_aws_error(operation):
+    target = _bmkb_raising(_client_error("ValidationException"))
+    with pytest.raises(AwsError):
+        _SDK_OPERATIONS[operation](target)
+
+
+def test_service_failure_keeps_its_code_and_the_services_own_wording():
+    target = _bmkb_raising(_client_error("ConflictException", "already exists"))
+    with pytest.raises(AwsError) as excinfo:
+        target.create_data_source_raw("KB123456789", {"name": "ds"})
+    assert excinfo.value.code == "ConflictException"
+    assert "ConflictException" in str(excinfo.value)
+    assert "already exists" in str(excinfo.value)
+
+
+def test_a_connection_failure_translates_but_carries_no_service_code():
+    from botocore.exceptions import EndpointConnectionError
+
+    target = _bmkb_raising(EndpointConnectionError(endpoint_url="https://example"))
+    with pytest.raises(AwsError) as excinfo:
+        target.get_knowledge_base("KB123456789")
+    assert excinfo.value.code is None
+
+
+def test_a_bug_is_not_disguised_as_an_aws_failure():
+    """Only SDK exceptions translate. A TypeError is a defect and must surface
+    as a traceback rather than a clean, expected-looking AwsError."""
+    target = _bmkb_raising(TypeError("not an AWS problem"))
+    with pytest.raises(TypeError):
+        target.get_knowledge_base("KB123456789")
