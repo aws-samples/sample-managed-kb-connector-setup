@@ -63,9 +63,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      # The mcp extra is required even though nothing here runs the server:
+      # without it mypy cannot resolve mcp.server.fastmcp, and an unresolved
+      # import makes every @mcp.tool() decorator untyped, which reports each
+      # decorated function as an error under strict mode.
       - run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,mcp]"
       - run: python -m mypy src/
 
   # Blocking, not advisory. A security config that nothing executes is not a
