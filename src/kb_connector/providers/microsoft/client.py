@@ -174,7 +174,7 @@ class GraphClient:
         params: dict | None = None,
         json_body: Any = None,
     ) -> Any:
-        # An absolute path is honoured so callers can follow an @odata.nextLink,
+        # An absolute path is honored so callers can follow an @odata.nextLink,
         # but only over TLS. Every request here carries the operator's Graph
         # bearer token, which holds their full directory privileges, so a
         # plaintext URL — from a paging link in a response body, or a caller

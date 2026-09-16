@@ -169,12 +169,13 @@ against the real endpoint inside the signing window.
 tool has no endpoint settings of its own and applies no host allowlist. Three
 reasons that is the right call rather than a gap:
 
-Every client here has always behaved this way. Secrets Manager, IAM, S3, STS,
-CloudTrail and CloudWatch Logs are ordinary boto3 clients and honour SDK
-endpoint configuration. A previous allowlist covered only `bedrock-agent`,
-whose request bodies carry secret *ARNs*, and left unguarded the Secrets
-Manager path — whose signed `GetSecretValue` can be replayed for AS-1 itself.
-The control protected the less sensitive path and misrepresented the rest.
+An allowlist would have to cover every client to mean anything. Secrets
+Manager, IAM, S3, STS, CloudTrail and CloudWatch Logs are ordinary boto3
+clients that honor SDK endpoint configuration, and the Secrets Manager path is
+the sensitive one: its signed `GetSecretValue` can be replayed for AS-1 itself,
+where a redirected `bedrock-agent` request body yields only secret *ARNs*.
+Guarding the Bedrock endpoint alone would protect the less sensitive path while
+implying the rest were covered.
 
 For the `~/.aws/config` vector the capability is already inside the boundary: a
 **TA-1** who can write that file can set `credential_process`, `role_arn` or
@@ -183,7 +184,7 @@ more powerful than redirecting an endpoint.
 
 Suppressing SDK configuration (`ignore_configured_endpoint_urls`) would break
 FIPS endpoints, VPC endpoints and pre-production testing, and would make this
-sample model behaviour no other AWS tool exhibits.
+sample model behavior no other AWS tool exhibits.
 
 **Residual:** an inherited environment variable in CI redirects signed requests
 for every service, and nothing in the tool detects it. `setup` prints the

@@ -77,8 +77,16 @@ against a live tenant and AWS account for:
 
 - **SharePoint** with cert auth and ACL on, including the ACL-aware retrieve
   trio (authorized user returns results, unauthorized user returns zero,
-  no-userContext returns zero).
+  no-userContext returns zero), a full crawl to `COMPLETE`, and stopping an
+  in-flight ingestion job.
 - **OneDrive** with cert auth and ACL on, same trio.
+
+A knowledge base encrypted with a customer-managed key has been created and
+reached `ACTIVE`. Note that `GetKnowledgeBase` does not echo the encryption
+configuration back, so there is no API-level confirmation to read: what is
+verifiable is that the service validates the key at create time and rejects an
+ARN it cannot resolve. Encryption of the secret and the certificate object is
+ordinary Secrets Manager and S3 SSE-KMS.
 
 Web (NO_AUTH) and S3 have been smoke-tested through to data-source
 AVAILABLE. Confluence and Google Drive have been validated for connector
@@ -302,7 +310,7 @@ mistakes — not to contain an attacker. See T-13 in
 
 ### Retries and idempotency come from the SDK
 
-Retry behaviour is whatever the AWS SDK does: transient socket errors, HTTP
+Retry behavior is whatever the AWS SDK does: transient socket errors, HTTP
 5xx, and throttling are retried, and the attempt count follows the SDK's own
 configuration, so `AWS_MAX_ATTEMPTS` or `retry_mode` in your profile applies
 here like anywhere else.
@@ -314,8 +322,8 @@ token and the service de-duplicates. A retried create therefore does not
 produce a duplicate resource.
 
 What the SDK does not distinguish is whether a failed write reached the
-service. An earlier version of this tool refused to retry a write on an
-ambiguous read timeout or 5xx, on the grounds that it might already have been
-processed. That distinction is gone, and the idempotency token is what replaces
-it. The residual case is a create that fails in a way the SDK does not retry at
+service: an ambiguous read timeout or 5xx on a create is retried even though it
+might already have been processed. The idempotency token is what makes that
+safe, and it is the reason this tool does not add a retry policy of its own.
+The residual case is a create that fails in a way the SDK does not retry at
 all, which surfaces as an error rather than a duplicate.

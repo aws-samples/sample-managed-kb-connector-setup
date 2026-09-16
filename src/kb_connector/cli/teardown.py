@@ -181,7 +181,7 @@ def _run_teardown(args: argparse.Namespace) -> int:
         print()
         response = input("  Proceed with teardown? (y/N): ").strip().lower()
         if response not in ("y", "yes"):
-            print("  Cancelled.")
+            print("  Canceled.")
             return 0
 
     # Execute deletions (AWS-side)

@@ -111,7 +111,7 @@ def _validate_crawl_url(url: str, *, field_name: str) -> str:
     # `is_link_local`, `is_loopback`, `is_private`, `is_reserved` and
     # `is_multicast` are properties on ipaddress.IPv4Address / IPv6Address, not
     # methods, so reading them without parentheses is correct and returns a real
-    # bool. Static analysers that cannot distinguish a property from a bound
+    # bool. Static analyzers that cannot distinguish a property from a bound
     # method read these as always-truthy; they are not. Verify with:
     #   ipaddress.ip_address("203.0.113.1").is_private    -> False
     #   ipaddress.ip_address("127.0.0.1").is_private      -> True

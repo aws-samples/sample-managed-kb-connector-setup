@@ -56,7 +56,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("\n\nCancelled.")
+        print("\n\nCanceled.")
         return 1
 
 
