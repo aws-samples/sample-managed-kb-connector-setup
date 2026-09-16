@@ -57,6 +57,17 @@ OWNER_TOOL_UNTAGGED = "tool-untagged"
 # Both tool markers mean "this tool created it", so both are in teardown's scope.
 _TOOL_OWNED = frozenset({OWNER_TOOL, OWNER_TOOL_UNTAGGED})
 
+# The state field holding each resource kind's identity, for `is_recorded_ours`.
+# Only these three are rediscoverable: setup finds an app by display name, and
+# reads a KB id and role ARN back out of state, so each needs to tell "the one
+# we created" from "one that happens to be there". The rest are addressed by a
+# derived name and classified by tag instead.
+_RESOURCE_ID_FIELDS = {
+    RESOURCE_APP: "client_app_object_id",
+    RESOURCE_KB: "knowledge_base_id",
+    RESOURCE_ROLE: "kb_role_arn",
+}
+
 
 @dataclass
 class ConnectorState:
@@ -130,6 +141,37 @@ class ConnectorState:
         owned, since a resource created without a tag is still one we created.
         """
         return self.created_resources.get(resource, OWNER_TOOL) in _TOOL_OWNED
+
+    def is_recorded_ours(self, resource: str, found_id: str | None) -> bool:
+        """Whether state already records `found_id` as a resource we created.
+
+        Setup is resumable, so it routinely rediscovers resources an earlier
+        pass created: it finds an Entra app by display name, and falls back to
+        `cs.knowledge_base_id` / `cs.kb_role_arn` when no id was passed on the
+        command line. Those branches otherwise read as "the operator pointed us
+        at this", and recording that disowns the resource — teardown then reports
+        it as pre-existing and leaves it behind.
+
+        Requires an explicit ownership record *and* an id match, so it can only
+        ever correct a false `external`. It never produces a false `tool`, which
+        is the direction that matters: `tool` is what permits deletion.
+
+        * Nothing recorded yet -> False. A first run against someone else's
+          resource has no record, and `is_tool_owned` treating an absent entry as
+          owned is right for teardown but wrong here.
+        * Recorded `external` -> False, so an adopted resource stays adopted
+          across re-runs.
+        * A different id than the one recorded -> False, so a resource that was
+          replaced out of band is not claimed.
+        """
+        field_name = _RESOURCE_ID_FIELDS.get(resource)
+        if field_name is None or not found_id:
+            return False
+        if getattr(self, field_name) != found_id:
+            return False
+        if self.created_resources.get(resource) is None:
+            return False
+        return self.is_tool_owned(resource)
 
     def created_untagged(self, resource: str) -> bool:
         """Whether this tool created the resource but could not tag it.

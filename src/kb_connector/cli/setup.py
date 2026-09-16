@@ -557,11 +557,19 @@ def _provision_kb_and_ds(
         print("  KB is ACTIVE")
         cs.record_owned(state_mod.RESOURCE_KB)
     else:
-        # The operator pointed us at this KB; it predates the connector and may
-        # carry other data sources. Recording it as external is what stops a
-        # later teardown from deleting someone else's knowledge base.
-        print(f"  Using existing KB: {kb_id} (external — teardown will not delete it)")
-        cs.record_external(state_mod.RESOURCE_KB)
+        # `kb_id` came from --kb or from state. If the operator pointed us at
+        # this KB it predates the connector and may carry other data sources, so
+        # recording it external is what stops a later teardown from deleting
+        # someone else's knowledge base. But a re-run reads the id back out of
+        # state, and disowning a KB this tool created strands it: teardown
+        # reports it as pre-existing and skips it.
+        if _record_reused_resource(cs, state_mod.RESOURCE_KB, kb_id):
+            print(f"  Using existing KB: {kb_id}")
+        else:
+            print(
+                f"  Using existing KB: {kb_id} "
+                f"(external — teardown will not delete it)"
+            )
 
     cs.knowledge_base_id = kb_id
 
@@ -849,13 +857,15 @@ def _setup_microsoft(
         # Update state with source-side results
         cs.connector_type = cfg.type
         cs.tenant_id = tenant_id
-        cs.client_app_id = reg.app_id
-        cs.client_app_object_id = reg.object_id
-        # `existing` is the app we found by display name rather than created.
+        # Evaluated before the ids below are overwritten, so it compares against
+        # what an earlier pass recorded. An app found by display name is adopted
+        # only if state does not already record it as ours.
         if existing:
-            cs.record_external(state_mod.RESOURCE_APP)
+            _record_reused_resource(cs, state_mod.RESOURCE_APP, reg.object_id)
         else:
             cs.record_owned(state_mod.RESOURCE_APP)
+        cs.client_app_id = reg.app_id
+        cs.client_app_object_id = reg.object_id
         cs.cert_thumbprint_b64url = cert_thumbprint
         cs.cert_not_after = cert_not_after
 
@@ -1020,8 +1030,9 @@ def _setup_microsoft(
             print("  Waiting for IAM propagation...")
             time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
         elif kb_role_arn:
-            # Operator supplied the role; the tool did not create it.
-            cs.record_external(state_mod.RESOURCE_ROLE)
+            # From --kb-role-arn, or from state on a re-run. Adopted unless state
+            # already records this same role as one this tool created.
+            _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
         # Create KB (if needed) + data source via the target abstraction
         target = _build_target(cfg, session)
@@ -1064,6 +1075,23 @@ def _setup_microsoft(
         )
 
         print("  Stage 2 complete")
+
+
+def _record_reused_resource(
+    cs: ConnectorState, resource: str, found_id: str | None
+) -> bool:
+    """Record ownership for a resource setup is reusing rather than creating.
+
+    Returns True if it was recorded as ours. See
+    `ConnectorState.is_recorded_ours` for why finding a resource is not enough
+    to call it adopted: a resumed or repeated run rediscovers what an earlier
+    pass created, and disowning it strands the resource beyond teardown's reach.
+    """
+    if cs.is_recorded_ours(resource, found_id):
+        cs.record_owned(resource)
+        return True
+    cs.record_external(resource)
+    return False
 
 
 def _delete_granter_app(
@@ -1150,8 +1178,12 @@ def _extend_existing_kb_role(
     except AwsError as exc:
         print(f"  WARNING: could not extend role: {exc}")
 
+    # Recorded before kb_role_arn is overwritten, so it compares against what an
+    # earlier pass stored. The role belongs to whoever owns the KB: external when
+    # the operator supplied the KB, but ours when a re-run rediscovered the KB
+    # and role this tool created.
+    _record_reused_resource(cs, state_mod.RESOURCE_ROLE, role_arn)
     cs.kb_role_arn = role_arn
-    cs.record_external(state_mod.RESOURCE_ROLE)
 
 
 def _import_handoff(handoff_path: str, cs: ConnectorState, cfg: ConnectorConfig) -> None:
@@ -1268,7 +1300,9 @@ def _setup_s3(
         print("  Waiting for IAM propagation...")
         time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
     elif kb_role_arn:
-        cs.record_external(state_mod.RESOURCE_ROLE)
+        # From --kb-role-arn, or from state on a re-run. Adopted unless
+        # state already records this same role as one this tool created.
+        _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
     # Create KB + S3 data source (managed-connector envelope, same as others)
     target = _build_target(cfg, session)
@@ -1502,7 +1536,9 @@ def _setup_web(
         print("  Waiting for IAM propagation...")
         time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
     elif kb_role_arn:
-        cs.record_external(state_mod.RESOURCE_ROLE)
+        # From --kb-role-arn, or from state on a re-run. Adopted unless
+        # state already records this same role as one this tool created.
+        _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
     # Create KB + Web data source via the target abstraction
     target = _build_target(cfg, session)
@@ -1682,7 +1718,9 @@ def _setup_guided(
             print("  Waiting for IAM propagation...")
             time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
         elif kb_role_arn:
-            cs.record_external(state_mod.RESOURCE_ROLE)
+            # From --kb-role-arn, or from state on a re-run. Adopted unless
+            # state already records this same role as one this tool created.
+            _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
         # Create KB + data source via the target abstraction
         target = _build_target(cfg, session)

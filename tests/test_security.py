@@ -36,6 +36,7 @@ from kb_connector.core.state import (
     OWNER_EXTERNAL,
     OWNER_TOOL,
     OWNER_TOOL_UNTAGGED,
+    RESOURCE_APP,
     RESOURCE_KB,
     RESOURCE_ROLE,
     RESOURCE_SECRET,
@@ -58,6 +59,7 @@ from kb_connector.core.tagging import (
     normalize_tags,
     validate_extra_tags,
 )
+from kb_connector.cli.setup import _record_reused_resource
 from kb_connector.providers.microsoft.apps import escape_odata_literal
 
 
@@ -243,6 +245,105 @@ def test_ownership_survives_state_roundtrip(tmp_path):
     cs.record_external(RESOURCE_KB)
     save_state(sf, path)
     assert not load_state(path).get("alpha").is_tool_owned(RESOURCE_KB)
+
+
+# --- T-02 / AS-5: a rediscovered resource is only ours if state says so -------
+#
+# Setup is resumable, so it routinely rediscovers what an earlier pass created:
+# Stage 1 finds an Entra app by display name, and the KB id and role ARN are read
+# back out of state when not passed on the command line. Disowning those strands
+# them beyond teardown's reach; claiming someone else's lets teardown delete it.
+# Both directions are pinned, for every resource kind the check covers.
+
+_OURS = "11111111-2222-3333-4444-555555555555"
+_OTHER = "99999999-8888-7777-6666-555555555555"
+
+# Each rediscoverable resource kind and the state field holding its identity.
+_REDISCOVERABLE = [
+    (RESOURCE_APP, "client_app_object_id"),
+    (RESOURCE_KB, "knowledge_base_id"),
+    (RESOURCE_ROLE, "kb_role_arn"),
+]
+
+
+def _state_recording(resource, field_name, marker, recorded_id=_OURS):
+    cs = ConnectorState()
+    setattr(cs, field_name, recorded_id)
+    if marker is not None:
+        cs.created_resources[resource] = marker
+    return cs
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_rediscovering_what_we_created_keeps_it_deletable(resource, field_name):
+    """The leak this exists to prevent: a re-run must not disown its own work."""
+    cs = _state_recording(resource, field_name, OWNER_TOOL)
+    assert cs.is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_rediscovering_an_adopted_resource_leaves_it_adopted(resource, field_name):
+    """The dangerous direction: never claim what the operator pointed us at."""
+    cs = _state_recording(resource, field_name, OWNER_EXTERNAL)
+    assert not cs.is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_a_first_run_against_someone_elses_resource_does_not_claim_it(
+    resource, field_name
+):
+    """Nothing is recorded yet, so there is no evidence the resource is ours."""
+    assert not ConnectorState().is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_an_unrecorded_resource_is_not_claimed_even_if_the_id_matches(
+    resource, field_name
+):
+    """is_tool_owned treats an absent entry as owned, which is right for
+    teardown but wrong here: an explicit record is required."""
+    cs = _state_recording(resource, field_name, None)
+    assert not cs.is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_a_resource_replaced_out_of_band_is_not_claimed(resource, field_name):
+    """Ours was deleted and something else now answers to the same name."""
+    cs = _state_recording(resource, field_name, OWNER_TOOL, recorded_id=_OTHER)
+    assert not cs.is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_an_untagged_tool_created_resource_is_still_ours(resource, field_name):
+    """Created by this tool but untaggable still means ours."""
+    cs = _state_recording(resource, field_name, OWNER_TOOL_UNTAGGED)
+    assert cs.is_recorded_ours(resource, _OURS)
+
+
+@pytest.mark.parametrize("resource,field_name", _REDISCOVERABLE)
+def test_no_id_to_compare_is_never_claimed(resource, field_name):
+    cs = _state_recording(resource, field_name, OWNER_TOOL)
+    assert not cs.is_recorded_ours(resource, None)
+
+
+def test_a_resource_kind_without_a_tracked_id_is_never_claimed():
+    """Secrets, certs and data sources are addressed by derived name and
+    classified by tag, so they have no id to compare and must not be claimed
+    by this check."""
+    cs = ConnectorState()
+    cs.created_resources[RESOURCE_SECRET] = OWNER_TOOL
+    assert not cs.is_recorded_ours(RESOURCE_SECRET, _OURS)
+
+
+def test_setup_records_a_rediscovered_resource_as_ours():
+    """The setup-side wrapper flips the record, not just the return value."""
+    cs = _state_recording(RESOURCE_KB, "knowledge_base_id", OWNER_EXTERNAL)
+    assert not _record_reused_resource(cs, RESOURCE_KB, _OURS)
+    assert not cs.is_tool_owned(RESOURCE_KB)
+
+    cs = _state_recording(RESOURCE_KB, "knowledge_base_id", OWNER_TOOL)
+    assert _record_reused_resource(cs, RESOURCE_KB, _OURS)
+    assert cs.is_tool_owned(RESOURCE_KB)
 
 
 # --- T-10: file permissions -------------------------------------------------

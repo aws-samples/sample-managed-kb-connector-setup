@@ -207,6 +207,19 @@ workloads that predate the connector.
 (`setup._extend_existing_kb_role`) are recorded `external`. Teardown skips those,
 lists them as "kept", and deletes them only with `--include-adopted`.
 
+Encountering a resource is not what makes it adopted, because setup is resumable
+and routinely rediscovers its own work: Stage 1 finds the Entra app by display
+name, and the KB id and role ARN are read back out of state whenever they are not
+passed on the command line. `ConnectorState.is_recorded_ours` decides which case
+applies, and it requires both an explicit prior ownership record and an id match,
+so it can only ever correct a resource wrongly marked `external` — it cannot
+produce a `tool` marking for a resource the tool did not create. A resource
+recorded `external` stays `external` across re-runs, and one replaced out of band
+no longer matches its recorded id. The asymmetry is deliberate: `tool` is the
+marking that permits deletion, so the check is built to be unable to grant it in
+error. Resource kinds addressed by derived name and classified by tag (secrets,
+certificates, data sources) have no id to compare and are never claimed this way.
+
 `_delete_role` evaluates every reason to refuse *before* it removes anything —
 managed policies attached, membership of an instance profile, or an inline policy
 the tool did not author — so a refused role is left completely intact rather than
@@ -832,6 +845,11 @@ Security-relevant behaviors that this model depends on:
   default, so it catches a service-specific override as well as a global one.
 - `core/state.ConnectorState.is_tool_owned` — the teardown gate behind T-02, and
   the reason its default-`True` behavior is a documented residual there.
+- `core/state.ConnectorState.is_recorded_ours` — behind T-02. Decides whether a
+  rediscovered resource is one this tool created. It must stay unable to mark a
+  resource `tool` without both a prior ownership record and an id match; a new
+  rediscoverable resource kind has to be added to `_RESOURCE_ID_FIELDS` to be
+  covered at all.
 - `setup._delete_granter_app` — the `finally` cleanup behind T-04.
 - `connectors/web.validate_crawl_urls` — the target validation behind T-13.
 - `log_analysis.redact_document_location` and `redact_reason` — the redaction
