@@ -16,6 +16,7 @@ can be reused by the CLI (writes to file + prints) and the service layer
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Callable
 from typing import Any
 
 from kb_connector.core.config import ConnectorConfig
@@ -100,7 +101,7 @@ def parse_handoff(raw: Any) -> dict:
 
     # Only fields that reach state are validated, and only when present:
     # a handoff legitimately omits whatever its stage did not produce.
-    checks = {
+    checks: dict[str, Callable[[Any], str]] = {
         "tenant_id": lambda v: validate_guid(v, field="handoff source.tenant_id"),
         "client_id": lambda v: validate_guid(v, field="handoff source.client_id"),
         "region": lambda v: validate_region(v, field="handoff aws.region"),

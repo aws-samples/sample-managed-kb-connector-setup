@@ -13,10 +13,12 @@ import base64
 import datetime as _dt
 import json
 import secrets as _secrets
+from typing import Any
 
 import requests
 
 from kb_connector.core.errors import GraphError
+from kb_connector.providers.microsoft.client import require_mapping
 
 _TIMEOUT = 30
 
@@ -95,7 +97,9 @@ def decode_jwt_claims(token: str) -> dict:
     try:
         _header, payload, _sig = token.split(".")
         padded = payload + "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(padded))
+        return require_mapping(
+            json.loads(base64.urlsafe_b64decode(padded)), field="jwt payload"
+        )
     except Exception as exc:
         return {"_decode_error": str(exc)}
 
@@ -144,10 +148,17 @@ def _b64url(data: bytes) -> bytes:
 
 
 def _parse_token_response(resp: requests.Response) -> dict:
+    body: dict[str, Any]
     try:
-        body = resp.json()
+        decoded = resp.json()
     except ValueError:
         body = {"raw": resp.text[:2000]}
+    else:
+        # A token endpoint should answer with a JSON object, but valid JSON can
+        # decode to a list or a bare scalar. Keep those in the same shape as an
+        # undecodable body so callers only ever see a mapping, and so a failed
+        # request still reports its status code rather than a shape complaint.
+        body = decoded if isinstance(decoded, dict) else {"raw": decoded}
     if resp.status_code != 200:
         raise GraphError(
             f"Token request failed ({resp.status_code}).",

@@ -10,10 +10,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import TYPE_CHECKING
 
 from kb_connector.core.config import load_config
 from kb_connector.core.errors import ConfigError, ConnectorError
 from kb_connector.core.state import load_state
+
+if TYPE_CHECKING:
+    # Annotation-only: diagnostics pulls in botocore, and this module is on the
+    # --help path.
+    from kb_connector.core.diagnostics import CheckResult
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -225,13 +231,13 @@ def _run_diagnose(args: argparse.Namespace) -> int:
     return 0 if result.status == "healthy" else 1
 
 
-def _print_check(check) -> None:
+def _print_check(check: CheckResult) -> None:
     """Print a single check result."""
     icon = "✓" if check.passed else "✗"
     print(f"    {icon} {check.name}: {check.details}")
 
 
-def _print_log_groups(check) -> None:
+def _print_log_groups(check: CheckResult) -> None:
     """Print the per-reason breakdown from log analysis, largest group first.
 
     The grouping is the useful part of this check: one line per (status,

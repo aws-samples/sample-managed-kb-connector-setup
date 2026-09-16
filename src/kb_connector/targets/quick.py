@@ -55,6 +55,11 @@ class QuickTarget(Target):
     ) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 
+    def create_data_source_raw(
+        self, kb_id: str, payload: dict[str, Any]
+    ) -> Mapping[str, Any]:
+        raise NotImplementedError(_NOT_AVAILABLE)
+
     def get_data_source(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 

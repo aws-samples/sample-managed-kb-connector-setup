@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 
 from kb_connector import __version__
 from kb_connector.cli import (
@@ -157,8 +158,13 @@ def main() -> int:
         parser.print_help()
         return 0
 
+    # argparse carries the subcommand handler as an untyped Namespace
+    # attribute, so name the contract that build_parser's set_defaults(func=...)
+    # calls establish: every handler takes the parsed args and returns an exit
+    # code.
+    handler: Callable[[argparse.Namespace], int] = args.func
     try:
-        return args.func(args)
+        return handler(args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130

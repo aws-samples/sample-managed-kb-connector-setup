@@ -17,7 +17,7 @@ import sys
 import time
 from dataclasses import dataclass, field as dataclass_field
 from getpass import getpass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
@@ -25,6 +25,15 @@ from kb_connector.core.diagnostics import describe_endpoints
 from kb_connector.core.config import ConnectorConfig, load_config
 from kb_connector.core.errors import AwsError, ConfigError, ConnectorError, StateError
 from kb_connector.core.state import ConnectorState, load_state, save_state
+
+if TYPE_CHECKING:
+    # Annotation-only: boto3 and the Graph provider stay off the import path
+    # for --help and pure-logic runs.
+    from boto3 import Session
+
+    from kb_connector.providers.microsoft.client import GraphClient
+    from kb_connector.providers.microsoft.sites_selected import AdminAppCredentials
+    from kb_connector.targets.base import Target
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -496,7 +505,7 @@ def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
 # --- Shared AWS-side helpers (route through the target abstraction) ----------
 
 
-def _build_target(cfg: ConnectorConfig, session):
+def _build_target(cfg: ConnectorConfig, session: Session) -> Target:
     """Construct the control-plane target for this connector's config."""
     from kb_connector.targets import get_target
     return get_target("bmkb", session=session, region=cfg.region)
@@ -504,7 +513,7 @@ def _build_target(cfg: ConnectorConfig, session):
 
 def _provision_kb_and_ds(
     *,
-    target,
+    target: Target,
     args: argparse.Namespace,
     cfg: ConnectorConfig,
     cs: ConnectorState,
@@ -599,7 +608,9 @@ def _provision_kb_and_ds(
 _DS_TERMINAL_BAD = {"FAILED", "DELETE_UNSUCCESSFUL"}
 
 
-def _reconcile_existing_data_source(target, kb_id: str, ds_id: str) -> str | None:
+def _reconcile_existing_data_source(
+    target: Target, kb_id: str, ds_id: str
+) -> str | None:
     """Decide what to do with a data source already tracked in state.
 
     Returns the DS id to reuse if it's healthy (AVAILABLE), or None if the
@@ -642,7 +653,7 @@ def _reconcile_existing_data_source(target, kb_id: str, ds_id: str) -> str | Non
 
 def _create_data_source_with_diagnostics(
     *,
-    target,
+    target: Target,
     kb_id: str,
     ds_name: str,
     connector_parameters: dict | None,
@@ -676,7 +687,7 @@ def _create_data_source_with_diagnostics(
 
     ds_obj = ds_resp.get("dataSource", ds_resp)
     ds_id = ds_obj.get("dataSourceId") or ds_obj.get("id")
-    if not ds_id:
+    if not isinstance(ds_id, str) or not ds_id:
         raise AwsError(f"CreateDataSource returned no data source id: {ds_resp}")
     return ds_id
 
@@ -1055,7 +1066,9 @@ def _setup_microsoft(
         print("  Stage 2 complete")
 
 
-def _delete_granter_app(graph, admin, admin_app_name: str) -> None:
+def _delete_granter_app(
+    graph: GraphClient, admin: AdminAppCredentials, admin_app_name: str
+) -> None:
     """Delete the temporary Sites.Selected granter app.
 
     Runs in a finally block, so it must not mask the original exception: a
@@ -1080,9 +1093,18 @@ def _delete_granter_app(graph, admin, admin_app_name: str) -> None:
 
 
 def _extend_existing_kb_role(
-    session, cfg, cs, kb_id, secret_arn, cert_s3_bucket, cert_s3_key, uses_cert,
-    *, account_id=None, opts=None,
-):
+    session: Session,
+    cfg: ConnectorConfig,
+    cs: ConnectorState,
+    kb_id: str,
+    secret_arn: str,
+    cert_s3_bucket: str | None,
+    cert_s3_key: str | None,
+    uses_cert: bool,
+    *,
+    account_id: str | None = None,
+    opts: _ProvisionOptions | None = None,
+) -> None:
     """Extend an existing KB's role to cover the new secret + cert.
 
     The role belongs to a knowledge base the operator pointed us at, so it is
@@ -1324,7 +1346,7 @@ def _resolve_web_basic_auth(
 
 
 def _add_s3_content_policy(
-    session,
+    session: Session,
     role_name: str,
     bucket_name: str,
     account_id: str,

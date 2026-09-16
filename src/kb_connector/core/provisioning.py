@@ -471,9 +471,15 @@ def get_secret_value(*, session: Any, secret_id: str) -> dict:
     sm = session.client("secretsmanager")
     try:
         resp = sm.get_secret_value(SecretId=secret_id)
-        return json.loads(resp["SecretString"])
+        parsed = json.loads(resp["SecretString"])
     except Exception as exc:
         raise AwsError(f"Failed to read secret {secret_id!r}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise AwsError(
+            f"Secret {secret_id!r} decoded to {type(parsed).__name__}, "
+            "expected a JSON object."
+        )
+    return parsed
 
 
 # --- IAM role ----------------------------------------------------------------

@@ -29,6 +29,7 @@ import datetime as _dt
 import json
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -234,18 +235,26 @@ def run_probe(args: ProbeArgs, *, session: Any, region: str) -> ProbeResult:
 # --- helpers -----------------------------------------------------------------
 
 
-def _resolve_kb(args, target, session, region, secret_arn, out_dir, events) -> str:
+def _resolve_kb(
+    args: ProbeArgs,
+    target: BmkbTarget,
+    session: Any,
+    region: str,
+    secret_arn: str | None,
+    out_dir: str,
+    events: list[_Event],
+) -> str:
     """Reuse or create the KB the data source hangs off."""
     from kb_connector.core import provisioning
 
-    kb_id = args.knowledge_base_id
-    reusing = bool(kb_id) and not args.create_kb
-
-    if reusing:
+    reuse_id = args.knowledge_base_id
+    if reuse_id and not args.create_kb:
         try:
-            kb_resp = target.get_knowledge_base(kb_id)
+            kb_resp = target.get_knowledge_base(reuse_id)
         except AwsError as exc:
-            raise ConnectorError(f"Could not GetKnowledgeBase {kb_id}: {exc}") from exc
+            raise ConnectorError(
+                f"Could not GetKnowledgeBase {reuse_id}: {exc}"
+            ) from exc
         kb_body = kb_resp.get("knowledgeBase", kb_resp) or {}
         role_arn = kb_body.get("roleArn")
         events.append(_Event("get-knowledge-base", True, detail=f"role={role_arn}"))
@@ -262,7 +271,7 @@ def _resolve_kb(args, target, session, region, secret_arn, out_dir, events) -> s
                 events.append(_Event("extend-kb-role", True))
             except AwsError as exc:
                 events.append(_Event("extend-kb-role", False, detail=str(exc)))
-        return kb_id
+        return reuse_id
 
     # Create path.
     if not args.create_kb:
@@ -299,7 +308,14 @@ def _resolve_kb(args, target, session, region, secret_arn, out_dir, events) -> s
     return kb_id
 
 
-def _poll_ingestion(target, kb_id, ds_id, job_id, poll_interval, timeout) -> dict:
+def _poll_ingestion(
+    target: BmkbTarget,
+    kb_id: str,
+    ds_id: str,
+    job_id: str,
+    poll_interval: int,
+    timeout: int,
+) -> dict:
     """Poll until terminal or timeout. Returns the last job dict."""
     deadline = time.time() + timeout
     last: dict = {}
@@ -434,15 +450,21 @@ def _short(body: Any, limit: int = 240) -> str:
     return text[:limit] + "..." if len(text) > limit else text
 
 
-def _extract_id(resp: dict, container: str, id_field: str) -> str:
+def _extract_id(resp: Mapping[str, Any], container: str, id_field: str) -> str:
     if not resp:
         raise ConnectorError(f"Empty response; expected {id_field}.")
     if id_field in resp:
-        return resp[id_field]
-    inner = resp.get(container) or {}
-    if id_field in inner:
-        return inner[id_field]
-    raise ConnectorError(f"Could not find {id_field} in response: {resp}")
+        value = resp[id_field]
+    else:
+        inner = resp.get(container) or {}
+        if id_field not in inner:
+            raise ConnectorError(f"Could not find {id_field} in response: {resp}")
+        value = inner[id_field]
+    if not isinstance(value, str):
+        raise ConnectorError(
+            f"Response field {id_field} was {value!r}, expected a string."
+        )
+    return value
 
 
 def _default_out_dir(connector_type: str) -> str:
@@ -450,7 +472,13 @@ def _default_out_dir(connector_type: str) -> str:
     return os.path.join(os.getcwd(), "kb-connector-probe-runs", connector_type, ts)
 
 
-def _finalize(out_dir, events, connector_type, kb_id, ds_id) -> None:
+def _finalize(
+    out_dir: str,
+    events: list[_Event],
+    connector_type: str,
+    kb_id: str | None,
+    ds_id: str | None,
+) -> None:
     """Write summary.json + events.jsonl describing the whole run."""
     summary = {
         "connector_type": connector_type,
@@ -476,7 +504,13 @@ def _event_dict(e: _Event) -> dict:
     }
 
 
-def _build_result(connector_type, out_dir, kb_id, ds_id, events) -> ProbeResult:
+def _build_result(
+    connector_type: str,
+    out_dir: str,
+    kb_id: str | None,
+    ds_id: str | None,
+    events: list[_Event],
+) -> ProbeResult:
     return ProbeResult(
         connector_type=connector_type,
         out_dir=out_dir,

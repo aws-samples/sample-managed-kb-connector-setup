@@ -97,7 +97,7 @@ def _run_validate(args: argparse.Namespace) -> int:
     return 0 if all_healthy else 1
 
 
-def _render(result) -> None:
+def _render(result: service.ValidateResult) -> None:
     """Pretty-print a ValidateResult."""
     print(f"\n{'═' * 50}")
     print(f"Validating: {result.connector}")

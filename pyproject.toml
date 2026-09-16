@@ -140,3 +140,11 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+# Bare `dict` is allowed. Writing `dict[str, Any]` instead constrains the key
+# type and leaves every value `Any`, so it checks almost nothing new while
+# touching ~170 signatures. The values that matter here are connector
+# parameters and AWS request/response bodies, and the way to make those
+# checkable is TypedDict per shape, not a generic parameter on dict. Targets
+# already do this: the Target ABC returns Mapping[str, Any] and BmkbTarget
+# overrides with the SDK's real response TypeDefs.
+disallow_any_generics = false

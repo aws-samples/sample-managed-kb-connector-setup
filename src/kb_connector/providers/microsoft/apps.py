@@ -11,7 +11,11 @@ from dataclasses import dataclass
 
 from kb_connector.core.errors import GraphError
 from kb_connector.providers.microsoft.certs import GeneratedCertificate, certificate_der_b64
-from kb_connector.providers.microsoft.client import GraphClient
+from kb_connector.providers.microsoft.client import (
+    GraphClient,
+    require_mapping,
+    require_str,
+)
 from kb_connector.providers.microsoft.permissions import PermissionPlan, PermissionRequirement
 
 
@@ -51,7 +55,7 @@ def find_application_by_name(graph: GraphClient, display_name: str) -> dict | No
     apps = (resp or {}).get("value", [])
     for app in apps:
         if app.get("displayName") == display_name:
-            return app
+            return require_mapping(app, field="applications[].value")
     return None
 
 
@@ -60,8 +64,11 @@ def ensure_service_principal(graph: GraphClient, app_id: str) -> dict:
     resp = graph.get("/servicePrincipals", **{"$filter": f"appId eq '{app_id}'"})
     existing = (resp or {}).get("value", [])
     if existing:
-        return existing[0]
-    return graph.post("/servicePrincipals", {"appId": app_id})
+        return require_mapping(existing[0], field="servicePrincipals[0]")
+    return require_mapping(
+        graph.post("/servicePrincipals", {"appId": app_id}),
+        field="servicePrincipals",
+    )
 
 
 def create_application(graph: GraphClient, display_name: str) -> AppRegistration:
@@ -200,7 +207,7 @@ def add_client_secret(
             }
         },
     )
-    return resp["secretText"]
+    return require_str(resp.get("secretText"), field="secretText")
 
 
 def delete_application(graph: GraphClient, app_object_id: str) -> None:
@@ -231,7 +238,7 @@ def _resource_sp_by_app_id(graph: GraphClient, resource_app_id: str) -> dict:
         raise GraphError(
             f"Resource service principal for appId {resource_app_id} not found."
         )
-    return values[0]
+    return require_mapping(values[0], field="servicePrincipals[0]")
 
 
 def _resolve_app_role_id(resource_sp: dict, value: str) -> str:
@@ -239,7 +246,7 @@ def _resolve_app_role_id(resource_sp: dict, value: str) -> str:
     for role in resource_sp.get("appRoles", []):
         is_app_role = "Application" in (role.get("allowedMemberTypes") or [])
         if role.get("value") == value and is_app_role and role.get("isEnabled", True):
-            return role["id"]
+            return require_str(role.get("id"), field="appRoles[].id")
     raise GraphError(
         f"Resource {resource_sp.get('appDisplayName')!r} exposes no enabled "
         f"application role named {value!r}."

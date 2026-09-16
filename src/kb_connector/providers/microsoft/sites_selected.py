@@ -29,7 +29,11 @@ from kb_connector.providers.microsoft.apps import (
     ensure_service_principal,
     find_application_by_name,
 )
-from kb_connector.providers.microsoft.client import GraphClient
+from kb_connector.providers.microsoft.client import (
+    GraphClient,
+    require_mapping,
+    require_str,
+)
 from kb_connector.providers.microsoft.permissions import GRAPH_APP_ID
 
 _TIMEOUT = 30
@@ -118,7 +122,7 @@ def _graph_service_principal(graph: GraphClient) -> dict:
     values = (resp or {}).get("value", [])
     if not values:
         raise GraphError("Microsoft Graph service principal not found in tenant.")
-    return values[0]
+    return require_mapping(values[0], field="servicePrincipals[0]")
 
 
 def _resolve_role(resource_sp: dict, value: str) -> str:
@@ -128,7 +132,7 @@ def _resolve_role(resource_sp: dict, value: str) -> str:
             and "Application" in (role.get("allowedMemberTypes") or [])
             and role.get("isEnabled", True)
         ):
-            return role["id"]
+            return require_str(role.get("id"), field="appRoles[].id")
     raise GraphError(f"Graph exposes no application role named {value!r}.")
 
 
@@ -156,7 +160,7 @@ def _add_short_lived_secret(graph: GraphClient, app_object_id: str) -> str:
             }
         },
     )
-    return resp["secretText"]
+    return require_str(resp.get("secretText"), field="secretText")
 
 
 def _mint_admin_token(tenant_id: str, client_id: str, client_secret: str) -> str:
@@ -176,7 +180,7 @@ def _mint_admin_token(tenant_id: str, client_id: str, client_secret: str) -> str
             _time.sleep(delay)
         resp = requests.post(token_url, data=data, timeout=_TIMEOUT)
         if resp.status_code == 200:
-            return resp.json()["access_token"]
+            return require_str(resp.json().get("access_token"), field="access_token")
         last_status = resp.status_code
         last_body = _safe_json(resp)
         if not _is_propagation_error(last_body):
@@ -213,7 +217,7 @@ def _resolve_site_id(admin_graph: GraphClient, site_url: str) -> str:
     site_id = (resp or {}).get("id")
     if not site_id:
         raise GraphError(f"Graph did not return a site id for {site_url!r}.")
-    return site_id
+    return require_str(site_id, field="sites.id")
 
 
 def _safe_json(resp: requests.Response) -> object:

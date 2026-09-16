@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import TYPE_CHECKING
 
 from kb_connector.core.config import load_config
 from kb_connector.core.errors import ConfigError, ConnectorError, StateError
 from kb_connector.core.state import load_state, save_state
+
+if TYPE_CHECKING:
+    # Annotation-only: core.monitor pulls in botocore, and this module is on the
+    # --help path.
+    from kb_connector.core.monitor import MonitorResult
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -164,7 +170,7 @@ def _run_monitor(args: argparse.Namespace) -> int:
     return 0 if result.stats.status in ("COMPLETE", "COMPLETED") else 1
 
 
-def _render_result(result) -> None:
+def _render_result(result: MonitorResult) -> None:
     """Pretty-print monitor results."""
     stats = result.stats
     if result.timed_out:

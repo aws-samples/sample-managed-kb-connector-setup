@@ -51,7 +51,7 @@ def graph_token_via_az() -> str:
             "Couldn't get a Graph token from 'az'. Run 'az login' first. "
             f"Details: {exc.stderr.strip()}"
         ) from exc
-    return json.loads(out.stdout)["accessToken"]
+    return require_str(json.loads(out.stdout).get("accessToken"), field="accessToken")
 
 
 def graph_token_via_device_code(
@@ -95,7 +95,7 @@ def graph_token_via_device_code(
             timeout=_DEFAULT_TIMEOUT,
         )
         if poll.status_code == 200:
-            return poll.json()["access_token"]
+            return require_str(poll.json().get("access_token"), field="access_token")
         body = _safe_json(poll)
         error = (body or {}).get("error")
         if error == "authorization_pending":
@@ -254,3 +254,38 @@ def _safe_json(resp: requests.Response) -> Any:
         return resp.json()
     except ValueError:
         return resp.text[:2000] if resp.text else None
+
+
+def require_str(value: Any, *, field: str) -> str:
+    """Return a string pulled out of a Graph response.
+
+    Graph replies are parsed JSON, so every value taken out of one arrives
+    untyped. Checking the type here turns a renamed or omitted field into an
+    error naming the field, at the call that needed it, instead of an obscure
+    failure further along. It can only fire where the response already differed
+    from what the caller expected.
+
+    The message names the type, not the value: one call site reads `secretText`,
+    and the field name plus the type is what makes a renamed or omitted field
+    actionable anyway.
+    """
+    if not isinstance(value, str):
+        raise GraphError(
+            f"Graph response field {field!r} was {type(value).__name__}, "
+            f"expected a string."
+        )
+    return value
+
+
+def require_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    """Return a JSON object pulled out of a Graph response.
+
+    Same reasoning as `require_str`: valid JSON can decode to a list or a
+    scalar, so a caller expecting an object needs to say so.
+    """
+    if not isinstance(value, dict):
+        raise GraphError(
+            f"Graph response field {field!r} was {type(value).__name__}, "
+            f"expected an object."
+        )
+    return value

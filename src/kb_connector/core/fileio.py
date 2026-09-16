@@ -30,7 +30,7 @@ import json
 import os
 import stat
 import tempfile
-from typing import Any
+from typing import IO, Any
 
 OWNER_ONLY = 0o600
 
@@ -78,7 +78,7 @@ def atomic_write_json(path: str, data: Any, *, indent: int = 2, sort_keys: bool 
     return atomic_write_bytes(path, text.encode("utf-8"))
 
 
-def open_owner_only(path: str, mode: str = "w"):
+def open_owner_only(path: str, mode: str = "w") -> IO[Any]:
     """Open a file for writing with mode 0600 applied before any content lands.
 
     For callers that must stream rather than serialize in one shot (probe's

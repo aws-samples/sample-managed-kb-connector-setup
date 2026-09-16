@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from typing import TYPE_CHECKING
 
 from kb_connector.core.config import load_config
 from kb_connector.core.errors import ConfigError, ConnectorError
@@ -18,6 +19,14 @@ from kb_connector.core.identifiers import (
     validate_secret_arn,
 )
 from kb_connector.core.state import load_state, save_state
+
+if TYPE_CHECKING:
+    # Annotation-only: boto3 stays off the import path for --help, and naming
+    # the Session type is what makes the SDK's client types visible here rather
+    # than collapsing to Any.
+    from boto3 import Session
+
+    from kb_connector.core.state import ConnectorState
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -298,7 +307,9 @@ def _run_teardown(args: argparse.Namespace) -> int:
     return 0
 
 
-def _delete_data_source(session, region, kb_id, ds_id):
+def _delete_data_source(
+    session: Session, region: str | None, kb_id: str, ds_id: str
+) -> None:
     from kb_connector.targets import get_target
     target = get_target("bmkb", session=session, region=region)
     target.delete_data_source(kb_id, ds_id)
@@ -346,7 +357,9 @@ def _role_name_from_arn(role_arn: str) -> str:
     return name
 
 
-def _find_active_ingestion_job(session, region, kb_id, ds_id) -> str | None:
+def _find_active_ingestion_job(
+    session: Session, region: str | None, kb_id: str, ds_id: str
+) -> str | None:
     """Return the most recent non-terminal ingestion job ID, or None.
 
     Used as the precheck that gates teardown: if a job is in progress,
@@ -362,7 +375,10 @@ def _find_active_ingestion_job(session, region, kb_id, ds_id) -> str | None:
         for job in resp.get("ingestionJobSummaries", [])[:5]:
             status = (job.get("status") or "").upper()
             if status not in _TERMINAL_INGESTION_STATES:
-                return job.get("ingestionJobId")
+                job_id = job.get("ingestionJobId")
+                # The caller passes this to StopIngestionJob, so a summary
+                # missing its id is no better than finding no job at all.
+                return job_id if isinstance(job_id, str) else None
     except Exception as exc:
         # This lookup is the gate that keeps teardown from deleting credentials
         # out from under a running ingestion job, so a failure here disables a
@@ -381,7 +397,9 @@ def _find_active_ingestion_job(session, region, kb_id, ds_id) -> str | None:
     return None
 
 
-def _stop_and_wait_for_terminal(session, region, kb_id, ds_id, job_id) -> None:
+def _stop_and_wait_for_terminal(
+    session: Session, region: str | None, kb_id: str, ds_id: str, job_id: str
+) -> None:
     """Stop the ingestion job and poll briefly for a terminal state.
 
     The Bedrock API's stop is asynchronous: STOPPING transitions to
@@ -412,13 +430,13 @@ def _stop_and_wait_for_terminal(session, region, kb_id, ds_id, job_id) -> None:
     print("    (ingestion still STOPPING after 3 minutes — proceeding anyway)")
 
 
-def _delete_knowledge_base(session, region, kb_id):
+def _delete_knowledge_base(session: Session, region: str | None, kb_id: str) -> None:
     from kb_connector.targets import get_target
     target = get_target("bmkb", session=session, region=region)
     target.delete_knowledge_base(kb_id)
 
 
-def _delete_secret(session, secret_arn):
+def _delete_secret(session: Session, secret_arn: str) -> None:
     sm = session.client("secretsmanager")
     # Force delete (no recovery window). The secret holds credentials this tool
     # minted for one connector and can mint again, so the 7-day default buys no
@@ -435,7 +453,7 @@ def _delete_secret(session, secret_arn):
     )
 
 
-def _delete_role(session, role_arn):
+def _delete_role(session: Session, role_arn: str) -> None:
     """Delete a KB service role the tool created.
 
     Every reason to refuse is checked *before* anything is removed. Inline
@@ -502,7 +520,7 @@ def _delete_role(session, role_arn):
     iam.delete_role(RoleName=role_name)
 
 
-def _delete_cert(session, bucket: str | None, key: str | None) -> None:
+def _delete_cert(session: Session, bucket: str | None, key: str | None) -> None:
     """Delete the certificate object from S3.
 
     The cert bucket itself is shared across connectors and is left in place;
@@ -520,7 +538,7 @@ def _delete_cert(session, bucket: str | None, key: str | None) -> None:
     )
 
 
-def _delete_entra_app(args: argparse.Namespace, cs) -> None:
+def _delete_entra_app(args: argparse.Namespace, cs: ConnectorState) -> None:
     """Delete the Entra app registration via Microsoft Graph.
 
     Requires a Graph token from `az login` or device-code auth. The state

@@ -62,6 +62,18 @@ class Target(ABC):
         ...
 
     @abstractmethod
+    def create_data_source_raw(
+        self, kb_id: str, payload: dict[str, Any]
+    ) -> Mapping[str, Any]:
+        """Create a data source from a fully-formed payload; return the created DS.
+
+        Part of the interface because callers depend on it directly: a connector
+        whose data source is not a managed connector (S3) builds the whole
+        payload itself rather than supplying `connector_parameters`.
+        """
+        ...
+
+    @abstractmethod
     def get_data_source(self, kb_id: str, ds_id: str) -> Mapping[str, Any]:
         """Get a data source by KB + DS ID."""
         ...
