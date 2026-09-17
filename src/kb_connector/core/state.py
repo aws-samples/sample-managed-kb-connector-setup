@@ -45,6 +45,10 @@ RESOURCE_ROLE = "role"
 RESOURCE_CERT = "cert"
 RESOURCE_APP = "app"
 RESOURCE_CERT_BUCKET = "cert_bucket"
+# The KMS asymmetric key that signs Entra assertions for a Quick knowledge base.
+# Tracked so teardown can *report* it; it is deliberately never deleted. See
+# core.kms_signing.describe_orphan_risk.
+RESOURCE_SIGNING_KEY = "signing_key"
 
 OWNER_TOOL = "tool"
 OWNER_EXTERNAL = "external"
@@ -58,14 +62,15 @@ OWNER_TOOL_UNTAGGED = "tool-untagged"
 _TOOL_OWNED = frozenset({OWNER_TOOL, OWNER_TOOL_UNTAGGED})
 
 # The state field holding each resource kind's identity, for `is_recorded_ours`.
-# Only these three are rediscoverable: setup finds an app by display name, and
-# reads a KB id and role ARN back out of state, so each needs to tell "the one
-# we created" from "one that happens to be there". The rest are addressed by a
-# derived name and classified by tag instead.
+# Only these are rediscoverable: setup finds an app by display name and a signing
+# key by alias, and reads a KB id and role ARN back out of state, so each needs to
+# tell "the one we created" from "one that happens to be there". The rest are
+# addressed by a derived name and classified by tag instead.
 _RESOURCE_ID_FIELDS = {
     RESOURCE_APP: "client_app_object_id",
     RESOURCE_KB: "knowledge_base_id",
     RESOURCE_ROLE: "kb_role_arn",
+    RESOURCE_SIGNING_KEY: "signing_key_arn",
 }
 
 
@@ -82,6 +87,10 @@ class ConnectorState:
     connector_type: str | None = None  # "sharepoint", "onedrive", etc.
     tenant_id: str | None = None
     region: str | None = None
+    # Which control plane created this connector's resources ("bmkb" | "quick").
+    # Recorded because the KB and data source ids alone don't say which service
+    # owns them, and teardown and monitor have to call the right one.
+    target: str | None = None
 
     # Source-side (provider) outputs
     client_app_id: str | None = None
@@ -96,6 +105,14 @@ class ConnectorState:
     cert_s3_key: str | None = None
     knowledge_base_id: str | None = None
     data_source_id: str | None = None
+
+    # Quick admin-managed outputs. The signing key is an asymmetric KMS key that
+    # signs Entra assertions. Not to be confused with the `kms_key_arn` config
+    # value, which is a symmetric key that *encrypts* the secret, certificate
+    # object, and knowledge base. Nothing secret is recorded here: the signing
+    # key's private half never leaves KMS.
+    signing_key_arn: str | None = None
+    signing_key_alias: str | None = None
 
     # Monitor outputs
     last_ingestion_job_id: str | None = None

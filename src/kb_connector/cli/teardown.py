@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from kb_connector.core.config import load_config
 from kb_connector.core.errors import ConfigError, ConnectorError
@@ -208,7 +208,7 @@ def _run_teardown(args: argparse.Namespace) -> int:
     # would still strip the credentials the running job depends on.
     if cs.knowledge_base_id and cs.data_source_id:
         active_job = _find_active_ingestion_job(
-            session, region, cs.knowledge_base_id, cs.data_source_id,
+            session, region, cs.knowledge_base_id, cs.data_source_id, cs.target,
         )
         if active_job:
             if not args.force:
@@ -226,7 +226,8 @@ def _run_teardown(args: argparse.Namespace) -> int:
                 return 1
             print(f"\n  --force: stopping ingestion job {active_job}...")
             _stop_and_wait_for_terminal(
-                session, region, cs.knowledge_base_id, cs.data_source_id, active_job,
+                session, region, cs.knowledge_base_id, cs.data_source_id,
+                active_job, cs.target,
             )
 
     # Order matters: AWS-side resources (DS, KB) need their credentials to
@@ -247,11 +248,13 @@ def _run_teardown(args: argparse.Namespace) -> int:
             continue
         try:
             if rtype == "ds" and cs.knowledge_base_id:
-                _delete_data_source(session, region, cs.knowledge_base_id, rid)
+                _delete_data_source(
+                    session, region, cs.knowledge_base_id, rid, cs.target
+                )
                 cs.data_source_id = None
                 print(f"    ✓ Deleted data source {rid}")
             elif rtype == "kb":
-                _delete_knowledge_base(session, region, rid)
+                _delete_knowledge_base(session, region, rid, cs.target)
                 cs.knowledge_base_id = None
                 print(f"    ✓ Deleted knowledge base {rid}")
             elif rtype == "secret":
@@ -307,11 +310,28 @@ def _run_teardown(args: argparse.Namespace) -> int:
     return 0
 
 
-def _delete_data_source(
-    session: Session, region: str | None, kb_id: str, ds_id: str
-) -> None:
+def _build_target(session: Session, region: str | None, target_name: str | None) -> Any:
+    """Construct the control-plane target recorded for this connector.
+
+    Teardown resolves the target from state rather than config, because the
+    knowledge base and data source ids in state say nothing about which service
+    holds them, and config may since have been edited or the connector removed
+    from it. State records what actually created them.
+
+    A single helper rather than a get_target call in each of the four functions
+    below: they run in sequence against the same connector, and one of them
+    reaching a different control plane than the others would delete against one
+    service while checking the other.
+    """
     from kb_connector.targets import get_target
-    target = get_target("bmkb", session=session, region=region)
+    return get_target(target_name, session=session, region=region)
+
+
+def _delete_data_source(
+    session: Session, region: str | None, kb_id: str, ds_id: str,
+    target_name: str | None = None,
+) -> None:
+    target = _build_target(session, region, target_name)
     target.delete_data_source(kb_id, ds_id)
 
 
@@ -358,7 +378,8 @@ def _role_name_from_arn(role_arn: str) -> str:
 
 
 def _find_active_ingestion_job(
-    session: Session, region: str | None, kb_id: str, ds_id: str
+    session: Session, region: str | None, kb_id: str, ds_id: str,
+    target_name: str | None = None,
 ) -> str | None:
     """Return the most recent non-terminal ingestion job ID, or None.
 
@@ -366,8 +387,7 @@ def _find_active_ingestion_job(
     plowing ahead deletes credentials the job still needs. We bail
     cleanly and let the caller decide between waiting and --force.
     """
-    from kb_connector.targets import get_target
-    target = get_target("bmkb", session=session, region=region)
+    target = _build_target(session, region, target_name)
     try:
         # Look at the most recent few jobs only — running jobs are always
         # near the top, and ListIngestionJobs is unfiltered by status.
@@ -398,7 +418,8 @@ def _find_active_ingestion_job(
 
 
 def _stop_and_wait_for_terminal(
-    session: Session, region: str | None, kb_id: str, ds_id: str, job_id: str
+    session: Session, region: str | None, kb_id: str, ds_id: str, job_id: str,
+    target_name: str | None = None,
 ) -> None:
     """Stop the ingestion job and poll briefly for a terminal state.
 
@@ -408,8 +429,7 @@ def _stop_and_wait_for_terminal(
     are about to go regardless.
     """
     import time
-    from kb_connector.targets import get_target
-    target = get_target("bmkb", session=session, region=region)
+    target = _build_target(session, region, target_name)
     try:
         target.stop_ingestion_job(kb_id, ds_id, job_id)
     except Exception as exc:
@@ -430,9 +450,11 @@ def _stop_and_wait_for_terminal(
     print("    (ingestion still STOPPING after 3 minutes — proceeding anyway)")
 
 
-def _delete_knowledge_base(session: Session, region: str | None, kb_id: str) -> None:
-    from kb_connector.targets import get_target
-    target = get_target("bmkb", session=session, region=region)
+def _delete_knowledge_base(
+    session: Session, region: str | None, kb_id: str,
+    target_name: str | None = None,
+) -> None:
+    target = _build_target(session, region, target_name)
     target.delete_knowledge_base(kb_id)
 
 

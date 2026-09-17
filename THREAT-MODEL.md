@@ -742,21 +742,35 @@ does not block an unrelated change.
 ### T-26 — Unvalidated connector name widens an IAM policy
 **Low · Elevation of privilege · TB-1→TB-4 · AS-1, AS-2**
 
-The connector name, `resource_prefix`, and `cert_s3_key_prefix` are interpolated
-into derived resource names, and those names are interpolated into the `Resource`
-ARNs of the inline policy attached to the knowledge base role. `*` and `?` are
-IAM policy wildcards, so a **TA-1** naming a connector `x*` produces an object ARN
-of `arn:aws:s3:::<bucket>/kb-connector/x*.p12` and grants the role read access to
+The connector name, `resource_prefix`, `cert_s3_key_prefix`, and
+`signing_key_alias` are interpolated into derived resource names, and those names
+are interpolated into the `Resource` ARNs of the inline policy attached to the
+knowledge base role. `*` and `?` are IAM policy wildcards, so a **TA-1** naming a
+connector `x*` produces an object ARN of
+`arn:aws:s3:::<bucket>/kb-connector/x*.p12` and grants the role read access to
 every object matching that pattern rather than the single certificate it needs,
 negatively impacting confidentiality of any other connector's key material in the
 shared certificate bucket.
 
+Two KMS key ARNs are supplied rather than derived, and both reach a policy
+`Resource`: `kms_key_arn` in the knowledge base role's inline policy, and
+`signing_key_arn` in the `kms:Sign` grant for a self-managed Quick service role.
+`key/*` in either place grants the principal every key in the account.
+
 **Status: Mitigated.** `identifiers.validate_name_component` and
-`validate_s3_key_prefix` constrain these values to a charset that is
+`validate_s3_key_prefix` constrain the derived-name inputs to a charset that is
 simultaneously safe for an IAM role name, a Secrets Manager name and an S3 key,
-and reject `*` and `?` explicitly. Validation runs in `config.resolve_connector`,
-the single point every command resolves configuration through, so the run fails
-before the first AWS call.
+and reject `*` and `?` explicitly. Both key ARNs are additionally checked as KMS
+ARNs specifically, so an ARN for another service cannot pass merely by parsing,
+and refused outright if they contain a wildcard. Validation runs in
+`config.resolve_connector`, the single point every command resolves configuration
+through, so the run fails before the first AWS call.
+
+Validation covers CLI overrides as well as file and default values, with the same
+precedence `pick` applies. A value passed as `--kms-key-arn` or
+`--signing-key-arn` reaches the policy `Resource` exactly as one from the config
+file does, so checking only the file would leave the flags as a way around the
+wildcard refusal.
 
 Characters IAM rejects outright are refused for a second, non-security reason:
 Secrets Manager and S3 accept names that IAM will not, so without a local check
@@ -839,7 +853,23 @@ Security-relevant behaviors that this model depends on:
 - `handoff.parse_handoff` — the version, direction and field validation behind
   T-24.
 - `config.resolve_connector` → `_validate_derived_name_inputs` — the single
-  choke point behind T-26.
+  choke point behind T-26. It takes CLI overrides as well as file and default
+  values; a new supplied-rather-than-derived value that lands in a policy
+  `Resource` has to be added there, not validated at its point of use.
+- `kms_signing.ensure_signing_key` — extends the T-03 ownership model to the KMS
+  asymmetric signing key. Note KMS spells tags `TagKey`/`TagValue` rather than
+  `Key`/`Value`, so the tag list is converted before it reaches
+  `classify_ownership`; skipping that conversion makes a key this tool created
+  classify as `UNMANAGED`. The module deliberately has no delete function: KMS
+  supports only scheduled deletion, and one signing key can back several Quick
+  knowledge bases, so `teardown` reports the key rather than removing it.
+- `certs._verify_kms_backed_cert` — checks the generated certificate carries the
+  KMS public key *and* that its self-signature verifies, before it is uploaded to
+  Entra. The second check is the same verification Entra performs on a client
+  assertion, so it fails a mismatched key pair at setup time instead of at every
+  sync. This is also why the certificate is signed via `kms:Sign` rather than the
+  `openssl -force_pubkey` splice in the AWS setup guide, which produces an
+  artifact whose signature does not verify against its own embedded key.
 - `diagnostics.describe_endpoints` — the pre-write endpoint report behind T-01.
   It compares each resolved endpoint against botocore's own region-derived
   default, so it catches a service-specific override as well as a global one.

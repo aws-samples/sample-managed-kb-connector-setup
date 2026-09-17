@@ -31,6 +31,10 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
+    # Builds the TBSCertificate that AWS KMS signs for the Amazon Quick
+    # admin-managed flow. `cryptography` cannot do this: its CertificateBuilder
+    # signs with a local private key, and the KMS key never leaves KMS.
+    "asn1crypto>=1.5.1",
     # 1.43.32 is the first release whose bedrock-agent model carries everything
     # this tool calls: the MANAGED_KNOWLEDGE_BASE_CONNECTOR data-source type and
     # its envelope, serverSideEncryptionConfiguration on the managed knowledge
@@ -148,3 +152,10 @@ warn_unused_configs = true
 # already do this: the Target ABC returns Mapping[str, Any] and BmkbTarget
 # overrides with the SDK's real response TypeDefs.
 disallow_any_generics = false
+
+# asn1crypto ships neither inline annotations nor a py.typed marker, and there
+# is no stub package for it. Scoped to this one module rather than set globally,
+# so a genuinely missing import elsewhere still fails the check.
+[[tool.mypy.overrides]]
+module = "asn1crypto.*"
+ignore_missing_imports = true

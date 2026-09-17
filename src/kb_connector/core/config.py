@@ -41,6 +41,11 @@ class ConnectorConfig:
     type: str  # "sharepoint", "onedrive", "s3", "web", "confluence", "googledrive"
     raw: dict = field(default_factory=dict)  # all raw TOML fields
 
+    # Which control plane creates the knowledge base: "bmkb" (Bedrock managed
+    # KB, the default) or "quick" (Amazon Quick). The source-side setup is the
+    # same either way. This selects only the AWS-side calls. See targets/base.py.
+    target: str = "bmkb"
+
     # Common fields resolved from raw + defaults
     region: str | None = None
     profile: str | None = None
@@ -64,6 +69,18 @@ class ConnectorConfig:
     # Unset means the AWS-managed key, which is free and needs no key
     # administration. See core/provisioning.put_secret for the tradeoff.
     kms_key_arn: str | None = None
+
+    # KMS asymmetric signing key for the Quick admin-managed flow. Distinct from
+    # kms_key_arn above in both algorithm and purpose: this one is RSA_2048
+    # SIGN_VERIFY and signs Entra OAuth assertions, and its private half never
+    # leaves KMS. Set `signing_key_arn` to reuse an existing key, or leave it
+    # unset and the tool creates one under `signing_key_alias`.
+    signing_key_arn: str | None = None
+    signing_key_alias: str | None = None
+
+    # Certificate lifetime in days. None means the CLI default. Lives in config
+    # because it is a standing policy choice rather than a per-run one.
+    cert_valid_days: int | None = None
 
     # Prefix applied to derived resource names (role, secret, KB, data source).
     # Exists for accounts running this tool more than once: two teams can use
@@ -113,15 +130,22 @@ class ToolConfig:
                 f"Connector {name!r} is missing required 'type' field."
             )
 
+        overrides = cli_overrides or {}
+
         # The connector name and these two prefixes are interpolated into
         # derived AWS resource names, which are then interpolated into the
         # Resource ARNs of the KB role's inline policy. Validate them here, at
         # the single point every command resolves config through, so a name
         # carrying an IAM wildcard fails before the first AWS call rather than
         # silently widening a grant. See identifiers.validate_name_component.
-        _validate_derived_name_inputs(name, connector_raw, self.defaults)
-
-        overrides = cli_overrides or {}
+        #
+        # CLI overrides are included, and validated with the same precedence
+        # `pick` applies. A key ARN supplied on the command line reaches a policy
+        # Resource exactly like one from the config file, so checking only the
+        # file would leave the flag as a way around the wildcard check.
+        _validate_derived_name_inputs(
+            name, connector_raw, self.defaults, overrides=overrides
+        )
         env = _read_env_vars()
         defaults = self.defaults
         microsoft_defaults = defaults.get("microsoft", {})
@@ -144,6 +168,7 @@ class ToolConfig:
             name=name,
             type=connector_type,
             raw=connector_raw,
+            target=_validate_target(pick("target")),
             region=pick("region"),
             profile=pick("profile"),
             credential=pick("credential"),
@@ -155,12 +180,70 @@ class ToolConfig:
             owner=pick("owner"),
             tags=_merge_tags(defaults, connector_raw),
             kms_key_arn=pick("kms_key_arn"),
+            signing_key_arn=pick("signing_key_arn"),
+            signing_key_alias=pick("signing_key_alias"),
+            cert_valid_days=_validate_cert_valid_days(
+                pick("cert_valid_days", from_microsoft=True)
+            ),
             resource_prefix=pick("resource_prefix"),
         )
 
 
+def _validate_cert_valid_days(raw: Any) -> int | None:
+    """Check cert_valid_days is a usable positive integer.
+
+    Checked here so a bad value fails before an Entra app registration exists,
+    rather than at the point the certificate is built. `bool` is excluded
+    explicitly because it is a subclass of `int`, and `cert_valid_days = true`
+    would otherwise silently mean one day.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        from kb_connector.core.errors import ConfigError
+        raise ConfigError(
+            f"cert_valid_days must be a positive integer, got {raw!r}."
+        )
+    if raw < 1:
+        from kb_connector.core.errors import ConfigError
+        raise ConfigError(
+            f"cert_valid_days must be at least 1, got {raw}."
+        )
+    return raw
+
+
+def _validate_target(raw: Any) -> str:
+    """Normalize and check the `target` value, defaulting to bmkb.
+
+    Checked at config resolution so a typo names the valid options immediately,
+    rather than reaching get_target and raising a ValueError partway through a
+    setup that has already made source-side changes.
+    """
+    from kb_connector.targets import DEFAULT_TARGET, TARGET_NAMES, normalize_target
+
+    if raw is None:
+        return DEFAULT_TARGET
+    if not isinstance(raw, str):
+        from kb_connector.core.errors import ConfigError
+        raise ConfigError(
+            f"target must be a string, not {type(raw).__name__}."
+        )
+    name = normalize_target(raw)
+    if name not in TARGET_NAMES:
+        from kb_connector.core.errors import ConfigError
+        expected = ", ".join(sorted(TARGET_NAMES))
+        raise ConfigError(
+            f"Unknown target {raw!r}. Expected one of: {expected}."
+        )
+    return name
+
+
 def _validate_derived_name_inputs(
-    name: str, connector_raw: dict, defaults: dict
+    name: str,
+    connector_raw: dict,
+    defaults: dict,
+    *,
+    overrides: dict | None = None,
 ) -> None:
     """Reject config values that would corrupt a derived AWS resource name.
 
@@ -178,24 +261,43 @@ def _validate_derived_name_inputs(
     # service cannot pass just because it parses; and rejected outright if it
     # carries an IAM wildcard, since `key/*` would grant the role every key in
     # the account rather than the one the connector needs.
-    kms_key_arn = connector_raw.get("kms_key_arn") or defaults.get("kms_key_arn")
-    if kms_key_arn is not None:
+    # Both key ARNs reach a policy Resource: kms_key_arn in the KB role's inline
+    # policy, signing_key_arn in the kms:Sign grant for the Quick service role
+    # (see core.kms_signing.build_sign_grant_statement). Same two checks apply to
+    # each, so they are validated together.
+    over = overrides or {}
+    for field_name in ("kms_key_arn", "signing_key_arn"):
+        key_arn = (
+            over.get(field_name)
+            or connector_raw.get(field_name)
+            or defaults.get(field_name)
+        )
+        if key_arn is None:
+            continue
         try:
-            checked = validate_arn(kms_key_arn, field="kms_key_arn", service="kms")
+            checked = validate_arn(key_arn, field=field_name, service="kms")
         except ConnectorError as exc:
             raise ConfigError(str(exc)) from exc
         if "*" in checked or "?" in checked:
             raise ConfigError(
-                f"kms_key_arn {kms_key_arn!r} contains an IAM wildcard. Give the "
+                f"{field_name} {key_arn!r} contains an IAM wildcard. Give the "
                 f"ARN of the single key this connector should use."
             )
 
     checks: list[tuple[str, object, bool]] = [
         (f"connector name {name!r}", name, False),
-        ("resource_prefix", connector_raw.get("resource_prefix")
+        ("resource_prefix", over.get("resource_prefix")
+         or connector_raw.get("resource_prefix")
          or defaults.get("resource_prefix"), False),
-        ("cert_s3_key_prefix", connector_raw.get("cert_s3_key_prefix")
+        ("cert_s3_key_prefix", over.get("cert_s3_key_prefix")
+         or connector_raw.get("cert_s3_key_prefix")
          or defaults.get("cert_s3_key_prefix"), True),
+        # The signing key's alias is interpolated into `alias/<value>` and used
+        # to address a KMS key, so it gets the same treatment as the other
+        # derived-name inputs.
+        ("signing_key_alias", over.get("signing_key_alias")
+         or connector_raw.get("signing_key_alias")
+         or defaults.get("signing_key_alias"), False),
     ]
     for label, value, is_prefix in checks:
         if value is None:

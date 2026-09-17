@@ -48,8 +48,14 @@ people).
 | Confluence | Guided (Atlassian) | Automated |
 | Google Drive | Guided (Google Workspace) | Automated |
 
-**Target:** Amazon Bedrock managed Knowledge Bases. A second target sits behind
-a clean interface but isn't available yet.
+**Targets** (`target` in config, or `--target`):
+
+| Target | What it does | Status |
+|--------|--------------|--------|
+| `bmkb` (default) | Amazon Bedrock managed Knowledge Bases. Full setup through to an ingestion job | Complete |
+| `quick` | Amazon Quick. Service credentials for SharePoint and OneDrive | Partial, see [Amazon Quick target](#amazon-quick-target) |
+
+Everything below assumes the default `bmkb` target unless it says otherwise.
 
 ---
 
@@ -183,6 +189,10 @@ credential = "cert"
 acl = true
 sharepoint_host = "contoso.sharepoint.com"
 site_urls = ["https://contoso.sharepoint.com/sites/engineering"]
+# Least-privilege alternative to the default tenant-wide grant: the app can
+# only reach sites you explicitly grant it. Off by default because each site
+# needs its own grant, including any you add later.
+sites_selected = false
 
 # Optional. validate uses these to drive the ACL retrieve trio.
 [connectors.engineering-sp.validation]
@@ -497,6 +507,91 @@ do when the two roles must be different people.
 carry: tenant and app IDs out to the AWS admin, and knowledge base and data
 source IDs back, so each side can configure and validate without holding the
 other's credentials.
+
+---
+
+## Amazon Quick target
+
+Everything above targets Amazon Bedrock managed Knowledge Bases. Setting
+`target = "quick"` on a SharePoint or OneDrive connector points the same
+source-side setup at Amazon Quick instead, following Quick's admin-managed
+pattern where the credential is an AWS KMS key rather than a stored private key.
+
+```toml
+[connectors.engineering-quick]
+type = "sharepoint"          # or "onedrive"
+target = "quick"
+credential = "cert"          # required: the credential is a KMS key pair
+region = "us-east-1"         # must match your Quick instance's Region
+acl = true
+sharepoint_domain = "https://contoso.sharepoint.com"   # SharePoint only
+site_urls = ["https://contoso.sharepoint.com/sites/engineering"]
+```
+
+Setup creates the KMS asymmetric signing key, builds an X.509 certificate over
+that key's public half, registers the Entra app with the documented permissions
+and admin consent, then prints the values the Quick console asks for: five for
+SharePoint, four for OneDrive, which has no domain field.
+
+The private key is generated inside KMS and never exported, so unlike the Bedrock
+path there is no PKCS#12 in S3, no secret in Secrets Manager, and no knowledge
+base service role. Quick signs the Entra client assertion through `kms:Sign` at
+crawl time. The certificate is signed by that same KMS key, so its signature
+verifies against its own embedded public key, which the OpenSSL `-force_pubkey`
+recipe in the AWS setup guide does not produce.
+
+### Where it stops, and the two manual steps
+
+Setup finishes at the credentials and does not create the knowledge base, because
+the Quick API cannot express this connection yet: `CreateDataSource` has no field
+for a KMS signing key or a certificate thumbprint. See KNOWN-LIMITATIONS.md for
+the evidence. Two steps remain in the Quick console, needing different Quick
+roles, so they are often done by different people:
+
+| Step | Who | What |
+|---|---|---|
+| 1 | Quick administrator (**Admin Pro**) | Authorize the signing key: Manage account, Permissions, AWS resources, AWS Key Management Service, then add the printed KMS key ARN. Until this is done the knowledge base can be created but every sync fails to authenticate. |
+| 2 | Knowledge base owner (**Author Pro or Admin Pro**) | Create the KB: Knowledge, the connector, "Connect with service credentials", then paste the printed values. |
+
+Setup prints both steps with the values filled in and a link to the matching AWS
+docs page, so its output is the handoff. Re-run it any time to reprint them,
+since it reuses the key, app and certificate rather than reissuing. Quick starts
+the first sync itself once the knowledge base exists, so `monitor` and `--sync`
+do not apply to this target.
+
+### SharePoint and OneDrive differ
+
+The tool requests the documented permission set for each, and they are not the
+same. OneDrive needs `Group.Read.All`, which the Bedrock connector never asks
+for, and needs no SharePoint REST permission at all. It always enforces
+document-level access control, so `acl = false` is reported and overridden. There
+is no `Sites.Selected` equivalent for OneDrive either, so its app necessarily
+holds tenant-wide read across every user's drive; `sites_selected` warns and has
+no effect. SharePoint supports `Sites.Selected` exactly as it does for `bmkb`.
+
+### Signing key options
+
+By default each connector gets its own key, aliased
+`kb-connector-<connector>-signing`. Point several connectors at one key with
+`signing_key_arn` instead, which also skips creating one:
+
+```toml
+signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+```
+
+A key supplied that way is recorded as external, so `teardown` reports it and
+leaves it alone. A key the tool created is never deleted automatically either:
+KMS only supports scheduled deletion, 7 to 30 days, and one key can back several
+Quick knowledge bases. `teardown` prints the ARN and the command to schedule it.
+
+`cert_valid_days` sets the certificate lifetime, defaulting to 365. Reissuing
+with `--rotate-cert` uses the same KMS key, so only the Entra upload and the
+thumbprint change, not the key ARN.
+
+Full step detail lives in the AWS docs rather than here, so it cannot drift:
+[SharePoint](https://docs.aws.amazon.com/quick/latest/userguide/sharepoint-kb-admin-config.html)
+and
+[OneDrive](https://docs.aws.amazon.com/quick/latest/userguide/onedrive-kb-admin-config.html).
 
 ---
 

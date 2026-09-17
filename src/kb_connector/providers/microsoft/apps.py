@@ -10,7 +10,11 @@ import datetime as _dt
 from dataclasses import dataclass
 
 from kb_connector.core.errors import GraphError
-from kb_connector.providers.microsoft.certs import GeneratedCertificate, certificate_der_b64
+from kb_connector.providers.microsoft.certs import (
+    GeneratedCertificate,
+    KmsBackedCertificate,
+    certificate_der_b64,
+)
 from kb_connector.providers.microsoft.client import (
     GraphClient,
     require_mapping,
@@ -171,9 +175,21 @@ def declare_required_resource_access(
 
 
 def upload_certificate(
-    graph: GraphClient, app_object_id: str, cert: GeneratedCertificate
+    graph: GraphClient,
+    app_object_id: str,
+    cert: GeneratedCertificate | KmsBackedCertificate,
 ) -> None:
-    """Set the generated certificate as the application's keyCredential."""
+    """Set the generated certificate as the application's keyCredential.
+
+    Accepts either certificate kind: only the public DER and the expiry are used,
+    and where the matching private key lives (locally, or inside KMS) makes no
+    difference to what Entra stores.
+
+    Note this PATCH replaces `keyCredentials` wholesale rather than appending, so
+    an app shared by more than one connector keeps only the most recently
+    uploaded certificate. Callers avoid re-uploading needlessly via their
+    certificate-reuse checks.
+    """
     now = _dt.datetime.now(_dt.timezone.utc)
     credential = {
         "type": "AsymmetricX509Cert",

@@ -109,16 +109,22 @@ def _run_monitor(args: argparse.Namespace) -> int:
 
     region = args.region
     profile = args.profile
+    # State is the primary record of which control plane holds this kb/ds, since
+    # a --kb/--ds pair passed directly may not appear in config at all. Config
+    # still wins when both are present, so editing `target` takes effect without
+    # having to clear state.
+    target_name = cs.target if cs else None
     if connector_name != "_direct" and config.connector_names():
         cfg = config.resolve_connector(connector_name, cli_overrides=cli_overrides)
         region = region or cfg.region
         profile = profile or cfg.profile
+        target_name = cfg.target or target_name
 
     if not region:
         raise ConfigError("No region available. Pass --region or set it in config.")
 
     session = boto3.Session(region_name=region, profile_name=profile)
-    target = get_target("bmkb", session=session, region=region)
+    target = get_target(target_name, session=session, region=region)
 
     # An explicit --job means "resume this job" and implies --no-start.
     do_start = not args.no_start and not args.job

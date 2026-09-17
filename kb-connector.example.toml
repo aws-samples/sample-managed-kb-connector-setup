@@ -111,6 +111,81 @@ crawl_depth = 2
 # authorized_user = "alice@contoso.com"      # expected to get results
 # unauthorized_user = "outsider@contoso.com" # expected to get zero
 
+# Example: OneDrive knowledge base in Amazon Quick (admin-managed)
+#
+# Same KMS + Entra process as the SharePoint example below, with three
+# differences the tool handles for you:
+#   • no `sharepoint_domain`. The console form has no domain field, so this
+#     prints four values rather than five
+#   • different Entra permissions: OneDrive needs Group.Read.All and needs no
+#     SharePoint REST permission at all
+#   • ACL is always enforced. `acl = false` is reported and overridden.
+#
+# There is no Sites.Selected equivalent for OneDrive, so the app holds
+# tenant-wide read across every user's drive. `sites_selected` warns and is
+# ignored here.
+#
+# [connectors.company-drive-quick]
+# type = "onedrive"
+# target = "quick"
+# credential = "cert"
+# region = "us-east-1"            # must match your Quick instance's Region
+# acl = true
+# cert_valid_days = 365
+#
+# Reuse one signing key across connectors instead of creating one per connector.
+# A supplied key is recorded as external, so teardown reports it and never
+# schedules it for deletion:
+# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+
+# Example: SharePoint knowledge base in Amazon Quick (admin-managed)
+#
+# `target` selects which control plane creates the knowledge base:
+#   "bmkb"  — Amazon Bedrock managed Knowledge Bases (default)
+#   "quick" — Amazon Quick
+#
+# The source-side work is identical either way; only the AWS side differs. The
+# Quick path holds no private key: it is generated inside AWS KMS and never
+# exported, so there is no PKCS#12 in S3 and no secret in Secrets Manager.
+#
+# Setup completes the service credentials and then stops, printing the five
+# values the Quick console asks for. Creating the knowledge base is still manual,
+# because the Quick API has no field for a signing key or a certificate
+# thumbprint yet. See KNOWN-LIMITATIONS.md.
+#
+# [connectors.engineering-quick]
+# type = "sharepoint"             # the only type supported with target = "quick"
+# target = "quick"
+# credential = "cert"             # required: the credential is a KMS key pair
+# region = "us-east-1"            # must match your Quick instance's Region.
+#                                 # Set it explicitly if [defaults] differs,
+#                                 # since Quick needs the key in that Region.
+# acl = true                      # immutable once the KB is created in Quick
+# sharepoint_domain = "https://contoso.sharepoint.com"   # tenant root, not a
+#                                 # site URL, which is what the console wants
+# site_urls = [
+#     "https://contoso.sharepoint.com/sites/engineering",
+# ]
+#
+# Certificate lifetime. Defaults to 365 days. Longer is fine, and the AWS guide
+# uses 730, because the certificate is only a public wrapper around a key that
+# outlives it: reissuing costs one Entra upload and changes neither the KMS key
+# ARN nor Quick's configuration. Re-run with --rotate-cert to reissue.
+# cert_valid_days = 365
+#
+# By default the tool creates the KMS asymmetric signing key and names it
+# alias/kb-connector-<connector>-signing. Override either half:
+# signing_key_alias = "quick-sharepoint-service-auth"   # alias for a new key
+# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+#                                 # reuse an existing key instead of creating
+#                                 # one. Must be asymmetric RSA_2048 with
+#                                 # SIGN_VERIFY usage, single-Region. Note this
+#                                 # is NOT kms_key_arn above: that one is a
+#                                 # symmetric key that ENCRYPTS the secret and
+#                                 # certificate object. This one SIGNS Entra
+#                                 # assertions. Swapping them fails to
+#                                 # authenticate, with no useful diagnostic.
+
 # Example: OneDrive connector
 # [connectors.company-drive]
 # type = "onedrive"
