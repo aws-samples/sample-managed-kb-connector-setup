@@ -127,13 +127,6 @@ skips = [
 # skips above and so are invisible to anyone auditing this file alone. Audit
 # them with: bandit -c pyproject.toml -r src/ --ignore-nosec
 #
-#   B303  providers/microsoft/certs.py — SHA-1 over the certificate DER. This
-#         is the highest-severity finding in the codebase (MEDIUM) and is
-#         suppressed inline, so it is called out explicitly here. SHA-1 is the
-#         algorithm Microsoft requires for a keyCredential's
-#         customKeyIdentifier / x5t thumbprint; it identifies which uploaded
-#         certificate is which and is not relied on for any security property.
-#         Signatures use SHA-256.
 #   B105  core/state.py, probe/driver.py, connectors/{sharepoint,onedrive}.py,
 #         core/provisioning.py — constant names and API enum values that bandit
 #         reads as passwords ("secret", "__SECRET_ARN__", "ENTRA_APP_ID",

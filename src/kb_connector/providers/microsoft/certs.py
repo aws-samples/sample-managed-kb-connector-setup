@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import hashlib
 import secrets as _secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -162,14 +163,13 @@ def certificate_thumbprints(certificate_der: bytes) -> tuple[str, str]:
     Equivalent to the shell pipeline in the Quick setup guide:
         openssl dgst -sha1 -binary cert.cer | base64 | tr '+/' '-_' | tr -d '='
 
-    The semgrep suppression sits on its own line rather than trailing the bandit
-    one: bandit reads everything after `nosec` as further test ids, so appending
-    to that comment would silently void the B303 suppression.
+    `usedforsecurity=False` is the declaration that this is an identifier rather
+    than a security primitive. bandit reads it and does not flag the call, which
+    is why there is no `# nosec` here. semgrep does not read it, so its
+    suppression is still required.
     """
     # nosemgrep: insecure-hash-algorithm-sha1
-    digest = hashes.Hash(hashes.SHA1())  # noqa: S303  # nosec B303
-    digest.update(certificate_der)
-    sha1 = digest.finalize()
+    sha1 = hashlib.sha1(certificate_der, usedforsecurity=False).digest()
     thumbprint_b64url = base64.urlsafe_b64encode(sha1).rstrip(b"=").decode("ascii")
     # Uppercase, because that is how both the Entra portal and Graph's
     # keyCredentials.customKeyIdentifier render it. An operator comparing this
