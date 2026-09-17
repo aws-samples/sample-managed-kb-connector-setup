@@ -136,7 +136,7 @@ crawl_depth = 2
 # Reuse one signing key across connectors instead of creating one per connector.
 # A supplied key is recorded as external, so teardown reports it and never
 # schedules it for deletion:
-# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 # Example: SharePoint knowledge base in Amazon Quick (admin-managed)
 #
@@ -176,7 +176,7 @@ crawl_depth = 2
 # By default the tool creates the KMS asymmetric signing key and names it
 # alias/kb-connector-<connector>-signing. Override either half:
 # signing_key_alias = "quick-sharepoint-service-auth"   # alias for a new key
-# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+# signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 #                                 # reuse an existing key instead of creating
 #                                 # one. Must be asymmetric RSA_2048 with
 #                                 # SIGN_VERIFY usage, single-Region. Note this

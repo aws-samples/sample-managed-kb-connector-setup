@@ -350,7 +350,7 @@ kb-connector setup engineering-sp --kb EPS06WSNZU # attach to an existing KB
 
 # Encrypt the secret + certificate with your own KMS key instead of the
 # AWS-managed one (adds a key-policy gate; the KB role gets kms:Decrypt on it):
-kb-connector setup engineering-sp --kms-key-arn arn:aws:kms:us-east-1:111122223333:key/abc
+kb-connector setup engineering-sp --kms-key-arn arn:aws:kms:us-east-1:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 # Take over a pre-existing role/secret whose ownership can't be verified:
 kb-connector setup engineering-sp --adopt-existing-resources
@@ -576,7 +576,7 @@ By default each connector gets its own key, aliased
 `signing_key_arn` instead, which also skips creating one:
 
 ```toml
-signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+signing_key_arn = "arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
 A key supplied that way is recorded as external, so `teardown` reports it and
@@ -694,7 +694,7 @@ statement the scoped caller policy below refers to:
   "Sid": "ConnectorKmsKey",
   "Effect": "Allow",
   "Action": ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
-  "Resource": "arn:aws:kms:us-west-2:111122223333:key/abcd1234-..."
+  "Resource": "arn:aws:kms:us-west-2:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 }
 ```
 
