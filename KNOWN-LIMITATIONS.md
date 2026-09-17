@@ -250,6 +250,74 @@ check your tenant for an app named `<app-name>-granter` and delete it. The tool
 prints the object ID and an `az ad app delete` command if it can't remove the app
 itself.
 
+### Amazon Quick target stops at the service credentials
+
+`target = "quick"` completes the credential half of the Amazon Quick
+admin-managed SharePoint setup and then stops. It does not create the
+Quick data source or knowledge base, because the API cannot express this
+connection yet.
+
+Verified against the published QuickSight model (`quicksight`
+`2018-04-01`, from botocore `develop`): the full transitive closure of
+`CreateDataSourceRequest` is 363 member paths, and none of them accept a
+KMS signing key or a certificate thumbprint. `SharePointParameters`
+carries exactly four fields (`SharePointDomain`, `TenantId`, `ClientId`,
+`AuthType`), and `DataSourceCredentials` has six arms, none holding a key
+ARN. The strings `thumbprint` and `signing key` do not appear anywhere in
+the model. The only KMS members in the whole service belong to
+`UpdateKeyRegistration` / `DescribeKeyRegistration` and are documented for
+"encryption and decryption use", meaning the symmetric QDataKey rather than
+the asymmetric `SIGN_VERIFY` key this flow needs.
+
+So two steps remain manual, and setup prints both with the values filled
+in:
+
+1. **Granting Quick use of the signing key.** The documented route is the
+   Quick console (Manage account → AWS resources → AWS Key Management
+   Service). If your organization manages its own Quick IAM service role,
+   the alternative is granting that role `kms:Sign` on the key; setup
+   prints the policy statement.
+2. **Creating the knowledge base**, in the Quick console, pasting the five
+   printed values.
+
+Two consequences worth planning around. **ACL management is immutable
+after the knowledge base is created**. Changing it means creating a new
+one, so decide before you click Create. And there is no knowledge-base
+sync API to drive: the only ingestion operations are dataset-scoped
+(`/data-sets/{DataSetId}/ingestions/{IngestionId}`). That costs nothing
+here, because Quick triggers the first sync itself once the knowledge base
+exists. It does mean `monitor` and `--sync` do not apply to this target,
+and `--sync` warns and no-ops.
+
+This area of the API is moving: `SharePointParameters` itself, along with
+`CreateKnowledgeBase` and `UpdateKnowledgeBase`, landed between botocore
+`1.43.32` and `develop`. If a credential field appears, the work is
+confined to `targets/quick.py` and the Stage 2 branch in `cli/setup.py`.
+
+`target = "quick"` supports `type = "sharepoint"` and `type = "onedrive"`,
+both requiring `credential = "cert"`. The credential is a KMS-held key
+pair and there is nowhere in the flow for a client secret, so unlike the
+Bedrock OneDrive path no client secret is created.
+
+The two sources need different Entra permissions, and the tool requests
+the documented set for each rather than sharing one. OneDrive needs
+`Group.Read.All`, which the Bedrock connector never asks for. Without it,
+group-based access control resolves to nothing and documents shared with a
+group are silently missed. It needs no SharePoint REST permission, so the
+Bedrock path's `Sites.FullControl.All` (tenant-wide full control) is not
+granted. And admin-managed OneDrive always enforces document-level access
+control, so `acl = false` is reported and overridden rather than honored
+into a permission set that cannot support the crawl Quick runs.
+
+There is no `Sites.Selected` equivalent for OneDrive: its setup guide has
+no per-site grant step, so the app necessarily holds tenant-wide
+`Files.Read.All` across every user's drive. Setting `sites_selected` on a
+OneDrive connector warns and has no effect.
+
+OneNote (`Notes.Read.All`) cannot work in admin-managed setup for either
+source: Microsoft retired app-only tokens for the OneNote APIs on
+31 March 2025. Use Quick's user-managed setup for OneNote content.
+
 ### Setup doesn't reuse an existing knowledge base by name
 
 If you re-run setup after a failed attempt that left an orphan KB

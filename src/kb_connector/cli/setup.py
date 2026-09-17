@@ -62,8 +62,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                         help="Graph token acquisition (default: az)")
     parser.add_argument("--device-client-id", help="Public client app id for device_code")
     parser.add_argument("--app-name", help="Entra app display name override")
-    parser.add_argument("--cert-valid-days", type=int, default=365,
-                        help="Certificate validity in days (default: 365)")
+    parser.add_argument("--cert-valid-days", type=int,
+                        default=_DEFAULT_CERT_VALID_DAYS,
+                        help=(
+                            f"Certificate validity in days (default: "
+                            f"{_DEFAULT_CERT_VALID_DAYS}). Can also be set as "
+                            f"cert_valid_days in config."
+                        ))
     parser.add_argument("--rotate-cert", action="store_true",
                         help="Issue a new certificate instead of keeping the "
                              "one already installed on the app. Replaces the "
@@ -122,6 +127,30 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument(
+        "--target", choices=sorted(_target_choices()),
+        help=(
+            "Which control plane creates the knowledge base: 'bmkb' (Bedrock "
+            "managed KB, the default) or 'quick' (Amazon Quick). Overrides the "
+            "target set in config."
+        ),
+    )
+    parser.add_argument(
+        "--signing-key-arn",
+        help=(
+            "[--target quick] Existing KMS asymmetric signing key (RSA_2048, "
+            "SIGN_VERIFY) to sign Entra assertions with. Default is to create "
+            "one. Not the same thing as --kms-key-arn, which encrypts."
+        ),
+    )
+    parser.add_argument(
+        "--signing-key-alias",
+        help=(
+            "[--target quick] Alias for the KMS signing key this tool creates "
+            "(default: derived from the connector name). Ignored when "
+            "--signing-key-arn names an existing key."
+        ),
+    )
+    parser.add_argument(
         "--sync", action="store_true",
         help="Start an ingestion job after setup and poll to completion",
     )
@@ -134,6 +163,24 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Max seconds to wait for ingestion when --sync is set (default: 1800)",
     )
     parser.set_defaults(func=run)
+
+
+# Shorter than the Quick guide's 730-day example. The certificate is a public
+# wrapper around a key that outlives it, so reissuing costs one Entra upload and
+# no change to the KMS key ARN or to Quick's configuration, which makes a
+# shorter default cheap. Override per connector with cert_valid_days.
+_DEFAULT_CERT_VALID_DAYS = 365
+
+
+def _target_choices() -> frozenset[str]:
+    """Target names for the --target flag.
+
+    Read from targets.TARGET_NAMES rather than repeated here, so adding a target
+    does not leave the flag silently rejecting it. Imported inside the function
+    to keep `--help` off the import path of anything heavier.
+    """
+    from kb_connector.targets import TARGET_NAMES
+    return TARGET_NAMES
 
 
 def run(args: argparse.Namespace) -> int:
@@ -396,6 +443,12 @@ def _run_setup(args: argparse.Namespace) -> int:
         cli_overrides["region"] = args.region
     if args.profile:
         cli_overrides["profile"] = args.profile
+    if getattr(args, "target", None):
+        cli_overrides["target"] = args.target
+    if getattr(args, "signing_key_arn", None):
+        cli_overrides["signing_key_arn"] = args.signing_key_arn
+    if getattr(args, "signing_key_alias", None):
+        cli_overrides["signing_key_alias"] = args.signing_key_alias
 
     try:
         cfg = config.resolve_connector(connector_name, cli_overrides=cli_overrides)
@@ -406,8 +459,15 @@ def _run_setup(args: argparse.Namespace) -> int:
     cs = state_file.get(connector_name)
     stage = args.stage
 
+    # Recorded for every connector, not just Quick: teardown and monitor resolve
+    # the control plane from state, because a knowledge base id alone does not
+    # say which service holds it.
+    cs.target = cfg.target
+
     print(f"Setting up connector: {connector_name} (type: {cfg.type})")
     print(f"  region: {cfg.region or 'default'}")
+    if cfg.target != "bmkb":
+        print(f"  target: {cfg.target}")
 
     # Dispatch to the appropriate setup path. Persist state in a finally block
     # so that resources created before a mid-flight failure are still tracked
@@ -459,6 +519,18 @@ def _run_setup(args: argparse.Namespace) -> int:
             print(f"\nState saved to {path}")
 
     print("Setup complete.")
+
+    if cfg.target == "quick":
+        # No ingestion to start: the knowledge base does not exist yet, and Quick
+        # triggers its own initial sync once it is created in the console.
+        if args.sync:
+            print(
+                "\n  NOTE: --sync has no effect with target = 'quick'. Quick "
+                "starts the first sync itself once the knowledge base is "
+                "created.",
+                file=sys.stderr,
+            )
+        return 0
 
     if args.sync:
         return _run_sync(args, connector_name)
@@ -515,7 +587,7 @@ def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
 def _build_target(cfg: ConnectorConfig, session: Session) -> Target:
     """Construct the control-plane target for this connector's config."""
     from kb_connector.targets import get_target
-    return get_target("bmkb", session=session, region=cfg.region)
+    return get_target(cfg.target, session=session, region=cfg.region)
 
 
 def _provision_kb_and_ds(
@@ -738,6 +810,10 @@ def _setup_microsoft(
     credential = cfg.credential or "cert"
     acl = cfg.acl
     uses_cert = credential.strip().lower() == "cert"
+    # Quick's admin-managed flow keeps the private key in KMS, which changes what
+    # Stage 1 produces (a certificate over an exported public key, no p12) and
+    # what Stage 2 needs (no secret, no S3 object, no KB service role).
+    uses_kms_signing = cfg.target == "quick"
 
     # Validate combination
     if acl and not uses_cert:
@@ -758,6 +834,58 @@ def _setup_microsoft(
             "needs, and 'ropc' is not automated by this tool. See "
             "KNOWN-LIMITATIONS.md."
         )
+
+    if uses_kms_signing:
+        # Quick's admin-managed setup is certificate-based by definition: the
+        # credential is a KMS-held key pair, and there is nowhere in the flow for
+        # a client secret to go.
+        if not uses_cert:
+            raise ConfigError(
+                f"target = 'quick' requires credential = 'cert' (got "
+                f"{credential!r}). Quick's admin-managed setup authenticates "
+                f"with a certificate whose private key lives in AWS KMS; it has "
+                f"no client-secret path."
+            )
+        if cfg.type not in ("sharepoint", "onedrive"):
+            raise ConfigError(
+                f"target = 'quick' supports SharePoint and OneDrive connectors "
+                f"(got type = {cfg.type!r})."
+            )
+        if cfg.type == "onedrive":
+            if not acl:
+                # Not an error, because there is no alternative to select:
+                # Quick's admin-managed OneDrive setup crawls every user's
+                # content and always enforces document-level access control.
+                # Honoring acl = false would request a permission set that
+                # cannot support the crawl Quick runs.
+                print(
+                    "  NOTE: acl = false is ignored for OneDrive with "
+                    "target = 'quick'. Admin-managed OneDrive always enforces "
+                    "document-level access control."
+                )
+                acl = True
+            if args.sites_selected or cfg.get("sites_selected", False):
+                # Said out loud rather than ignored: the operator asked for
+                # least privilege and is not getting it. There is no OneDrive
+                # equivalent of Sites.Selected. The admin-managed OneDrive
+                # setup has no per-site grant step, so the app necessarily
+                # holds tenant-wide Files.Read.All.
+                print(
+                    "  WARNING: sites_selected has no effect for OneDrive. "
+                    "There is no per-site grant for OneDrive, so the app holds "
+                    "tenant-wide read across every user's drive.",
+                    file=sys.stderr,
+                )
+        # The KMS key is created during Stage 1, before the certificate that
+        # wraps its public half, so a region is needed earlier than the Bedrock
+        # path needs one. Quick also requires the account and the Quick instance
+        # to be in the same Region.
+        if not cfg.region:
+            raise ConfigError(
+                "region is required for target = 'quick': the KMS signing key "
+                "is created before the certificate that embeds its public key. "
+                "It must be the same Region as your Quick instance."
+            )
 
     # Stage 1 mints the connector's credential — a certificate private key, or a
     # client secret — and holds it only in memory. It is never written to state
@@ -817,6 +945,7 @@ def _setup_microsoft(
             acl=acl,
             sites_selected=sites_sel,
             credential=credential,
+            target=cfg.target,
         )
         grants = apps.resolve_grants(graph, plan)
         apps.grant_admin_consent(graph, reg.service_principal_id, grants)
@@ -843,7 +972,18 @@ def _setup_microsoft(
                 print("  issuing a new certificate.")
                 installed = []
 
-            if _should_reuse_certificate(
+            if uses_kms_signing:
+                # Quick admin-managed: the private key is generated in KMS and
+                # never exists here, so this branch produces no p12, no password
+                # and no private key to carry into Stage 2.
+                cert_thumbprint, cert_not_after = _ensure_kms_backed_certificate(
+                    args, cfg, cs, connector_name,
+                    graph=graph,
+                    app_object_id=reg.object_id,
+                    app_name=app_name,
+                    installed_thumbprints=installed,
+                )
+            elif _should_reuse_certificate(
                 cs, installed_thumbprints=installed, rotate=args.rotate_cert
             ):
                 cert_thumbprint = cs.cert_thumbprint_b64url
@@ -870,8 +1010,13 @@ def _setup_microsoft(
         # Graph token with it), and the non-cert modes use it as the primary
         # credential. SharePoint cert auth doesn't use it: the certificate signs
         # both the Graph and SharePoint REST tokens.
+        #
+        # Never for Quick, whichever source: the credential is the KMS key pair,
+        # Quick has no field to receive a client secret, and there is no Secrets
+        # Manager secret in this flow to store one. Creating one anyway would
+        # leave a live, unused credential on the app registration.
         client_secret = None
-        if not uses_cert or cfg.type == "onedrive":
+        if not uses_kms_signing and (not uses_cert or cfg.type == "onedrive"):
             client_secret = apps.add_client_secret(graph, reg.object_id)
             print("  Created client secret")
 
@@ -930,6 +1075,14 @@ def _setup_microsoft(
         _import_handoff(args.from_handoff, cs, cfg)
 
     # --- Stage 2: AWS-side ---------------------------------------------------
+    if stage in ("2", "both") and uses_kms_signing:
+        # Quick's AWS-side work finished in Stage 1: the signing key and the
+        # certificate are the whole credential. What remains is granting Quick
+        # use of the key and creating the knowledge base, neither of which this
+        # tool can do yet, so report the values the console asks for.
+        _report_quick_credentials(args, cfg, cs, connector_name)
+        return
+
     if stage in ("2", "both"):
         print("\n── Stage 2: AWS-side ──")
 
@@ -1144,6 +1297,296 @@ def _setup_microsoft(
         )
 
         print("  Stage 2 complete")
+
+
+def _cert_valid_days(args: argparse.Namespace, cfg: ConnectorConfig) -> int:
+    """Certificate lifetime, from --cert-valid-days or config.
+
+    The flag keeps its own default, so config only applies when the flag was left
+    at that default. Config is the better home for this: certificate lifetime is
+    a standing policy decision, not something to remember on each run.
+    """
+    from_flag = getattr(args, "cert_valid_days", None)
+    if from_flag is not None and from_flag != _DEFAULT_CERT_VALID_DAYS:
+        return int(from_flag)
+    from_config = cfg.cert_valid_days
+    if from_config is not None:
+        return int(from_config)
+    return int(from_flag or _DEFAULT_CERT_VALID_DAYS)
+
+
+def _derive_signing_key_alias(
+    args: argparse.Namespace, cfg: ConnectorConfig, connector_name: str
+) -> str:
+    """Alias for this connector's KMS signing key."""
+    explicit = getattr(args, "signing_key_alias", None) or cfg.signing_key_alias
+    if explicit:
+        return str(explicit)
+    return _derived_name(cfg, f"kb-connector-{connector_name}-signing")
+
+
+def _should_reuse_kms_certificate(
+    cs: ConnectorState,
+    *,
+    signing_key_arn: str,
+    installed_thumbprints: list[str],
+    rotate: bool,
+) -> bool:
+    """Whether the recorded KMS-backed certificate can be kept.
+
+    Simpler than the Bedrock equivalent because the credential is not split in
+    half. There is no private key in Secrets Manager and no object in S3 to fall
+    out of step with the directory, because the private key sits in KMS the whole
+    time.
+    So reuse only needs the recorded certificate to still be installed on the
+    app, and to have been built from the key this run is using.
+
+    That last condition is the one that matters: reissuing a certificate is
+    cheap and harmless here, but keeping one built from a *different* KMS key
+    silently leaves Entra validating assertions against a public key that no
+    longer matches the signer, which fails at sync time.
+    """
+    if rotate:
+        return False
+    recorded = cs.cert_thumbprint_b64url
+    if not recorded or cs.signing_key_arn != signing_key_arn:
+        return False
+    return recorded in installed_thumbprints
+
+
+def _ensure_kms_backed_certificate(
+    args: argparse.Namespace,
+    cfg: ConnectorConfig,
+    cs: ConnectorState,
+    connector_name: str,
+    *,
+    graph: Any,
+    app_object_id: str,
+    app_name: str,
+    installed_thumbprints: list[str],
+) -> tuple[str | None, str | None]:
+    """Create/reuse the KMS signing key and the Entra certificate over it.
+
+    Returns (thumbprint_b64url, not_after). Records the signing key and its
+    ownership in state.
+
+    Ordering is forced by the credential's shape: the certificate embeds the
+    KMS public key, so the key has to exist first. That makes this the one AWS
+    resource the source-side stage creates.
+    """
+    from kb_connector.core import kms_signing
+    from kb_connector.providers.microsoft import apps, certs
+
+    session, _account_id = _aws_session_and_account(cfg)
+    opts = _provision_options(args, cfg)
+
+    explicit_arn = getattr(args, "signing_key_arn", None) or cfg.signing_key_arn
+    if explicit_arn:
+        # An operator-supplied key is read, never created or tagged, so it is
+        # recorded external: teardown reports it and leaves it be.
+        signing_key_arn = str(explicit_arn)
+        _record_reused_resource(
+            cs, state_mod.RESOURCE_SIGNING_KEY, signing_key_arn
+        )
+        print(f"  Using existing KMS signing key: {signing_key_arn}")
+        alias = None
+    else:
+        alias = _derive_signing_key_alias(args, cfg, connector_name)
+        key_res = kms_signing.ensure_signing_key(
+            session=session,
+            alias=alias,
+            connector_name=connector_name,
+            tags_enabled=opts.tags_enabled,
+            extra_tags=opts.tags,
+            adopt_existing=opts.adopt_existing,
+            created_untagged=cs.created_untagged(state_mod.RESOURCE_SIGNING_KEY),
+        )
+        signing_key_arn = key_res.arn
+        cs.record_ownership(
+            state_mod.RESOURCE_SIGNING_KEY, key_res.state_marker
+        )
+        verb = "Created" if key_res.created else "Using"
+        print(f"  {verb} KMS signing key ({alias}): {signing_key_arn}")
+
+    cs.signing_key_arn = signing_key_arn
+    cs.signing_key_alias = alias
+
+    if _should_reuse_kms_certificate(
+        cs,
+        signing_key_arn=signing_key_arn,
+        installed_thumbprints=installed_thumbprints,
+        rotate=args.rotate_cert,
+    ):
+        print(
+            f"  Keeping the existing certificate (expires {cs.cert_not_after}). "
+            f"Pass --rotate-cert to replace it."
+        )
+        return cs.cert_thumbprint_b64url, cs.cert_not_after
+
+    public_key_der = kms_signing.get_public_key_der(
+        session=session, key_id=signing_key_arn
+    )
+    cert = certs.generate_kms_backed_cert(
+        public_key_der=public_key_der,
+        signing_key_arn=signing_key_arn,
+        sign=kms_signing.make_signer(session=session, key_id=signing_key_arn),
+        common_name=app_name,
+        valid_days=_cert_valid_days(args, cfg),
+    )
+    apps.upload_certificate(graph, app_object_id, cert)
+    cs.record_owned(state_mod.RESOURCE_CERT)
+    print(
+        f"  Generated + uploaded certificate over the KMS public key "
+        f"(expires {cert.not_after})"
+    )
+    return cert.thumbprint_b64url, cert.not_after
+
+
+def _report_quick_credentials(
+    args: argparse.Namespace,
+    cfg: ConnectorConfig,
+    cs: ConnectorState,
+    connector_name: str,
+) -> None:
+    """Print the service credentials Quick's console wizard asks for.
+
+    This is where the automated path stops. Two steps remain and neither has a
+    public API today:
+
+      * Granting Quick use of the signing key. The documented route is the Quick
+        admin console (Manage account -> AWS resources -> AWS Key Management
+        Service). The only API-shaped alternative applies when an organization
+        manages its own Quick service role, which needs kms:Sign on the key.
+      * Creating the knowledge base. `quicksight:CreateDataSource` has no field
+        for a KMS signing key or a certificate thumbprint. SharePointParameters
+        carries only domain, tenant, client id and auth type, so the connection
+        cannot be expressed through the API yet.
+
+    Printing the exact five values, labeled as the console labels them, is
+    therefore the useful end state rather than a placeholder.
+    """
+    from kb_connector.core import kms_signing
+
+    is_sharepoint = cfg.type == "sharepoint"
+    sharepoint_domain = None
+    if is_sharepoint:
+        # OneDrive's console form has no domain field. The tenant id identifies
+        # the tenant and the drives are enumerated from it.
+        sharepoint_domain = (
+            cfg.get("sharepoint_domain")
+            or cfg.get("sharepoint_host")
+            or _domain_from_site_urls(cfg.get("site_urls", []))
+        )
+
+    print("\n── Service credentials (for the Amazon Quick console) ──")
+    rows = []
+    if is_sharepoint:
+        rows.append(("SharePoint domain", sharepoint_domain))
+    rows += [
+        ("Tenant ID", cs.tenant_id),
+        ("Client ID", cs.client_app_id),
+        ("KMS key ARN", cs.signing_key_arn),
+        ("Certificate Thumbprint", cs.cert_thumbprint_b64url),
+    ]
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        shown = value if value else "(unavailable, see above)"
+        print(f"  {label.ljust(width)}  {shown}")
+    if cs.cert_not_after:
+        print(f"\n  Certificate expires {cs.cert_not_after}. Re-run with "
+              f"--rotate-cert to reissue it from the same KMS key.")
+    if is_sharepoint and not sharepoint_domain:
+        print(
+            "\n  NOTE: no SharePoint domain in config. Set `sharepoint_domain` "
+            "on the connector (for example "
+            '"https://contoso.sharepoint.com"). The console asks for it.',
+            file=sys.stderr,
+        )
+
+    slug = "sharepoint" if is_sharepoint else "onedrive"
+    source_label = (
+        "Microsoft SharePoint Online" if is_sharepoint else "Microsoft OneDrive"
+    )
+    docs = "https://docs.aws.amazon.com/quick/latest/userguide"
+
+    print("\n── Next: two steps in the Amazon Quick console ──")
+    print(
+        "  Neither has an API yet, so both are manual. They need different Quick\n"
+        "  roles and are often done by different people. Hand the values above to\n"
+        "  whoever holds each role."
+    )
+
+    print("\n  Step 1. Quick administrator (Admin Pro): authorize the signing key")
+    print("    Manage account -> Permissions -> AWS resources")
+    print("      -> AWS Key Management Service -> Select keys -> Add:")
+    print(f"        {cs.signing_key_arn or '(signing key unavailable)'}")
+    print("    Then Finish, and Save at the bottom of the page.")
+    print(f"    Docs: {docs}/{slug}-kb-admin-config.html")
+    print(
+        "    Until this is done, the knowledge base can be created but every sync\n"
+        "    fails to authenticate: Quick cannot sign the Entra assertion."
+    )
+
+    print(
+        "\n  Step 2. Knowledge base owner (Author Pro or Admin Pro): create the KB"
+    )
+    print(f"    Knowledge -> Set up new knowledge base -> {source_label} -> Add")
+    print("      -> 'Have admin access? Connect with service credentials'")
+    print("      -> + Add account, then paste the values above.")
+    print(f"    Docs: {docs}/{slug}-kb-admin-connection.html")
+    if is_sharepoint:
+        print(
+            "    Enter site URLs as /sites/<name> paths, not the tenant root.\n"
+            "    ACL management is IMMUTABLE after creation. Decide before you "
+            "create it."
+        )
+    else:
+        print(
+            "    Document-level access control is always enforced for "
+            "admin-managed OneDrive."
+        )
+    print(
+        "    Quick starts the first sync itself once the knowledge base exists;\n"
+        "    there is nothing to trigger from here."
+    )
+
+    print(
+        "\n  If your organization manages its own Quick IAM service role, Step 1\n"
+        "  may not apply. Grant that role kms:Sign on the key instead:"
+    )
+    grant = kms_signing.build_sign_grant_statement(
+        signing_key_arn=cs.signing_key_arn or "<signing-key-arn>",
+        principal_arn="<your-quick-service-role-arn>",
+    )
+    for line in json.dumps(grant, indent=2).splitlines():
+        print(f"      {line}")
+
+    print(
+        f"\n  Re-run `kb-connector setup {connector_name}` at any time to reprint "
+        f"these\n  values; it reuses the key, app and certificate rather than "
+        f"reissuing them."
+    )
+
+    print(f"\n  {kms_signing.describe_orphan_risk(cs.signing_key_arn or '(none)')}")
+
+
+def _domain_from_site_urls(site_urls: Any) -> str | None:
+    """Derive the SharePoint domain from the first configured site URL.
+
+    A convenience only: the console wants the tenant root
+    (`https://contoso.sharepoint.com`) while connectors are configured with site
+    URLs beneath it. Returns None rather than guessing if the value is not a
+    parseable https URL, since a wrong domain in the console fails in a way that
+    does not point back here.
+    """
+    if not isinstance(site_urls, list) or not site_urls:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(site_urls[0]))
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    return f"https://{parsed.netloc}"
 
 
 def _should_reuse_certificate(

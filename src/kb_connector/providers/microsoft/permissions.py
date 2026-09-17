@@ -110,6 +110,50 @@ def _sharepoint_plan(*, acl: bool, sites_selected: bool) -> PermissionPlan:
 # --- OneDrive ----------------------------------------------------------------
 
 
+def _onedrive_quick_plan() -> PermissionPlan:
+    """OneDrive permissions for Amazon Quick's admin-managed setup.
+
+    Distinct from the Bedrock plan in three ways, all of them load-bearing:
+
+    * `Group.Read.All` is required and the Bedrock connector never asks for it.
+      Without it, group-based access control resolves to nothing and documents
+      shared with a group are silently missed.
+    * There is no SharePoint REST permission at all. The Bedrock plan adds
+      `Sites.FullControl.All` for its real-time permission check, which is
+      tenant-wide full control, and granting it here would be an over-grant
+      Quick has no use for.
+    * ACL is unconditional. Admin-managed OneDrive crawls every user's content
+      and always enforces document-level access control, so there is no
+      content-only variant to select.
+    """
+    reqs = (
+        PermissionRequirement(
+            GRAPH_APP_ID, "Files.Read.All",
+            "Read files in all users' OneDrive content.",
+        ),
+        PermissionRequirement(
+            GRAPH_APP_ID, "Sites.Read.All",
+            "Enumerate per-user OneDrive drives (hosted on SharePoint).",
+        ),
+        PermissionRequirement(
+            GRAPH_APP_ID, "User.Read.All",
+            "Resolve user profiles for document-level ACLs.",
+        ),
+        PermissionRequirement(
+            GRAPH_APP_ID, "Group.Read.All",
+            "Resolve group objects for group-based access control.",
+        ),
+        PermissionRequirement(
+            GRAPH_APP_ID, "GroupMember.Read.All",
+            "Resolve group membership for document-level ACLs.",
+        ),
+    )
+    return PermissionPlan(reqs, notes=(
+        "Admin-managed OneDrive always enforces document-level access control, "
+        "and crawls every user's OneDrive in the tenant.",
+    ))
+
+
 def _onedrive_plan(*, acl: bool) -> PermissionPlan:
     reqs: list[PermissionRequirement] = [
         PermissionRequirement(
@@ -143,9 +187,21 @@ def _onedrive_plan(*, acl: bool) -> PermissionPlan:
 
 
 def build_plan(
-    *, source: str, acl: bool, sites_selected: bool = False, credential: str = "cert"
+    *,
+    source: str,
+    acl: bool,
+    sites_selected: bool = False,
+    credential: str = "cert",
+    target: str = "bmkb",
 ) -> PermissionPlan:
     """Return the permission plan for the requested source + options.
+
+    `target` selects the consuming service. It only changes the OneDrive plan:
+    Amazon Quick's documented SharePoint permission sets are identical to the
+    Bedrock connector's in all four combinations (with and without ACL, all-sites
+    and Sites.Selected, including the per-site `fullcontrol` role under ACL), so
+    that plan is shared rather than duplicated. OneDrive genuinely differs. See
+    `_onedrive_quick_plan`.
 
     Raises ValueError for an unknown source.
     """
@@ -153,7 +209,11 @@ def build_plan(
     if normalized == "sharepoint":
         plan = _sharepoint_plan(acl=acl, sites_selected=sites_selected)
     elif normalized == "onedrive":
-        plan = _onedrive_plan(acl=acl)
+        plan = (
+            _onedrive_quick_plan()
+            if target.strip().lower() == "quick"
+            else _onedrive_plan(acl=acl)
+        )
     else:
         raise ValueError(
             f"Unknown source {source!r}; expected 'sharepoint' or 'onedrive'."

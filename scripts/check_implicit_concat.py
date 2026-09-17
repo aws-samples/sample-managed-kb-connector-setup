@@ -7,7 +7,7 @@ indistinguishable from a forgotten comma.
 
 This matters here more than it would in most codebases: the lists in
 core/provisioning.py hold IAM actions and policy resource ARNs. An element
-merged into its neighbour by a missing comma does not raise — it produces a
+merged into its neighbor by a missing comma does not raise — it produces a
 policy with a resource ARN that does not exist, or an action list missing an
 entry, and the failure shows up later as an opaque AccessDenied.
 

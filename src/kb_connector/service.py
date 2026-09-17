@@ -89,14 +89,33 @@ def _default_session_factory(region: str | None, profile: str | None) -> Any:
     return boto3.Session(region_name=region, profile_name=profile)
 
 
-def _default_target_factory(*, session: Any, region: str) -> Any:
-    """Build a BmkbTarget. Imported lazily so tests don't pay for it."""
+def _default_target_factory(
+    *, session: Any, region: str, target: str | None = None
+) -> Any:
+    """Build the Target for a connector. Imported lazily so tests don't pay for it.
+
+    `target` is keyword-only with a default so existing callers that predate
+    multi-target support keep working and get the Bedrock managed KB.
+    """
     from kb_connector.targets import get_target
-    return get_target("bmkb", session=session, region=region)
+    return get_target(target, session=session, region=region)
 
 
 SessionFactory = Callable[[str | None, str | None], Any]
 TargetFactory = Callable[..., Any]
+
+
+def _resolve_target(cfg: Any, cs: Any) -> str | None:
+    """Pick the control plane for a connector, preferring config over state.
+
+    Config wins so editing `target` takes effect without clearing state, and
+    state is the fallback because a kb/ds pair passed directly on the command
+    line may not correspond to any configured connector. None means "let
+    get_target apply its default".
+    """
+    return (getattr(cfg, "target", None) if cfg else None) or (
+        getattr(cs, "target", None) if cs else None
+    )
 
 
 # --- Shared resolution helpers -----------------------------------------------
@@ -348,7 +367,9 @@ def monitor(
     sess_factory = session_factory or _default_session_factory
     tgt_factory = target_factory or _default_target_factory
     session = sess_factory(region, profile)
-    target = tgt_factory(session=session, region=region)
+    target = tgt_factory(
+        session=session, region=region, target=_resolve_target(cfg, cs)
+    )
 
     if start:
         return start_and_poll(
@@ -452,7 +473,9 @@ def validate(
         sess_factory = session_factory or _default_session_factory
         tgt_factory = target_factory or _default_target_factory
         session = sess_factory(region, profile)
-        target = tgt_factory(session=session, region=region)
+        target = tgt_factory(
+            session=session, region=region, target=_resolve_target(cfg, cs)
+        )
 
         if acl_enabled:
             if authorized_user:
