@@ -27,7 +27,7 @@ read permissions with admin consent, generates private key material, and creates
 IAM roles. The caller needs `iam:CreateRole` and `iam:PutRolePolicy`, which
 together are enough to escalate within the account. Run it as a human operator
 with an SSO session, using the
-[scoped caller policy](README.md#what-the-caller-needs) — not as a long-lived
+[scoped caller policy](IDENTITY-AND-PERMISSIONS.md#what-the-caller-needs) — not as a long-lived
 access key and not as a role other workloads can assume.
 
 Secrets at rest live in AWS Secrets Manager, not on disk. The tool writes
@@ -93,5 +93,4 @@ resource ARNs as appropriate for your environment. Document paths in
 `diagnose --logs` are redacted by default for this reason.
 
 For the full identity and trust model per connector, see the
-[Security and identity model](README.md#security-and-identity-model) section of
-the README.
+[IDENTITY-AND-PERMISSIONS.md](IDENTITY-AND-PERMISSIONS.md).
