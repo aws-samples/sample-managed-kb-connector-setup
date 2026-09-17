@@ -3,7 +3,7 @@
 This tool provisions identity and access resources. Know what it creates and how
 credentials flow before you run it against a real environment.
 
-### Where credentials live
+## Where credentials live
 
 Secrets go to AWS Secrets Manager, never to disk. Client secrets, certificate
 passwords, refresh tokens, and API tokens are written to a Secrets Manager
@@ -45,7 +45,7 @@ private key into a bucket that isn't protected — override with
 elsewhere. The certificate password lives in Secrets Manager, and the bucket
 holds the only artifact that carries the private key.
 
-### Using a customer-managed key
+## Using a customer-managed key
 
 `--kms-key-arn` (or `kms_key_arn` in config) points the tool at one existing
 KMS key. It applies to three things: the connector secret in Secrets Manager,
@@ -106,7 +106,7 @@ error when the knowledge base is created or when a crawl first reads the
 secret, not as a configuration error at startup — the tool cannot tell in
 advance whether a key policy will admit a role that does not exist yet.
 
-### Endpoints come from your AWS configuration
+## Endpoints come from your AWS configuration
 
 The tool has no endpoint settings of its own. Every call resolves the endpoint
 the way any AWS SDK client does — from the region, and from the standard SDK
@@ -124,7 +124,7 @@ credentials. Treat your SDK endpoint configuration as security-relevant, and
 don't set a global `AWS_ENDPOINT_URL` in a shell profile or CI config for
 reasons you can't name.
 
-### What the caller needs
+## What the caller needs
 
 This is an administrative tool. It creates IAM roles and writes IAM policies, so
 the identity you run it as is necessarily privileged — `iam:CreateRole` plus
@@ -279,7 +279,7 @@ name, adjust the `CertificateBucket` resources to match.
 
 </details>
 
-### The IAM role it creates
+## The IAM role it creates
 
 The Knowledge Base service role mirrors the least-privilege role the Bedrock
 console creates rather than a broad policy:
@@ -308,7 +308,7 @@ recognizes, it attaches a separate policy named
 `kb-connector-supplemental-access` instead of editing one it didn't author, so
 you can see exactly what was added.
 
-### Resource ownership and reuse
+## Resource ownership and reuse
 
 Resource names are derived from the connector name (`kb-connector-<name>-role`,
 `kb-connector/<name>-credentials`), which is predictable — and more than one
@@ -351,7 +351,7 @@ the ownership mechanism rather than degrading it: a run that also passes
 reuse those resources without `--adopt-existing-resources`. A later run
 *without* `--no-tags` can still reclaim them from state.
 
-### Per-connector identity model
+## Per-connector identity model
 
 | Connector | Auth to source | Notes |
 |-----------|----------------|-------|
@@ -362,7 +362,7 @@ reuse those resources without `--adopt-existing-resources`. A later run
 | Confluence | Atlassian OAuth2 or Basic (API token) | OAuth2 is not supported with ACL. Use Basic auth for ACL-enabled sources. |
 | Google Drive | Google OAuth2 or service account | OAuth2 is not supported with ACL. Use a service account for ACL-enabled sources. |
 
-### Credentials you need (and only when you need them)
+## Credentials you need (and only when you need them)
 
 You only need credentials for the stage you're running. Stage 1 (source-side)
 needs a Microsoft Graph token, and Stage 2 (AWS-side) needs AWS credentials. The

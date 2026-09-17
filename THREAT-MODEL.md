@@ -14,8 +14,7 @@ which behaviors are load-bearing for security.
 
 Related documents: [SECURITY.md](SECURITY.md) for vulnerability reporting and a
 summary of credential handling; [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for
-functional gaps; the README's
-[security and identity model](README.md#security-and-identity-model) for
+functional gaps; [IDENTITY-AND-PERMISSIONS.md](IDENTITY-AND-PERMISSIONS.md) for
 operator-facing guidance.
 
 ---
@@ -817,7 +816,8 @@ Before running this tool against a real environment:
 - [ ] Confirm the AWS account and Region are the intended ones
       (`setup` prints the resolved profile and caller ARN before its first write).
 - [ ] Use a scoped caller policy
-      ([README](README.md#what-the-caller-needs)), not `AdministratorAccess`, and
+      ([IDENTITY-AND-PERMISSIONS.md](IDENTITY-AND-PERMISSIONS.md#what-the-caller-needs)),
+      not `AdministratorAccess`, and
       an SSO session rather than a long-lived key.
 - [ ] Decide whether the connector needs ACL. It significantly widens the Entra
       permissions required (T-07).

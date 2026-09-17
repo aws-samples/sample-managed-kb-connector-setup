@@ -16,6 +16,16 @@ failing when one does, which is usually the harder problem.
 > [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for what's exercised and what
 > still has rough edges.
 
+**Which document do I want?**
+
+| Document | Answers |
+|---|---|
+| This README | How do I install it, configure a connector, and run the commands? |
+| [IDENTITY-AND-PERMISSIONS.md](IDENTITY-AND-PERMISSIONS.md) | What does it create, where do credentials live, and what does the caller need? |
+| [THREAT-MODEL.md](THREAT-MODEL.md) | What can go wrong, which threats are mitigated, and what risk is left? |
+| [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) | What doesn't work yet, and what is exercised end to end? |
+| [SECURITY.md](SECURITY.md) | How do I report a vulnerability? |
+
 ---
 
 ## What it does
@@ -87,7 +97,8 @@ kb-connector-mcp           # starts a stdio MCP server (see below)
 You need AWS credentials configured (via `~/.aws/config`, environment, or an
 SSO/assumed-role session) for the account where your Knowledge Base lives. This
 tool creates IAM roles and writes IAM policies, so the caller needs more than
-read access — see [What the caller needs](#what-the-caller-needs) for the exact
+read access — see [What the caller needs](IDENTITY-AND-PERMISSIONS.md#what-the-caller-needs)
+for the exact
 permission set and a ready-to-use scoped policy. For SharePoint and OneDrive you
 also authenticate to Microsoft Graph, either by borrowing your Azure CLI session
 or using a device-code flow.
@@ -359,7 +370,8 @@ kb-connector setup engineering-sp --adopt-existing-resources
 Created resources are tagged `ManagedBy=kb-connector` and
 `KbConnectorName=<name>`. Setup refuses to modify an existing role, secret, or
 certificate bucket that those tags don't attribute to this connector — see
-[Resource ownership and reuse](#resource-ownership-and-reuse). If several people
+[Resource ownership and reuse](IDENTITY-AND-PERMISSIONS.md#resource-ownership-and-reuse).
+If several people
 run this tool in one account, set `resource_prefix` per connector so derived
 names can't collide.
 
