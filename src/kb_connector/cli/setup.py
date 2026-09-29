@@ -1752,19 +1752,46 @@ def _import_handoff(handoff_path: str, cs: ConnectorState, cfg: ConnectorConfig)
         # Source admin completed Stage 1; we have source-side details
         source = handoff.get("source", {})
         cs.tenant_id = source.get("tenant_id") or cs.tenant_id
-        cs.client_app_id = source.get("client_id") or cs.client_app_id
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_APP, "client_app_id", source.get("client_id")
+        )
         cs.connector_type = handoff.get("type") or cs.connector_type
         # Cert material would need to come from the file referenced in handoff
         print("  Imported handoff (direction: source -> AWS)")
     elif direction == DIRECTION_AWS_TO_SOURCE:
         aws = handoff.get("aws", {})
-        cs.knowledge_base_id = aws.get("knowledge_base_id") or cs.knowledge_base_id
-        cs.data_source_id = aws.get("data_source_id") or cs.data_source_id
-        cs.secret_arn = aws.get("secret_arn") or cs.secret_arn
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_KB, "knowledge_base_id",
+            aws.get("knowledge_base_id"),
+        )
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_DS, "data_source_id", aws.get("data_source_id")
+        )
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_SECRET, "secret_arn", aws.get("secret_arn")
+        )
         cs.region = aws.get("region") or cs.region
         print("  Imported handoff (direction: AWS -> source)")
     else:  # pragma: no cover - parse_handoff restricts direction to the two above
         raise ConfigError(f"Unsupported handoff direction {direction!r}.")
+
+
+def _import_handoff_resource(
+    cs: ConnectorState, resource: str, field_name: str, value: str | None
+) -> None:
+    """Copy one identifier from a handoff document into state, as external.
+
+    A handoff comes from another admin, so whatever it names was created by
+    someone else's run. Teardown treats a resource with no ownership record as
+    its own, so copying the id without a record would let it delete another
+    admin's knowledge base or force-delete their secret. An id state already
+    holds is left as recorded: importing the same value again is not evidence
+    that ownership changed.
+    """
+    if not value or getattr(cs, field_name) == value:
+        return
+    setattr(cs, field_name, value)
+    cs.record_external(resource)
 
 
 # --- S3 connector setup (no provider) ----------------------------------------
