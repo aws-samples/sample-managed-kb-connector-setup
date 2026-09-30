@@ -470,6 +470,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     # the control plane from state, because a knowledge base id alone does not
     # say which service holds it.
     cs.target = cfg.target
+    _record_region(cs, cfg)
 
     print(f"Setting up connector: {connector_name} (type: {cfg.type})")
     print(f"  region: {cfg.region or 'default'}")
@@ -544,6 +545,41 @@ def _run_setup(args: argparse.Namespace) -> int:
 
     print(f"  Next: kb-connector monitor {connector_name}    # start ingestion + watch it")
     return 0
+
+
+# State fields naming a regional AWS resource. If any is set, state already
+# records where this connector lives.
+_REGIONAL_STATE_FIELDS = (
+    "knowledge_base_id", "data_source_id", "secret_arn", "cert_s3_key",
+    "signing_key_arn",
+)
+
+
+def _record_region(cs: ConnectorState, cfg: ConnectorConfig) -> None:
+    """Record the region this run creates resources in, before it creates any.
+
+    Teardown deletes in the region state records. It used to be recorded only
+    when the data source was created, so a run that failed earlier (after the
+    secret, role or KB) left none, and teardown fell back to boto's default
+    region.
+
+    A run whose region differs from the one state already records is refused:
+    it would create new resources in one region while state still tracks the
+    old ones in another, and whichever region state ended up holding, teardown
+    would miss half of them.
+    """
+    if not cfg.region:
+        return
+    tracked = any(getattr(cs, f) for f in _REGIONAL_STATE_FIELDS)
+    if tracked and cs.region and cs.region != cfg.region:
+        raise ConfigError(
+            f"State records this connector's resources in {cs.region}, but this "
+            f"run would use {cfg.region}. Tear the connector down first "
+            f"(kb-connector teardown {cfg.name} --region {cs.region}), use a "
+            f"different connector name for the new region, or set region back "
+            f"to {cs.region}."
+        )
+    cs.region = cfg.region
 
 
 def _run_sync(args: argparse.Namespace, connector_name: str) -> int:

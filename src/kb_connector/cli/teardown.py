@@ -148,6 +148,15 @@ def _run_teardown(args: argparse.Namespace) -> int:
         print("  No matching resources to tear down.")
         return 0
 
+    # Resolved before the plan is shown, so a missing region is reported ahead
+    # of the confirmation prompt rather than after it.
+    needs_aws = any(rtype in _AWS_RESOURCE_TYPES for rtype, _, _ in resources)
+    region, profile = _resolve_region_profile(
+        args, config, connector_name, cs, required=needs_aws
+    )
+    if region:
+        print(f"  region: {region}")
+
     # Display plan
     if resources:
         print(f"\n  Resources to {'delete' if not args.dry_run else 'delete (DRY RUN)'}:")
@@ -195,8 +204,6 @@ def _run_teardown(args: argparse.Namespace) -> int:
 
     # Execute deletions (AWS-side)
     import boto3
-    region = args.region or cs.region
-    profile = args.profile
 
     if region:
         session = boto3.Session(region_name=region, profile_name=profile)
@@ -308,6 +315,47 @@ def _run_teardown(args: argparse.Namespace) -> int:
         save_state(state_file)
         print("\n  Teardown complete. State updated.")
     return 0
+
+
+# Candidate types deleted through an AWS client. "app" goes through Graph.
+_AWS_RESOURCE_TYPES = frozenset({"ds", "kb", "secret", "role", "cert"})
+
+
+def _resolve_region_profile(
+    args: argparse.Namespace,
+    config: Any,
+    connector_name: str,
+    cs: ConnectorState,
+    *,
+    required: bool,
+) -> tuple[str | None, str | None]:
+    """Pick the region and profile to delete in.
+
+    Precedence: --region, then the region state recorded when the resources
+    were created, then the connector's config. State ranks above config
+    because it records where the resources actually are, and config may have
+    been edited since.
+
+    With none of those, boto's default region would be a guess, and a wrong
+    guess sends every delete to a region where the resources don't exist. So
+    teardown refuses instead, when there is anything AWS-side to delete.
+    """
+    cfg = None
+    if connector_name in config.connector_names():
+        try:
+            cfg = config.resolve_connector(connector_name)
+        except ConfigError:
+            cfg = None  # A broken config entry shouldn't block cleanup.
+
+    region = args.region or cs.region or (cfg.region if cfg else None)
+    profile = args.profile or (cfg.profile if cfg else None)
+    if required and not region:
+        raise ConfigError(
+            f"No region known for {connector_name!r}: state does not record one "
+            f"and config does not set one. Pass --region with the region the "
+            f"resources were created in."
+        )
+    return region, profile
 
 
 def _build_target(session: Session, region: str | None, target_name: str | None) -> Any:

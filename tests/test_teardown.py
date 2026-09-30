@@ -368,3 +368,66 @@ def test_delete_cert_accepts_a_real_target():
     s3.delete_object.assert_called_once_with(
         Bucket="kb-connector-certs-111122223333-us-west-2", Key="kb/c1.p12"
     )
+
+
+# --- Region: teardown deletes where the resources are, or refuses -------------
+
+
+def _run_region_case(monkeypatch, *, state_region, config_region, arg_region):
+    """Run teardown and return (session kwargs, secret deletes, error)."""
+    from kb_connector.cli import teardown as td
+    from kb_connector.core.config import ToolConfig
+    from kb_connector.core.state import ConnectorState, StateFile
+
+    cs = ConnectorState(
+        connector_type="sharepoint",
+        region=state_region,
+        secret_arn="arn:aws:secretsmanager:us-west-2:111122223333:secret:s-a1",
+        created_resources={"secret": "tool"},
+    )
+    connectors = {"c1": {"type": "sharepoint"}}
+    if config_region:
+        connectors["c1"]["region"] = config_region
+    sessions: list[dict] = []
+    deletes: list[str] = []
+    monkeypatch.setattr(td, "load_state", lambda *a, **kw: StateFile(connectors={"c1": cs}))
+    monkeypatch.setattr(td, "save_state", lambda *a, **kw: None)
+    monkeypatch.setattr(td, "load_config", lambda *a, **kw: ToolConfig(connectors=connectors))
+    monkeypatch.setattr(td, "_delete_secret", lambda s, arn: deletes.append(arn))
+    monkeypatch.setattr(td, "_find_active_ingestion_job", lambda *a, **kw: None)
+    monkeypatch.setattr("boto3.Session", lambda **kw: sessions.append(kw) or MagicMock())
+    try:
+        td._run_teardown(_args(region=arg_region))
+    except Exception as exc:  # noqa: BLE001 - returned for the assertion
+        return sessions, deletes, exc
+    return sessions, deletes, None
+
+
+def test_teardown_falls_back_to_the_config_region(monkeypatch):
+    """State without a region used to mean boto's default region."""
+    sessions, deletes, err = _run_region_case(
+        monkeypatch, state_region=None, config_region="eu-west-1", arg_region=None
+    )
+    assert err is None
+    assert sessions[0]["region_name"] == "eu-west-1"
+    assert deletes
+
+
+def test_state_region_beats_config(monkeypatch):
+    """State records where the resources are; config may have been edited."""
+    sessions, _, err = _run_region_case(
+        monkeypatch, state_region="us-west-2", config_region="eu-west-1",
+        arg_region=None,
+    )
+    assert err is None
+    assert sessions[0]["region_name"] == "us-west-2"
+
+
+def test_teardown_refuses_without_any_region(monkeypatch):
+    from kb_connector.core.errors import ConfigError
+
+    sessions, deletes, err = _run_region_case(
+        monkeypatch, state_region=None, config_region=None, arg_region=None
+    )
+    assert isinstance(err, ConfigError)
+    assert not sessions and not deletes

@@ -74,3 +74,33 @@ def test_setup_microsoft_requires_tenant_id():
     cfg = ConnectorConfig(name="sp", type="sharepoint", credential="cert")
     with pytest.raises(ConfigError, match="tenant_id is required"):
         _run_guards(cfg)
+
+
+# --- Setup records its region before it creates anything -------------------
+
+
+def test_setup_records_region_up_front():
+    from kb_connector.cli.setup import _record_region
+
+    cs = ConnectorState()
+    _record_region(cs, ConnectorConfig(name="c", type="s3", region="eu-west-1"))
+    assert cs.region == "eu-west-1"
+
+
+def test_setup_refuses_a_region_change_while_resources_are_tracked():
+    """New resources in one region with state tracking the old ones in another
+    would leave teardown unable to reach half of them."""
+    from kb_connector.cli.setup import _record_region
+
+    cs = ConnectorState(region="us-west-2", knowledge_base_id="KB12345678")
+    with pytest.raises(ConfigError, match="us-west-2"):
+        _record_region(cs, ConnectorConfig(name="c", type="s3", region="eu-west-1"))
+    assert cs.region == "us-west-2"
+
+
+def test_region_change_with_nothing_tracked_is_allowed():
+    from kb_connector.cli.setup import _record_region
+
+    cs = ConnectorState(region="us-west-2")
+    _record_region(cs, ConnectorConfig(name="c", type="s3", region="eu-west-1"))
+    assert cs.region == "eu-west-1"
