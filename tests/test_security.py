@@ -865,6 +865,81 @@ def test_setup_refuses_a_squatted_app_before_any_graph_write(monkeypatch):
     assert not graph.patch.called
 
 
+# --- T-21: a resource is tracked from the moment it exists -------------------
+#
+# State is saved in setup's `finally`, which only helps if the id is already on
+# the in-memory state when the failure happens. These pin the two resources
+# whose ids used to be recorded only after later steps succeeded.
+
+
+def test_app_is_tracked_when_consent_fails(monkeypatch):
+    import argparse
+    from unittest.mock import MagicMock
+
+    from kb_connector.cli import setup as setup_mod
+    from kb_connector.core.config import ConnectorConfig
+    from kb_connector.core.errors import GraphError
+    from kb_connector.providers.microsoft import apps
+    from kb_connector.providers.microsoft.client import GraphClient
+
+    graph = MagicMock()
+    graph.get.return_value = {"value": []}  # no existing app
+    monkeypatch.setattr(GraphClient, "from_auth", lambda **kw: graph)
+    monkeypatch.setattr(setup_mod, "_preflight_aws_ownership", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        apps, "create_application",
+        lambda g, name: apps.AppRegistration("app-id", _APP_OBJ, "sp-id"),
+    )
+
+    def _consent_fails(*a, **kw):
+        raise GraphError("consent denied", status=403)
+
+    monkeypatch.setattr(apps, "resolve_grants", _consent_fails)
+
+    cfg = ConnectorConfig(
+        name="sp", type="sharepoint", credential="cert",
+        tenant_id="f204b1c2-3d4e-5f60-7182-93a4b5c6d7e8", region="us-west-2",
+    )
+    args = argparse.Namespace(
+        from_handoff=None, auth_method="az", device_client_id=None,
+        app_name=None, adopt_existing_resources=False, sites_selected=False,
+    )
+    cs = ConnectorState()
+    with pytest.raises(GraphError):
+        setup_mod._setup_microsoft(args, cfg, cs, "sp", "both")
+    assert cs.client_app_object_id == _APP_OBJ
+    assert cs.is_recorded_ours(RESOURCE_APP, _APP_OBJ), (
+        "a failed run must leave its app recognizable as ours on the next run"
+    )
+
+
+def test_kb_is_tracked_when_the_active_wait_times_out():
+    import argparse
+    from unittest.mock import MagicMock
+
+    from kb_connector.cli.setup import _provision_kb_and_ds
+    from kb_connector.core.config import ConnectorConfig
+
+    target = MagicMock()
+    target.create_knowledge_base.return_value = {
+        "knowledgeBase": {"knowledgeBaseId": "KB12345678"}
+    }
+    target.wait_until_kb_active.side_effect = TimeoutError("still CREATING")
+    args = argparse.Namespace(knowledge_base_id=None, kb_name=None, kms_key_arn=None)
+    cfg = ConnectorConfig(name="c", type="s3", region="us-west-2")
+    cs = ConnectorState()
+
+    with pytest.raises(TimeoutError):
+        _provision_kb_and_ds(
+            target=target, args=args, cfg=cfg, cs=cs, connector_name="c",
+            kb_role_arn="arn:aws:iam::111122223333:role/r",
+            connector_parameters={},
+        )
+    assert cs.knowledge_base_id == "KB12345678"
+    assert cs.is_tool_owned(RESOURCE_KB)
+    assert cs.region == "us-west-2"
+
+
 # --- T-05 / T-19: generated policy shape ------------------------------------
 
 

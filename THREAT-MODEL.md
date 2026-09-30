@@ -639,9 +639,12 @@ availability of cleanup and leaving cost and unused credentials behind.
 
 **Status: Accepted (documented, tracked).** State is persisted in a `finally`
 block so whatever was created before a failure is still recorded, and setup
-prints the tracked resources plus the teardown command on failure. The
-overwrite-on-retry case is documented in KNOWN-LIMITATIONS.md; the fix is for
-setup to detect existing credential references and reuse them. Ownership tags now
+prints the tracked resources plus the teardown command on failure. The Entra app
+and the knowledge base are recorded the moment they exist, ahead of the consent,
+certificate and ACTIVE wait that can fail after them. The overwrite-on-retry case
+is documented in KNOWN-LIMITATIONS.md; the fix is for setup to detect existing
+credential references and reuse them. A process killed outright (SIGKILL, power
+loss) skips the `finally` and loses everything the run created. Ownership tags
 make orphans identifiable after the fact (`ManagedBy=kb-connector`).
 
 ### T-22 — No credential rotation path

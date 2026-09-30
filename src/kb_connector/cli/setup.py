@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     # for --help and pure-logic runs.
     from boto3 import Session
 
+    from kb_connector.providers.microsoft.apps import AppRegistration
     from kb_connector.providers.microsoft.client import GraphClient
     from kb_connector.providers.microsoft.sites_selected import AdminAppCredentials
     from kb_connector.targets.base import Target
@@ -637,10 +638,16 @@ def _provision_kb_and_ds(
         kb_obj = created.get("knowledgeBase", created)
         kb_id = kb_obj.get("knowledgeBaseId") or kb_obj.get("id")
         print(f"  Created knowledge base: {kb_id}")
+        # Recorded before the wait, as the data source is below. An encrypted KB
+        # can take past five minutes to become ACTIVE, and a timeout or FAILED
+        # status here used to leave a KB that state never mentioned: teardown
+        # could not find it and the next run collided with its name.
+        cs.knowledge_base_id = kb_id
+        cs.record_owned(state_mod.RESOURCE_KB)
+        cs.region = cfg.region
         print("  Waiting for KB to become ACTIVE...")
         target.wait_until_kb_active(kb_id)
         print("  KB is ACTIVE")
-        cs.record_owned(state_mod.RESOURCE_KB)
     else:
         # `kb_id` came from --kb or from state. If the operator pointed us at
         # this KB it predates the connector and may carry other data sources, so
@@ -950,6 +957,12 @@ def _setup_microsoft(
             reg = apps.create_application(graph, app_name)
             print(f"  Created app '{app_name}' (appId {reg.app_id})")
 
+        # Recorded now, before consent, certificate and site grants, any of
+        # which can fail. Recording it only after them meant a failure left a
+        # tool-created app untracked, and the next run then found it by name
+        # with no record and could not tell it from someone else's.
+        _record_app(cs, cfg, tenant_id, reg, reused=bool(existing))
+
         # Permissions + consent
         sites_sel = args.sites_selected or cfg.get("sites_selected", False)
         plan = permissions.build_plan(
@@ -1059,18 +1072,8 @@ def _setup_microsoft(
                 finally:
                     _delete_granter_app(graph, admin, admin_app_name)
 
-        # Update state with source-side results
-        cs.connector_type = cfg.type
-        cs.tenant_id = tenant_id
-        # Evaluated before the ids below are overwritten, so it compares against
-        # what an earlier pass recorded. An app found by display name is adopted
-        # only if state does not already record it as ours.
-        if existing:
-            _record_reused_resource(cs, state_mod.RESOURCE_APP, reg.object_id)
-        else:
-            cs.record_owned(state_mod.RESOURCE_APP)
-        cs.client_app_id = reg.app_id
-        cs.client_app_object_id = reg.object_id
+        # Update state with source-side results. The app itself was recorded
+        # when it was created or found, above.
         cs.cert_thumbprint_b64url = cert_thumbprint
         cs.cert_not_after = cert_not_after
 
@@ -1678,6 +1681,30 @@ def _check_app_reuse(
         f"It is then recorded as external, so teardown leaves it alone.\n"
         f"  • Otherwise, delete it: az ad app delete --id {object_id}"
     )
+
+
+def _record_app(
+    cs: ConnectorState,
+    cfg: ConnectorConfig,
+    tenant_id: str,
+    reg: AppRegistration,
+    *,
+    reused: bool,
+) -> None:
+    """Record the connector's Entra app in state, with its ownership.
+
+    For a reused app, ownership is evaluated before the ids are overwritten,
+    so it compares against what an earlier pass recorded: an app found by
+    display name stays ours only if state already records it as ours.
+    """
+    cs.connector_type = cfg.type
+    cs.tenant_id = tenant_id
+    if reused:
+        _record_reused_resource(cs, state_mod.RESOURCE_APP, reg.object_id)
+    else:
+        cs.record_owned(state_mod.RESOURCE_APP)
+    cs.client_app_id = reg.app_id
+    cs.client_app_object_id = reg.object_id
 
 
 def _record_reused_resource(

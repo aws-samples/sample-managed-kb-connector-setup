@@ -320,13 +320,14 @@ source: Microsoft retired app-only tokens for the OneNote APIs on
 
 ### Setup doesn't reuse an existing knowledge base by name
 
-If you re-run setup after a failed attempt that left an orphan KB
-behind, or after running setup against the same connector without a
-clean teardown in between, the second setup will 409 on
-`CreateKnowledgeBase` because a KB with the target name already exists.
-Setup also has no logic that looks the KB up by name and reuses it.
+If a KB with the target name exists but state doesn't record it, setup
+will 409 on `CreateKnowledgeBase`. Setup has no logic that looks the KB
+up by name and reuses it. A KB setup created is recorded before the
+ACTIVE wait, so a timeout or failure there no longer causes this. What
+still does: the process being killed mid-run, a lost or deleted state
+file, or a KB created outside the tool under the same name.
 
-Caught when retrying a setup mid-test. Workarounds while this is open:
+Workarounds while this is open:
 
 - Use `--kb` to attach to the existing KB explicitly, or
 - Pick a different connector name (every default name is derived from
