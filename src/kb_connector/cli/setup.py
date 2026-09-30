@@ -23,7 +23,13 @@ from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
 
 from kb_connector.core.config import ConnectorConfig, load_config
-from kb_connector.core.errors import AwsError, ConfigError, ConnectorError, StateError
+from kb_connector.core.errors import (
+    AwsError,
+    ConfigError,
+    ConnectorError,
+    ProviderError,
+    StateError,
+)
 from kb_connector.core.state import ConnectorState, load_state, save_state
 
 if TYPE_CHECKING:
@@ -929,6 +935,12 @@ def _setup_microsoft(
         app_name = args.app_name or f"kb-connector-{connector_name}"
         existing = apps.find_application_by_name(graph, app_name)
         if existing:
+            # Before any Graph write: everything below grants this app admin
+            # consent, so it must be one this tool can show it created.
+            _check_app_reuse(
+                cs, existing, app_name=app_name,
+                adopt=getattr(args, "adopt_existing_resources", False),
+            )
             app_id = existing["appId"]
             object_id = existing["id"]
             sp = apps.ensure_service_principal(graph, app_id)
@@ -1612,6 +1624,60 @@ def _should_reuse_certificate(
     if not recorded or not cs.cert_s3_key or not cs.secret_arn:
         return False
     return recorded in installed_thumbprints
+
+
+def _check_app_reuse(
+    cs: ConnectorState, existing: dict, *, app_name: str, adopt: bool
+) -> None:
+    """Refuse to reuse an Entra app this tool cannot show it created.
+
+    The app is found by display name, and the name is predictable
+    (`kb-connector-<connector>`). Entra lets ordinary users register apps by
+    default, so anyone can create an app with that name and add their own
+    client secret to it. Reusing it would then grant their app tenant-wide admin
+    consent. Uploading our certificate replaces the app's certificates but not
+    its client secrets, so their credential would keep working.
+
+    So an app found by name is reused only when state records that exact object
+    id as one this tool created. `--adopt-existing-resources` overrides, and in
+    that case the credentials already on the app are listed, because whoever
+    holds them gets the permissions consented next.
+    """
+    object_id = existing.get("id")
+    if cs.is_recorded_ours(state_mod.RESOURCE_APP, object_id):
+        return
+
+    secrets = existing.get("passwordCredentials") or []
+    certs_ = existing.get("keyCredentials") or []
+    held = (
+        f"It currently carries {len(secrets)} client secret(s) and "
+        f"{len(certs_)} certificate(s)."
+    )
+
+    if adopt:
+        print(
+            f"  WARNING: adopting existing Entra app '{app_name}' (object id "
+            f"{object_id}), which state does not record as created by this "
+            f"tool. {held} Anyone holding one of those gets the permissions "
+            f"about to be consented. Check its owners and credentials in the "
+            f"Entra portal.",
+            file=sys.stderr,
+        )
+        return
+
+    raise ProviderError(
+        f"An Entra app named '{app_name}' (object id {object_id}) already "
+        f"exists, and state does not record it as created by this tool. {held}\n\n"
+        f"Setup would grant this app tenant-wide admin consent, so it is not "
+        f"reused on the strength of its name alone: anyone who can register "
+        f"apps in the tenant can create one with this name.\n\n"
+        f"Ways forward:\n"
+        f"  • Pass --app-name with a distinct name to create a new app.\n"
+        f"  • If an earlier run of this tool created it, or you have verified "
+        f"its owners and credentials, re-run with --adopt-existing-resources. "
+        f"It is then recorded as external, so teardown leaves it alone.\n"
+        f"  • Otherwise, delete it: az ad app delete --id {object_id}"
+    )
 
 
 def _record_reused_resource(

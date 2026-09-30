@@ -781,6 +781,90 @@ def test_find_application_reverifies_exact_name():
     assert find_application_by_name(graph, "wanted")["appId"] == "a"
 
 
+# --- T-27: an app found by name is not granted consent on its name alone -----
+#
+# The derived app name is predictable and ordinary users can register apps, so
+# a pre-registered `kb-connector-<name>` app carrying someone else's client
+# secret would otherwise receive tenant-wide admin consent.
+
+_APP_OBJ = "11111111-2222-3333-4444-555555555555"
+_SQUATTED_APP = {
+    "appId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "id": _APP_OBJ,
+    "displayName": "kb-connector-sp",
+    "passwordCredentials": [{"keyId": "k1", "hint": "abc"}],
+    "keyCredentials": [],
+}
+
+
+def test_unrecorded_app_found_by_name_is_refused():
+    from kb_connector.cli.setup import _check_app_reuse
+    from kb_connector.core.errors import ProviderError
+
+    with pytest.raises(ProviderError, match="1 client secret"):
+        _check_app_reuse(
+            ConnectorState(), _SQUATTED_APP, app_name="kb-connector-sp",
+            adopt=False,
+        )
+
+
+def test_app_recorded_as_ours_is_reused():
+    from kb_connector.cli.setup import _check_app_reuse
+
+    cs = ConnectorState(client_app_object_id=_APP_OBJ)
+    cs.record_owned(RESOURCE_APP)
+    _check_app_reuse(cs, _SQUATTED_APP, app_name="kb-connector-sp", adopt=False)
+
+
+def test_app_recorded_as_external_needs_the_opt_in_again():
+    """Adoption is a per-run decision because consent is re-granted each run."""
+    from kb_connector.cli.setup import _check_app_reuse
+    from kb_connector.core.errors import ProviderError
+
+    cs = ConnectorState(client_app_object_id=_APP_OBJ)
+    cs.record_external(RESOURCE_APP)
+    with pytest.raises(ProviderError):
+        _check_app_reuse(cs, _SQUATTED_APP, app_name="kb-connector-sp", adopt=False)
+
+
+def test_adopting_an_unrecorded_app_warns_with_its_credentials(capsys):
+    from kb_connector.cli.setup import _check_app_reuse
+
+    _check_app_reuse(
+        ConnectorState(), _SQUATTED_APP, app_name="kb-connector-sp", adopt=True
+    )
+    assert "1 client secret(s)" in capsys.readouterr().err
+
+
+def test_setup_refuses_a_squatted_app_before_any_graph_write(monkeypatch):
+    """The refusal has to precede the service principal, consent and cert."""
+    import argparse
+    from unittest.mock import MagicMock
+
+    from kb_connector.cli import setup as setup_mod
+    from kb_connector.core.config import ConnectorConfig
+    from kb_connector.core.errors import ProviderError
+    from kb_connector.providers.microsoft.client import GraphClient
+
+    graph = MagicMock()
+    graph.get.return_value = {"value": [_SQUATTED_APP]}
+    monkeypatch.setattr(GraphClient, "from_auth", lambda **kw: graph)
+    monkeypatch.setattr(setup_mod, "_preflight_aws_ownership", lambda *a, **kw: None)
+
+    cfg = ConnectorConfig(
+        name="sp", type="sharepoint", credential="cert",
+        tenant_id="f204b1c2-3d4e-5f60-7182-93a4b5c6d7e8", region="us-west-2",
+    )
+    args = argparse.Namespace(
+        from_handoff=None, auth_method="az", device_client_id=None,
+        app_name=None, adopt_existing_resources=False,
+    )
+    with pytest.raises(ProviderError):
+        setup_mod._setup_microsoft(args, cfg, ConnectorState(), "sp", "both")
+    assert not graph.post.called
+    assert not graph.patch.called
+
+
 # --- T-05 / T-19: generated policy shape ------------------------------------
 
 

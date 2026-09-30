@@ -144,6 +144,7 @@ flowchart TB
 | **TA-5** | Attacker who obtains AS-1 | Holds connector credentials without holding the operator's credentials. |
 | **TA-6** | Careless operator | Runs the wrong command in the wrong account. Not malicious; the most likely cause of damage. |
 | **TA-7** | Network attacker | Can observe or redirect traffic. |
+| **TA-8** | Other user in the Entra tenant | Holds no directory role, but can register applications and add credentials to them, which Entra allows by default. |
 
 ---
 
@@ -707,6 +708,11 @@ resource; a well-formed ARN for a secret the operator can delete but did not
 create still passes, and is caught only by the ownership map (T-02) and the y/N
 prompt. Under **A1** an attacker with code execution needs none of this.
 
+For a handoff, the ownership map does catch it: every identifier imported from a
+handoff document is recorded as external, since another admin's run created it,
+so teardown skips it unless `--include-adopted` is passed. An identifier state
+already holds keeps its recorded ownership.
+
 ### T-25 — Declared dependency floors admit versions with known CVEs
 **Low · Various · TB-1 · AS-2, AS-3**
 
@@ -776,6 +782,32 @@ Secrets Manager and S3 accept names that IAM will not, so without a local check
 the secret and the certificate get created and only the role fails, leaving a
 half-provisioned run to clean up by hand.
 
+### T-27 — Pre-registered app name receives tenant-wide admin consent
+**High · Elevation of privilege · TB-3 · AS-5**
+
+A **TA-8** who registers an application named `kb-connector-<connector>` and adds
+their own client secret to it, before an administrator runs setup, can have setup
+find that app by display name and grant it the connector's admin consent —
+`Sites.Read.All`, `Sites.FullControl.All` on SharePoint, or `Files.Read.All` on
+every user's drive — negatively impacting confidentiality of the tenant's
+SharePoint and OneDrive content. Uploading the tool's certificate replaces the
+app's certificates but not its client secrets, so the attacker's credential keeps
+working after setup finishes. The name is predictable from the connector name.
+
+**Status: Mitigated.** An app found by display name is reused only when state
+records that exact object id as created by this tool (`_check_app_reuse`), and the
+check runs before the first Graph write, ahead of the service principal, consent
+and certificate. Otherwise setup stops and names the credentials the app carries.
+`--adopt-existing-resources` overrides and prints the same credential count, and
+the app is then recorded as external. Adoption is re-confirmed on every run,
+because consent is re-granted on every run.
+
+**Residual:** an app the tool did create can still gain credentials later from
+anyone who is one of its owners or holds Application Administrator. Setup does not
+inventory client secrets on its own app, since OneDrive setup adds one per run.
+Restricting app registration in the tenant (Entra: *Users can register
+applications* = No) removes the precondition entirely.
+
 ---
 
 ## 6. Prioritized summary
@@ -786,6 +818,7 @@ half-provisioned run to clean up by hand.
 | T-02 | Teardown destroys adopted resources | High | Mitigated |
 | T-03 | Name collision clobbers another workload | High | Mitigated |
 | T-04 | Orphaned Sites.Selected granter app | High | Mitigated |
+| T-27 | Pre-registered app name receives admin consent | High | Mitigated |
 | T-05 | Account-wide secret read → tenant access | High | Partial + accepted |
 | T-06 | Caller permissions enable escalation | High | Partial (documented) |
 | T-07 | Standing tenant-wide connector app | Medium | Accepted (inherent) |
