@@ -15,6 +15,7 @@ through small factory hooks the test suite can monkeypatch.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -36,7 +37,12 @@ from kb_connector.core.diagnostics import (
 )
 from kb_connector.core.errors import ConfigError, StateError
 from kb_connector.core.handoff import build_aws_to_source, build_source_to_aws
-from kb_connector.core.monitor import MonitorResult, poll_job, start_and_poll
+from kb_connector.core.monitor import (
+    IngestionStats,
+    MonitorResult,
+    poll_job,
+    start_and_poll,
+)
 from kb_connector.core.state import StateFile, load_state
 
 
@@ -255,11 +261,18 @@ def monitor(
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
     target_factory: TargetFactory | None = None,
+    on_job_started: Callable[[str], None] | None = None,
+    on_poll: Callable[[IngestionStats], None] | None = None,
 ) -> MonitorResult:
     """Poll an ingestion job (or start a new one).
 
     Defaults to *poll-only* (start=False) so an agent can't accidentally
     kick off ingestion. Pass start=True to begin a fresh job.
+
+    The job id is written to state as soon as a started job exists, and again
+    when polling ends, so `monitor --no-start` can resume it. A DIRECT run (ids
+    given, no connector) writes no state. `on_job_started` and `on_poll` are
+    progress hooks for the caller.
     """
     ctx = resolve_context(
         connector_name, region=region, profile=profile,
@@ -277,26 +290,39 @@ def monitor(
             "Need kb_id and ds_id, or run setup first to populate state."
         )
 
-    target = ctx.target()
+    def _record_job(started_id: str) -> None:
+        if not ctx.is_direct:
+            ctx.ensure_state().last_ingestion_job_id = started_id
+            ctx.save()
 
     if start:
-        return start_and_poll(
-            target, kb_id=kb_id, ds_id=ds_id,
+        def _started(started_id: str) -> None:
+            _record_job(started_id)
+            if on_job_started is not None:
+                on_job_started(started_id)
+
+        result = start_and_poll(
+            ctx.target(), kb_id=kb_id, ds_id=ds_id,
             poll_interval_seconds=poll_interval_seconds,
             timeout_seconds=timeout_seconds,
+            on_job_started=_started,
+            on_poll=on_poll,
         )
-
-    last_job_id = job_id or (cs.last_ingestion_job_id if cs else None)
-    if not last_job_id:
-        raise StateError(
-            "Poll-only mode requires a known job_id (in state or passed in). "
-            "Use start=True to begin a new job."
+    else:
+        last_job_id = job_id or (cs.last_ingestion_job_id if cs else None)
+        if not last_job_id:
+            raise StateError(
+                "No ingestion job to poll: none is recorded in state and none was "
+                "given. Pass a job id, or start a new job."
+            )
+        result = poll_job(
+            ctx.target(), kb_id=kb_id, ds_id=ds_id, job_id=last_job_id,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
+            on_poll=on_poll,
         )
-    return poll_job(
-        target, kb_id=kb_id, ds_id=ds_id, job_id=last_job_id,
-        poll_interval_seconds=poll_interval_seconds,
-        timeout_seconds=timeout_seconds,
-    )
+    _record_job(result.job_id)
+    return result
 
 
 # --- validate ----------------------------------------------------------------
