@@ -30,6 +30,7 @@ from kb_connector.core.diagnostics import (
     DiagnoseResult,
     build_diagnose_result,
     check_cert_expiry,
+    check_certificate_installed,
     check_cloudtrail_permissions,
     check_ingestion_logs,
     check_secret_validity,
@@ -172,9 +173,14 @@ def diagnose(
     include_logs: bool = False,
     log_group_name: str | None = None,
     redact_logs: bool = True,
+    check_directory: bool = False,
+    graph_auth_method: str = "az",
+    device_client_id: str | None = None,
     config_path: str | None = None,
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
+    thumbprint_reader: Callable[[Any], list[str] | None] | None = None,
+    on_check: Callable[[CheckResult], None] | None = None,
 ) -> DiagnoseResult:
     """Run the diagnostic checks and return a structured result.
 
@@ -186,6 +192,11 @@ def diagnose(
     base plus logs:FilterLogEvents, so for most callers it would just add a
     failed check. Document paths in the result are redacted unless
     `redact_logs=False`.
+
+    `check_directory` adds a Microsoft Graph lookup confirming the app still
+    carries the certificate this connector authenticates with. Without Graph
+    access that check reports as unverified. `on_check` receives each result as
+    it completes.
     """
     ctx = resolve_context(
         connector_name, region=region, profile=profile,
@@ -201,9 +212,14 @@ def diagnose(
 
     checks: list[CheckResult] = []
 
+    def _add(check: CheckResult) -> None:
+        checks.append(check)
+        if on_check is not None:
+            on_check(check)
+
     secret_arn = cs.secret_arn if cs else None
     if secret_arn:
-        checks.append(check_secret_validity(
+        _add(check_secret_validity(
             session=session,
             secret_arn=secret_arn,
             connector_type=connector_type,
@@ -212,10 +228,23 @@ def diagnose(
 
     cert_not_after = cs.cert_not_after if cs else None
     if cert_not_after or credential == "cert":
-        checks.append(check_cert_expiry(cert_not_after=cert_not_after))
+        _add(check_cert_expiry(cert_not_after=cert_not_after))
+
+    # Expiry comes from state, so it cannot tell whether the directory still
+    # carries the certificate. This asks the directory.
+    if check_directory and credential == "cert" and cs and cs.client_app_object_id:
+        reader = thumbprint_reader or (
+            lambda state: _read_installed_thumbprints(
+                state, method=graph_auth_method, device_client_id=device_client_id,
+            )
+        )
+        _add(check_certificate_installed(
+            recorded_thumbprint=cs.cert_thumbprint_b64url,
+            installed_thumbprints=reader(cs),
+        ))
 
     role_arn = cs.kb_role_arn if cs else None
-    checks.append(check_cloudtrail_permissions(
+    _add(check_cloudtrail_permissions(
         session=session,
         region=region,
         role_arn=role_arn,
@@ -233,7 +262,7 @@ def diagnose(
                 "Log analysis needs a knowledge base id to derive the log group "
                 "name, or an explicit log_group_name."
             )
-        checks.append(check_ingestion_logs(
+        _add(check_ingestion_logs(
             session=session,
             log_group_name=group,
             lookback_minutes=lookback_minutes,
@@ -241,6 +270,29 @@ def diagnose(
         ))
 
     return build_diagnose_result(name, checks)
+
+
+def _read_installed_thumbprints(
+    cs: Any, *, method: str, device_client_id: str | None
+) -> list[str] | None:
+    """Read the app's certificate thumbprints, or None if Graph is unreachable.
+
+    None rather than an exception: an operator diagnosing the AWS side often has
+    no Graph access, and `check_certificate_installed` reports None as
+    unverified instead of failing the diagnosis.
+    """
+    if not cs.tenant_id or not cs.client_app_object_id:
+        return None
+    try:
+        from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+        from kb_connector.providers.microsoft.client import GraphClient
+
+        graph = GraphClient.from_auth(
+            method=method, tenant_id=cs.tenant_id, device_client_id=device_client_id,
+        )
+        return list_certificate_thumbprints(graph, cs.client_app_object_id)
+    except Exception:  # noqa: BLE001 - no Graph access is an expected outcome
+        return None
 
 
 # --- monitor -----------------------------------------------------------------

@@ -104,3 +104,25 @@ def test_region_change_with_nothing_tracked_is_allowed():
     cs = ConnectorState(region="us-west-2")
     _record_region(cs, ConnectorConfig(name="c", type="s3", region="eu-west-1"))
     assert cs.region == "eu-west-1"
+
+
+# --- diagnose --json is machine-readable -------------------------------------
+
+
+def test_diagnose_json_prints_only_json(monkeypatch, capsys):
+    import json
+
+    from kb_connector import service
+    from kb_connector.core.diagnostics import CheckResult, build_diagnose_result
+
+    def _fake_diagnose(**kwargs):
+        check = CheckResult(name="cert_expiry", passed=True, details="ok", side="source")
+        kwargs["on_check"](check)
+        return build_diagnose_result("sp", [check])
+
+    monkeypatch.setattr(service, "diagnose", _fake_diagnose)
+    args = build_parser().parse_args(["--json", "diagnose", "sp"])
+    assert args.func(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "healthy"
+    assert out["checks"][0]["name"] == "cert_expiry"

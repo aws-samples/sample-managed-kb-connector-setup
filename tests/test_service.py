@@ -553,3 +553,66 @@ def test_monitor_direct_run_writes_no_state(tmp_path, monkeypatch):
     )
     assert result.job_id == "JOB-NEW"
     assert not state_path.exists()
+
+
+# --- diagnose: directory check and streaming -----------------------------------
+
+
+def _with_app_in_state(project_paths, thumbprint="TP-OURS"):
+    state = Path(project_paths["state_path"])
+    data = json.loads(state.read_text())
+    data["connectors"]["engineering-sp"].update(
+        client_app_object_id="obj-1", cert_thumbprint_b64url=thumbprint,
+    )
+    state.write_text(json.dumps(data))
+
+
+def _healthy_aws_factory():
+    sm = MagicMock()
+    sm.get_secret_value.return_value = {
+        "SecretString": json.dumps({"clientId": "app-12345", "certificatePassword": "x"})
+    }
+    ct = MagicMock()
+    ct.lookup_events.return_value = {"Events": []}
+    return _stub_session_factory(secretsmanager=sm, cloudtrail=ct)
+
+
+@pytest.mark.parametrize("installed,passed", [
+    (["TP-OURS"], True),
+    (["TP-SOMEONE-ELSE"], False),
+    (None, True),  # Graph unreachable: unverified, not failing
+])
+def test_diagnose_directory_check(project_paths, installed, passed):
+    _with_app_in_state(project_paths)
+    result = service.diagnose(
+        connector_name="engineering-sp", check_directory=True,
+        session_factory=_healthy_aws_factory(),
+        thumbprint_reader=lambda cs: installed,
+        **project_paths,
+    )
+    check = next(c for c in result.checks if c.name == "certificate_installed")
+    assert check.passed is passed
+
+
+def test_diagnose_directory_check_is_opt_in(project_paths):
+    _with_app_in_state(project_paths)
+    calls: list = []
+    result = service.diagnose(
+        connector_name="engineering-sp",
+        session_factory=_healthy_aws_factory(),
+        thumbprint_reader=lambda cs: calls.append(cs) or [],
+        **project_paths,
+    )
+    assert calls == []
+    assert "certificate_installed" not in {c.name for c in result.checks}
+
+
+def test_diagnose_streams_each_check_in_order(project_paths):
+    seen: list[str] = []
+    result = service.diagnose(
+        connector_name="engineering-sp",
+        session_factory=_healthy_aws_factory(),
+        on_check=lambda c: seen.append(c.name),
+        **project_paths,
+    )
+    assert seen == [c.name for c in result.checks]
