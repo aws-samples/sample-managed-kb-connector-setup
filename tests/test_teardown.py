@@ -1,203 +1,76 @@
-"""Unit tests for the teardown precheck and stop-and-wait helpers.
+"""Tests for teardown: the delete primitives, the plan, and the delete flow.
 
-The destructive teardown loop itself isn't unit-tested (it'd need a full
-mock of a session, target, and Graph client that exercises every branch).
-What IS tested is the precheck — the gate that blocks teardown while an
-ingestion job is in progress, which is what stops a delete racing a live
-crawl.
+The flow tests run the real CLI against a config and state file in a temp
+directory, with the AWS session, the control-plane target, and the delete
+primitives replaced by fakes that record what they were asked to do.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from kb_connector.cli.teardown import (
-    _find_active_ingestion_job,
-    _stop_and_wait_for_terminal,
-    _TERMINAL_INGESTION_STATES,
-)
+from kb_connector.core import teardown as td
 from kb_connector.core.errors import ConnectorError
 
+_KB = "KB12345678"
+_DS = "DS12345678"
+_SECRET = "arn:aws:secretsmanager:us-west-2:111122223333:secret:kb-connector/c1-a1"
+_ROLE_ARN = "arn:aws:iam::111122223333:role/kb-connector-c1-role"
 
-def _fake_target_with_jobs(jobs: list[dict]) -> MagicMock:
-    """Build a fake target whose ListIngestionJobs returns the given jobs."""
+
+# --- ingestion job precheck ------------------------------------------------------
+
+
+def _target_with_jobs(jobs: list[dict]) -> MagicMock:
     target = MagicMock()
     target.list_ingestion_jobs.return_value = {"ingestionJobSummaries": jobs}
     return target
 
 
 def test_find_active_returns_in_progress_job():
-    target = _fake_target_with_jobs([
-        {"ingestionJobId": "JOB-RUNNING", "status": "IN_PROGRESS"},
-    ])
-    with patch("kb_connector.targets.get_target", return_value=target):
-        assert _find_active_ingestion_job(
-            session=MagicMock(), region="us-west-2",
-            kb_id="kb-1", ds_id="ds-1",
-        ) == "JOB-RUNNING"
+    target = _target_with_jobs([{"ingestionJobId": "JOB-RUNNING", "status": "IN_PROGRESS"}])
+    assert td.find_active_ingestion_job(target, "kb", "ds") == "JOB-RUNNING"
 
 
 def test_find_active_returns_none_for_all_terminal():
-    target = _fake_target_with_jobs([
+    target = _target_with_jobs([
         {"ingestionJobId": "JOB-OLD", "status": "COMPLETE"},
         {"ingestionJobId": "JOB-OLDER", "status": "FAILED"},
     ])
-    with patch("kb_connector.targets.get_target", return_value=target):
-        assert _find_active_ingestion_job(
-            session=MagicMock(), region="us-west-2",
-            kb_id="kb-1", ds_id="ds-1",
-        ) is None
+    assert td.find_active_ingestion_job(target, "kb", "ds") is None
 
 
 def test_find_active_returns_none_on_no_jobs():
-    target = _fake_target_with_jobs([])
-    with patch("kb_connector.targets.get_target", return_value=target):
-        assert _find_active_ingestion_job(
-            session=MagicMock(), region="us-west-2",
-            kb_id="kb-1", ds_id="ds-1",
-        ) is None
+    assert td.find_active_ingestion_job(_target_with_jobs([]), "kb", "ds") is None
 
 
-def test_find_active_handles_lookup_error():
-    """A failed list call shouldn't block teardown — return None and let it proceed."""
-    target = MagicMock()
-    target.list_ingestion_jobs.side_effect = RuntimeError("network down")
-    with patch("kb_connector.targets.get_target", return_value=target):
-        assert _find_active_ingestion_job(
-            session=MagicMock(), region="us-west-2",
-            kb_id="kb-1", ds_id="ds-1",
-        ) is None
+def test_terminal_states():
+    assert {"COMPLETE", "COMPLETED", "FAILED", "STOPPED"} == set(td.TERMINAL_INGESTION_STATES)
 
 
-def test_terminal_states_set_includes_expected_values():
-    """Terminal states the precheck recognizes."""
-    assert "COMPLETE" in _TERMINAL_INGESTION_STATES
-    assert "COMPLETED" in _TERMINAL_INGESTION_STATES
-    assert "FAILED" in _TERMINAL_INGESTION_STATES
-    assert "STOPPED" in _TERMINAL_INGESTION_STATES
-    assert "IN_PROGRESS" not in _TERMINAL_INGESTION_STATES
-    assert "STARTING" not in _TERMINAL_INGESTION_STATES
-    assert "STOPPING" not in _TERMINAL_INGESTION_STATES
-
-
-def test_stop_and_wait_returns_when_terminal_observed(monkeypatch):
-    """Once GET reports a terminal state, the polling loop returns."""
-    target = MagicMock()
-    target.stop_ingestion_job.return_value = None
-    target.get_ingestion_job.return_value = {"ingestionJob": {"status": "STOPPED"}}
-    monkeypatch.setattr("kb_connector.targets.get_target", lambda *a, **kw: target)
+def test_stop_and_wait_returns_the_terminal_status(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda _: None)
-    _stop_and_wait_for_terminal(
-        session=MagicMock(), region="us-west-2",
-        kb_id="kb-1", ds_id="ds-1", job_id="JOB-1",
-    )
-    assert target.stop_ingestion_job.call_count == 1
-    assert target.get_ingestion_job.call_count == 1
+    target = MagicMock()
+    target.get_ingestion_job.return_value = {"ingestionJob": {"status": "STOPPED"}}
+    assert td.stop_and_wait(target, "kb", "ds", "JOB-1") == "STOPPED"
+    target.stop_ingestion_job.assert_called_once_with("kb", "ds", "JOB-1")
 
 
-def test_stop_and_wait_proceeds_on_stop_failure(monkeypatch):
-    """If StopIngestionJob fails, log and proceed — don't raise."""
+def test_stop_and_wait_raises_when_the_stop_request_fails():
     target = MagicMock()
     target.stop_ingestion_job.side_effect = RuntimeError("boom")
-    monkeypatch.setattr("kb_connector.targets.get_target", lambda *a, **kw: target)
-    # Should not raise
-    _stop_and_wait_for_terminal(
-        session=MagicMock(), region="us-west-2",
-        kb_id="kb-1", ds_id="ds-1", job_id="JOB-1",
-    )
+    with pytest.raises(RuntimeError):
+        td.stop_and_wait(target, "kb", "ds", "JOB-1")
 
 
-# --- T-02: teardown must not write state before it is allowed to ------------
-
-
-def _args(**overrides):
-    """Build a teardown argparse.Namespace with all defaults populated."""
-    import argparse
-    base = dict(
-        connector="c1", kb=None, only=None, dry_run=False, yes=True, force=False,
-        include_adopted=False, region="us-west-2", profile=None,
-        auth_method="az", device_client_id=None, config=None,
-    )
-    base.update(overrides)
-    return argparse.Namespace(**base)
-
-
-def _state_with(created_resources):
-    """A StateFile holding one connector with a secret and the given ownership."""
-    from kb_connector.core.state import ConnectorState, StateFile
-    cs = ConnectorState(
-        connector_type="sharepoint",
-        region="us-west-2",
-        secret_arn="arn:aws:secretsmanager:us-west-2:111122223333:secret:s-a1",
-        created_resources=dict(created_resources),
-    )
-    return StateFile(connectors={"c1": cs})
-
-
-def _run_with_spies(monkeypatch, state_file, args):
-    """Run teardown with save_state spied and all deletion stubbed out."""
-    from kb_connector.cli import teardown as td
-    calls: list[str] = []
-    monkeypatch.setattr(td, "load_state", lambda *a, **kw: state_file)
-    monkeypatch.setattr(td, "save_state", lambda *a, **kw: calls.append("save"))
-    monkeypatch.setattr(td, "load_config", lambda *a, **kw: MagicMock(
-        connector_names=lambda: ["c1"]
-    ))
-    monkeypatch.setattr(td, "_delete_secret", lambda *a, **kw: None)
-    monkeypatch.setattr(
-        td, "_find_active_ingestion_job", lambda *a, **kw: None
-    )
-    monkeypatch.setattr("boto3.Session", lambda *a, **kw: MagicMock())
-    rc = td._run_teardown(args)
-    return rc, calls
-
-
-@pytest.mark.parametrize("marker", ["tool", "external"])
-def test_dry_run_writes_no_state(monkeypatch, marker):
-    """--dry-run must not write state under any ownership shape.
-
-    The "external" shape is the one worth pinning: with every candidate
-    adopted, `resources` is empty and control reaches the nothing-to-delete
-    branch, which sits ahead of the --dry-run check.
-    """
-    state_file = _state_with({"secret": marker})
-    rc, calls = _run_with_spies(
-        monkeypatch, state_file, _args(dry_run=True)
-    )
-    assert rc == 0
-    assert calls == [], f"dry run wrote state (ownership={marker})"
-    assert "c1" in state_file.connectors
-
-
-def test_all_adopted_keeps_state_entry(monkeypatch):
-    """Every candidate adopted: nothing to delete, and the entry must survive.
-
-    The entry is the only record that this connector is attached to those
-    still-live resources, so clearing it would strand them.
-    """
-    state_file = _state_with({"secret": "external"})
-    rc, calls = _run_with_spies(monkeypatch, state_file, _args())
-    assert rc == 0
-    assert calls == [], "cleared state while adopted resources are still live"
-    assert "c1" in state_file.connectors
-    assert state_file.connectors["c1"].secret_arn is not None
-
-
-def test_owned_resource_teardown_does_write_state(monkeypatch):
-    """Control: a real teardown of an owned resource still persists state."""
-    state_file = _state_with({"secret": "tool"})
-    rc, calls = _run_with_spies(monkeypatch, state_file, _args())
-    assert rc == 0
-    assert calls == ["save"]
-
-
-# --- T-02: _delete_role must refuse before it removes anything --------------
+# --- T-02: delete_role refuses before it removes anything ------------------------
 
 
 def _iam_session(inline=(), attached=(), profiles=()):
-    """A session whose IAM client reports the given role attachments."""
     iam = MagicMock()
     iam.list_role_policies.return_value = {"PolicyNames": list(inline)}
     iam.list_attached_role_policies.return_value = {
@@ -211,13 +84,9 @@ def _iam_session(inline=(), attached=(), profiles=()):
     return session, iam
 
 
-_ROLE_ARN = "arn:aws:iam::111122223333:role/kb-connector-c1-role"
-
-
 def test_delete_role_removes_only_exact_tool_policies():
-    from kb_connector.cli.teardown import _delete_role
     session, iam = _iam_session(inline=["kb-connector-access"])
-    _delete_role(session, _ROLE_ARN)
+    td.delete_role(session, _ROLE_ARN)
     iam.delete_role_policy.assert_called_once_with(
         RoleName="kb-connector-c1-role", PolicyName="kb-connector-access"
     )
@@ -225,57 +94,40 @@ def test_delete_role_removes_only_exact_tool_policies():
 
 
 def test_delete_role_refuses_foreign_inline_policy_without_deleting():
-    """Foreign policies must be caught before any delete, not after."""
-    from kb_connector.cli.teardown import _delete_role
-    session, iam = _iam_session(
-        inline=["kb-connector-access", "app-team-dynamodb-access"]
-    )
+    session, iam = _iam_session(inline=["kb-connector-access", "app-team-dynamodb-access"])
     with pytest.raises(ConnectorError, match="did not create"):
-        _delete_role(session, _ROLE_ARN)
+        td.delete_role(session, _ROLE_ARN)
     iam.delete_role_policy.assert_not_called()
     iam.delete_role.assert_not_called()
 
 
 def test_delete_role_does_not_claim_prefix_lookalike_policies():
     """`kb-connector-audit` matches the name prefix but the tool never wrote it."""
-    from kb_connector.cli.teardown import _delete_role
-    session, iam = _iam_session(
-        inline=["kb-connector-access", "kb-connector-audit"]
-    )
+    session, iam = _iam_session(inline=["kb-connector-access", "kb-connector-audit"])
     with pytest.raises(ConnectorError, match="kb-connector-audit"):
-        _delete_role(session, _ROLE_ARN)
+        td.delete_role(session, _ROLE_ARN)
     iam.delete_role_policy.assert_not_called()
 
 
 def test_delete_role_refuses_managed_policy_without_deleting():
-    from kb_connector.cli.teardown import _delete_role
-    session, iam = _iam_session(
-        inline=["kb-connector-access"], attached=["AdministratorAccess"]
-    )
+    session, iam = _iam_session(inline=["kb-connector-access"], attached=["AdministratorAccess"])
     with pytest.raises(ConnectorError, match="managed policies"):
-        _delete_role(session, _ROLE_ARN)
+        td.delete_role(session, _ROLE_ARN)
     iam.delete_role_policy.assert_not_called()
     iam.delete_role.assert_not_called()
 
 
 def test_delete_role_refuses_role_in_instance_profile():
-    """A role in an instance profile is in use by an EC2 workload."""
-    from kb_connector.cli.teardown import _delete_role
-    session, iam = _iam_session(
-        inline=["kb-connector-access"], profiles=["web-tier-profile"]
-    )
+    session, iam = _iam_session(inline=["kb-connector-access"], profiles=["web-tier-profile"])
     with pytest.raises(ConnectorError, match="instance profile"):
-        _delete_role(session, _ROLE_ARN)
+        td.delete_role(session, _ROLE_ARN)
     iam.delete_role_policy.assert_not_called()
     iam.delete_role.assert_not_called()
 
 
 def test_delete_role_handles_iam_role_paths():
-    from kb_connector.cli.teardown import _delete_role
     session, iam = _iam_session()
-    _delete_role(
-        session, "arn:aws:iam::111122223333:role/service-roles/nested/MyRole"
-    )
+    td.delete_role(session, "arn:aws:iam::111122223333:role/service-roles/nested/MyRole")
     iam.delete_role.assert_called_once_with(RoleName="MyRole")
 
 
@@ -290,21 +142,18 @@ def test_delete_role_handles_iam_role_paths():
     ],
 )
 def test_delete_role_refuses_a_target_state_does_not_justify(bad_arn):
-    from kb_connector.cli.teardown import _delete_role
     session, iam = _iam_session()
     with pytest.raises(ConnectorError):
-        _delete_role(session, bad_arn)
+        td.delete_role(session, bad_arn)
     iam.delete_role.assert_not_called()
     iam.delete_role_policy.assert_not_called()
 
 
 def test_tool_policy_names_cover_every_authored_policy():
-    """Guards against a new put_role_policy name drifting out of the set.
-
-    If this fails, a call site started writing an inline policy that teardown
-    will refuse to remove. Add the name to TOOL_INLINE_POLICY_NAMES.
-    """
+    """A new put_role_policy name must be added to TOOL_INLINE_POLICY_NAMES,
+    or teardown refuses to remove the role."""
     import inspect
+
     from kb_connector.core import provisioning
     from kb_connector.core.provisioning import TOOL_INLINE_POLICY_NAMES
 
@@ -314,30 +163,27 @@ def test_tool_policy_names_cover_every_authored_policy():
     assert sig.parameters["policy_name"].default in TOOL_INLINE_POLICY_NAMES
 
 
-# --- T-18: destructive targets taken from state must be shape-checked -------
+# --- T-24: destructive targets taken from state are shape-checked ----------------
+
+
+def _client_session():
+    client = MagicMock()
+    session = MagicMock()
+    session.client.return_value = client
+    return session, client
 
 
 def test_delete_secret_refuses_a_non_secret_arn():
-    """ForceDeleteWithoutRecovery has no undo, so the target is checked first."""
-    from kb_connector.cli.teardown import _delete_secret
-    sm = MagicMock()
-    session = MagicMock()
-    session.client.return_value = sm
+    session, sm = _client_session()
     with pytest.raises(ConnectorError):
-        _delete_secret(session, "arn:aws:kms:us-west-2:111122223333:key/abc")
+        td.delete_secret(session, _ROLE_ARN)
     sm.delete_secret.assert_not_called()
 
 
-def test_delete_secret_accepts_a_real_secret_arn():
-    from kb_connector.cli.teardown import _delete_secret
-    sm = MagicMock()
-    session = MagicMock()
-    session.client.return_value = sm
-    arn = "arn:aws:secretsmanager:us-west-2:111122223333:secret:kb-connector/c1-a1"
-    _delete_secret(session, arn)
-    sm.delete_secret.assert_called_once_with(
-        SecretId=arn, ForceDeleteWithoutRecovery=True
-    )
+def test_delete_secret_force_deletes_a_real_secret_arn():
+    session, sm = _client_session()
+    td.delete_secret(session, _SECRET)
+    sm.delete_secret.assert_called_once_with(SecretId=_SECRET, ForceDeleteWithoutRecovery=True)
 
 
 @pytest.mark.parametrize(
@@ -350,84 +196,246 @@ def test_delete_secret_accepts_a_real_secret_arn():
     ],
 )
 def test_delete_cert_refuses_an_implausible_target(bucket, key):
-    from kb_connector.cli.teardown import _delete_cert
-    s3 = MagicMock()
-    session = MagicMock()
-    session.client.return_value = s3
+    session, s3 = _client_session()
     with pytest.raises(ConnectorError):
-        _delete_cert(session, bucket, key)
+        td.delete_cert(session, bucket, key)
     s3.delete_object.assert_not_called()
 
 
 def test_delete_cert_accepts_a_real_target():
-    from kb_connector.cli.teardown import _delete_cert
-    s3 = MagicMock()
-    session = MagicMock()
-    session.client.return_value = s3
-    _delete_cert(session, "kb-connector-certs-111122223333-us-west-2", "kb/c1.p12")
+    session, s3 = _client_session()
+    td.delete_cert(session, "kb-connector-certs-111122223333-us-west-2", "kb/c1.p12")
     s3.delete_object.assert_called_once_with(
         Bucket="kb-connector-certs-111122223333-us-west-2", Key="kb/c1.p12"
     )
 
 
-# --- Region: teardown deletes where the resources are, or refuses -------------
+# --- the flow, through the CLI ---------------------------------------------------
 
 
-def _run_region_case(monkeypatch, *, state_region, config_region, arg_region):
-    """Run teardown and return (session kwargs, secret deletes, error)."""
-    from kb_connector.cli import teardown as td
-    from kb_connector.core.config import ToolConfig
-    from kb_connector.core.state import ConnectorState, StateFile
+class _Recorder:
+    """Fakes for everything teardown reaches, recording what it was asked."""
 
-    cs = ConnectorState(
-        connector_type="sharepoint",
-        region=state_region,
-        secret_arn="arn:aws:secretsmanager:us-west-2:111122223333:secret:s-a1",
-        created_resources={"secret": "tool"},
+    def __init__(self, *, active_job=None, fail=()):
+        self.calls: list[str] = []
+        self.sessions: list[tuple] = []
+        self.fail = set(fail)
+        self.target = MagicMock()
+        self.target.list_ingestion_jobs.return_value = {
+            "ingestionJobSummaries": (
+                [{"ingestionJobId": active_job, "status": "IN_PROGRESS"}] if active_job else []
+            )
+        }
+        self.target.get_ingestion_job.return_value = {"ingestionJob": {"status": "STOPPED"}}
+        self.target.delete_data_source.side_effect = lambda kb, ds: self._call("ds")
+        self.target.delete_knowledge_base.side_effect = lambda kb: self._call("kb")
+
+    def _call(self, kind):
+        self.calls.append(kind)
+        if kind in self.fail:
+            raise RuntimeError(f"{kind} delete failed")
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(
+            "kb_connector.context.default_session_factory",
+            lambda region, profile: self.sessions.append((region, profile)) or MagicMock(),
+        )
+        monkeypatch.setattr(
+            "kb_connector.context.default_target_factory", lambda **kw: self.target
+        )
+        monkeypatch.setattr(td, "delete_secret", lambda s, arn: self._call("secret"))
+        monkeypatch.setattr(td, "delete_role", lambda s, arn: self._call("role"))
+        monkeypatch.setattr(td, "delete_cert", lambda s, b, k: self._call("cert"))
+        monkeypatch.setattr(td, "delete_entra_app", lambda **kw: self._call("app"))
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        return self
+
+
+def _project(tmp_path: Path, monkeypatch, *, owners: dict, config_region="us-west-2",
+             state_region="us-west-2", **fields) -> Path:
+    """A project dir with one connector `c1`, resources and ownership as given."""
+    region_line = f'region = "{config_region}"\n' if config_region else ""
+    (tmp_path / "kb-connector.toml").write_text(
+        f'[connectors.c1]\ntype = "sharepoint"\n{region_line}'
     )
-    connectors = {"c1": {"type": "sharepoint"}}
-    if config_region:
-        connectors["c1"]["region"] = config_region
-    sessions: list[dict] = []
-    deletes: list[str] = []
-    monkeypatch.setattr(td, "load_state", lambda *a, **kw: StateFile(connectors={"c1": cs}))
-    monkeypatch.setattr(td, "save_state", lambda *a, **kw: None)
-    monkeypatch.setattr(td, "load_config", lambda *a, **kw: ToolConfig(connectors=connectors))
-    monkeypatch.setattr(td, "_delete_secret", lambda s, arn: deletes.append(arn))
-    monkeypatch.setattr(td, "_find_active_ingestion_job", lambda *a, **kw: None)
-    monkeypatch.setattr("boto3.Session", lambda **kw: sessions.append(kw) or MagicMock())
-    try:
-        td._run_teardown(_args(region=arg_region))
-    except Exception as exc:  # noqa: BLE001 - returned for the assertion
-        return sessions, deletes, exc
-    return sessions, deletes, None
+    state = {
+        "connector_type": "sharepoint",
+        "region": state_region,
+        "created_resources": owners,
+        **fields,
+    }
+    path = tmp_path / "kb-connector.state.json"
+    path.write_text(json.dumps({"connectors": {"c1": state}}))
+    monkeypatch.chdir(tmp_path)
+    return path
 
 
-def test_teardown_falls_back_to_the_config_region(monkeypatch):
-    """State without a region falls back to config, not boto's default region."""
-    sessions, deletes, err = _run_region_case(
-        monkeypatch, state_region=None, config_region="eu-west-1", arg_region=None
+def _all_resources():
+    return dict(
+        knowledge_base_id=_KB, data_source_id=_DS, secret_arn=_SECRET,
+        kb_role_arn=_ROLE_ARN, cert_s3_bucket="kb-connector-certs-111122223333-us-west-2",
+        cert_s3_key="kb-connector/c1.p12", client_app_id="app-1",
+        client_app_object_id="obj-1", tenant_id="t-1",
     )
-    assert err is None
-    assert sessions[0]["region_name"] == "eu-west-1"
-    assert deletes
 
 
-def test_state_region_beats_config(monkeypatch):
+def _teardown(*argv):
+    from kb_connector.cli.main import build_parser
+
+    args = build_parser().parse_args(["teardown", "c1", *argv])
+    return args.func(args)
+
+
+def _state(path: Path) -> dict:
+    return json.loads(path.read_text())["connectors"]
+
+
+_TOOL = {k: "tool" for k in ("ds", "kb", "secret", "role", "cert", "app")}
+
+
+def test_full_teardown_deletes_control_plane_first_and_clears_state(tmp_path, monkeypatch):
+    path = _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.calls[:2] == ["ds", "kb"]
+    assert set(rec.calls) == set(_TOOL)
+    assert "c1" not in _state(path)
+
+
+def test_control_plane_failure_keeps_credentials_and_exits_nonzero(tmp_path, monkeypatch):
+    path = _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    rec = _Recorder(fail={"kb"}).install(monkeypatch)
+    assert _teardown("--yes") == 1
+    assert rec.calls == ["ds", "kb"]
+    remaining = _state(path)["c1"]
+    assert remaining["knowledge_base_id"] == _KB
+    assert remaining["secret_arn"] == _SECRET
+    assert remaining["data_source_id"] is None
+
+
+def test_a_credential_failure_exits_nonzero_and_keeps_the_entry(tmp_path, monkeypatch):
+    path = _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    _Recorder(fail={"role"}).install(monkeypatch)
+    assert _teardown("--yes") == 1
+    assert _state(path)["c1"]["kb_role_arn"] == _ROLE_ARN
+
+
+def test_running_job_blocks_teardown_without_force(tmp_path, monkeypatch):
+    path = _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    before = path.read_text()
+    rec = _Recorder(active_job="JOB-1").install(monkeypatch)
+    assert _teardown("--yes") == 1
+    assert rec.calls == []
+    assert path.read_text() == before
+
+
+def test_force_stops_the_running_job_then_deletes(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    rec = _Recorder(active_job="JOB-1").install(monkeypatch)
+    assert _teardown("--yes", "--force") == 0
+    rec.target.stop_ingestion_job.assert_called_once_with(_KB, _DS, "JOB-1")
+    assert rec.calls[:2] == ["ds", "kb"]
+
+
+def test_a_failed_job_check_does_not_block_cleanup(tmp_path, monkeypatch, capsys):
+    _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    rec = _Recorder().install(monkeypatch)
+    rec.target.list_ingestion_jobs.side_effect = RuntimeError("network down")
+    assert _teardown("--yes") == 0
+    assert "could not check for a running ingestion job" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("marker", ["tool", "external"])
+def test_dry_run_writes_no_state_and_calls_nothing(tmp_path, monkeypatch, marker):
+    path = _project(tmp_path, monkeypatch, owners={"secret": marker}, secret_arn=_SECRET)
+    before = path.read_text()
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--dry-run") == 0
+    assert rec.calls == [] and rec.sessions == []
+    assert path.read_text() == before
+
+
+def test_all_adopted_keeps_the_state_entry(tmp_path, monkeypatch):
+    """The entry is the only record that this connector is attached to them."""
+    path = _project(tmp_path, monkeypatch, owners={"secret": "external"}, secret_arn=_SECRET)
+    before = path.read_text()
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.calls == []
+    assert path.read_text() == before
+
+
+def test_include_adopted_deletes_adopted_resources(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch, owners={"secret": "external"}, secret_arn=_SECRET)
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes", "--include-adopted") == 0
+    assert rec.calls == ["secret"]
+
+
+def test_scoped_teardown_keeps_the_entry(tmp_path, monkeypatch):
+    path = _project(tmp_path, monkeypatch, owners=_TOOL, **_all_resources())
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes", "--only", "secret") == 0
+    assert rec.calls == ["secret"]
+    assert _state(path)["c1"]["secret_arn"] is None
+    assert _state(path)["c1"]["knowledge_base_id"] == _KB
+
+
+def test_nothing_tracked_is_a_no_op(tmp_path, monkeypatch, capsys):
+    _project(tmp_path, monkeypatch, owners={})
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.calls == []
+    assert "Nothing to tear down" in capsys.readouterr().out
+
+
+# --- region: delete where the resources are, or refuse ----------------------------
+
+
+def test_state_region_beats_config(tmp_path, monkeypatch):
     """State records where the resources are; config may have been edited."""
-    sessions, _, err = _run_region_case(
-        monkeypatch, state_region="us-west-2", config_region="eu-west-1",
-        arg_region=None,
-    )
-    assert err is None
-    assert sessions[0]["region_name"] == "us-west-2"
+    _project(tmp_path, monkeypatch, owners={"secret": "tool"}, secret_arn=_SECRET,
+             config_region="eu-west-1", state_region="us-west-2")
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.sessions[0][0] == "us-west-2"
 
 
-def test_teardown_refuses_without_any_region(monkeypatch):
-    from kb_connector.core.errors import ConfigError
+def test_config_region_when_state_has_none(tmp_path, monkeypatch):
+    """State without a region falls back to config, not boto's default region."""
+    _project(tmp_path, monkeypatch, owners={"secret": "tool"}, secret_arn=_SECRET,
+             config_region="eu-west-1", state_region=None)
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.sessions[0][0] == "eu-west-1"
 
-    sessions, deletes, err = _run_region_case(
-        monkeypatch, state_region=None, config_region=None, arg_region=None
-    )
-    assert isinstance(err, ConfigError)
-    assert not sessions and not deletes
+
+def test_refuses_without_any_region_before_prompting(tmp_path, monkeypatch, capsys):
+    _project(tmp_path, monkeypatch, owners={"secret": "tool"}, secret_arn=_SECRET,
+             config_region=None, state_region=None)
+    rec = _Recorder().install(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *_: pytest.fail("prompted"))
+    monkeypatch.setattr("sys.argv", ["kb-connector", "teardown", "c1"])
+    from kb_connector.cli.main import main
+
+    assert main() == 1
+    assert "No region known" in capsys.readouterr().err
+    assert rec.calls == [] and rec.sessions == []
+
+
+def test_entra_only_teardown_needs_no_region(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch, owners={"app": "tool"}, client_app_id="app-1",
+             client_app_object_id="obj-1", tenant_id="t-1",
+             config_region=None, state_region=None)
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.calls == ["app"]
+
+
+def test_profile_comes_from_config(tmp_path, monkeypatch):
+    _project(tmp_path, monkeypatch, owners={"secret": "tool"}, secret_arn=_SECRET)
+    with open("kb-connector.toml", "a") as f:
+        f.write('profile = "team-profile"\n')
+    rec = _Recorder().install(monkeypatch)
+    assert _teardown("--yes") == 0
+    assert rec.sessions[0] == ("us-west-2", "team-profile")

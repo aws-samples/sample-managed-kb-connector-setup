@@ -108,6 +108,12 @@ class CommandContext:
         self.state_file.set(self.name, self.cs)
         return save_state(self.state_file, self.state_path)
 
+    def forget(self) -> str:
+        """Remove this connector's state entry and persist; return the file path."""
+        self.state_file.connectors.pop(self.name, None)
+        self.cs = None
+        return save_state(self.state_file, self.state_path)
+
 
 def resolve_connector_name(
     config: ToolConfig,

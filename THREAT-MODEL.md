@@ -220,7 +220,7 @@ marking that permits deletion, so the check is built to be unable to grant it in
 error. Resource kinds addressed by derived name and classified by tag (secrets,
 certificates, data sources) have no id to compare and are never claimed this way.
 
-`_delete_role` evaluates every reason to refuse *before* it removes anything —
+`core.teardown.delete_role` evaluates every reason to refuse *before* it removes anything —
 managed policies attached, membership of an instance profile, or an inline policy
 the tool did not author — so a refused role is left completely intact rather than
 stripped of permissions and then abandoned. Recognition is by exact name against
@@ -589,7 +589,7 @@ testing. Mitigated procedurally: `--dry-run`, a y/N prompt, `--only` scoping, an
 a refusal to tear down while an ingestion job is running. Called out in both the
 README and KNOWN-LIMITATIONS.md so the tradeoff is visible before use.
 
-Because there is no undo, the *target* is also checked: `_delete_secret` requires
+Because there is no undo, the *target* is also checked: `core.teardown.delete_secret` requires
 a well-formed Secrets Manager ARN (`identifiers.validate_secret_arn`) before it
 calls `DeleteSecret`, so a malformed or crafted state entry cannot redirect the
 deletion at another service's resource (T-24). The refusal to tear down while a
@@ -689,13 +689,13 @@ another team, usually over email or chat.
 **Status: Mitigated.** Every identifier taken from a local file and used as the
 target of an AWS call is shape-checked first, in `core/identifiers.py`:
 
-- `_delete_secret` requires a Secrets Manager ARN naming a secret, so an ARN for
+- `core.teardown.delete_secret` requires a Secrets Manager ARN naming a secret, so an ARN for
   another service cannot reach `DeleteSecret`.
-- `_delete_role` requires a well-formed IAM role ARN and validates the extracted
+- `core.teardown.delete_role` requires a well-formed IAM role ARN and validates the extracted
   name against IAM's charset and length limit. Trimming from a `:role/` marker
   would pass a bare string straight through, letting a state entry of
   `OrganizationAccountAccessRole` aim `DeleteRole` at that role.
-- `_delete_cert` requires a syntactically valid bucket name and a relative key
+- `core.teardown.delete_cert` requires a syntactically valid bucket name and a relative key
   with no `..` segment.
 
 Handoff documents go through `handoff.parse_handoff` before any value reaches
@@ -878,9 +878,9 @@ Security-relevant behaviors that this model depends on:
 - `provisioning.preflight_ownership` — the check that moves a T-03 refusal ahead
   of the irreversible Entra work in Stage 1.
 - `provisioning.TOOL_INLINE_POLICY_NAMES` — the exact-name set that bounds what
-  `teardown._delete_role` will remove (T-02). A new `put_role_policy` call site
+  `core.teardown.delete_role` will remove (T-02). A new `put_role_policy` call site
   must add its name here.
-- `teardown._delete_role` — the refuse-before-remove ordering behind T-02.
+- `core.teardown.delete_role` — the refuse-before-remove ordering behind T-02.
 - `core/fileio.py` — the `0600` and atomicity guarantees behind T-10, including
   `O_NOFOLLOW` in `open_owner_only`.
 - `core/identifiers.py` — the shape checks behind T-24 and T-26. Anything that

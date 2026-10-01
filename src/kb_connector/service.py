@@ -594,6 +594,266 @@ def handoff(
     )
 
 
+# --- teardown ----------------------------------------------------------------
+
+# Resource kinds deleted through an AWS client. "app" goes through Graph.
+_AWS_KINDS = frozenset({"ds", "kb", "secret", "role", "cert"})
+# Deleted first. If either fails, the credentials they depend on are kept.
+_CONTROL_PLANE_KINDS = ("ds", "kb")
+TEARDOWN_KINDS = ("ds", "kb", "secret", "role", "cert", "app")
+
+
+@dataclass
+class TeardownItem:
+    """One tracked resource teardown would act on."""
+
+    kind: str          # one of TEARDOWN_KINDS
+    identifier: str
+    description: str
+    adopted: bool      # recorded as external rather than created by this tool
+
+
+@dataclass
+class TeardownPlan:
+    """What teardown would delete and keep. Computing it makes no AWS call."""
+
+    connector: str
+    connector_type: str | None
+    region: str | None
+    delete: list[TeardownItem] = field(default_factory=list)
+    keep: list[TeardownItem] = field(default_factory=list)
+    scoped: bool = False   # limited to one kind with `only`
+    ctx: Any = field(default=None, repr=False)
+
+    @property
+    def tracked(self) -> bool:
+        return bool(self.delete or self.keep)
+
+
+@dataclass
+class TeardownEvent:
+    """Progress from execute_teardown, in the order things happen."""
+
+    kind: Literal[
+        "job_check_failed", "job_stopping", "job_stopped", "job_still_stopping",
+        "job_stop_failed", "deleted", "failed", "skipped",
+    ]
+    item: TeardownItem | None = None
+    detail: str | None = None
+
+
+@dataclass
+class TeardownResult:
+    """Outcome of execute_teardown."""
+
+    connector: str
+    deleted: list[TeardownItem] = field(default_factory=list)
+    failed: list[TeardownItem] = field(default_factory=list)
+    skipped: list[TeardownItem] = field(default_factory=list)
+    # Set when an ingestion job was running and `force` was not passed. Nothing
+    # was deleted.
+    blocked_by_job: str | None = None
+    state_cleared: bool = False
+    state_path: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return not (self.failed or self.skipped or self.blocked_by_job)
+
+
+def plan_teardown(
+    *,
+    connector_name: str | None = None,
+    only: str | None = None,
+    include_adopted: bool = False,
+    region: str | None = None,
+    profile: str | None = None,
+    config_path: str | None = None,
+    state_path: str | None = None,
+    session_factory: SessionFactory | None = None,
+    target_factory: TargetFactory | None = None,
+) -> TeardownPlan:
+    """List what teardown would delete and keep, from state.
+
+    Resources recorded as adopted are kept unless `include_adopted`. A config
+    entry that fails to resolve does not block the plan, since state is what
+    teardown acts on. Raises ConfigError if anything AWS-side would be deleted
+    and no region is known: a guessed region sends every delete to a region
+    where the resources do not exist.
+    """
+    if only is not None and only not in TEARDOWN_KINDS:
+        raise ConfigError(
+            f"Unknown resource type {only!r}. Expected one of: "
+            f"{', '.join(TEARDOWN_KINDS)}."
+        )
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path, strict_config=False,
+        session_factory=session_factory, target_factory=target_factory,
+    )
+    cs = ctx.cs
+    plan = TeardownPlan(
+        connector=ctx.name,
+        connector_type=cs.connector_type if cs else None,
+        region=ctx.region,
+        scoped=only is not None,
+        ctx=ctx,
+    )
+    if cs is None:
+        return plan
+
+    candidates: list[tuple[str, str | None, str]] = [
+        ("ds", cs.data_source_id, f"Data source {cs.data_source_id}"),
+        ("kb", cs.knowledge_base_id, f"Knowledge base {cs.knowledge_base_id}"),
+        ("secret", cs.secret_arn, f"Secret {cs.secret_arn}"),
+        ("role", cs.kb_role_arn, f"IAM role {cs.kb_role_arn}"),
+        (
+            "cert",
+            f"s3://{cs.cert_s3_bucket}/{cs.cert_s3_key}"
+            if cs.cert_s3_bucket and cs.cert_s3_key else None,
+            f"Certificate s3://{cs.cert_s3_bucket}/{cs.cert_s3_key}",
+        ),
+        ("app", cs.client_app_id, f"Entra app {cs.client_app_id}"),
+    ]
+    for kind, identifier, description in candidates:
+        if not identifier or (only and kind != only):
+            continue
+        adopted = not cs.is_tool_owned(kind)
+        item = TeardownItem(kind, identifier, description, adopted)
+        (plan.keep if adopted and not include_adopted else plan.delete).append(item)
+
+    if any(item.kind in _AWS_KINDS for item in plan.delete):
+        ctx.require_region(
+            f"No region known for {ctx.name!r}: state does not record one and "
+            f"config does not set one. Pass the region the resources were "
+            f"created in."
+        )
+    return plan
+
+
+def execute_teardown(
+    plan: TeardownPlan,
+    *,
+    force: bool = False,
+    auth_method: str = "az",
+    device_client_id: str | None = None,
+    on_event: Callable[[TeardownEvent], None] | None = None,
+) -> TeardownResult:
+    """Delete what the plan lists, then update or clear the state entry.
+
+    Refuses while an ingestion job is running on the data source unless
+    `force`, which stops the job first. The data source and knowledge base are
+    deleted before the credentials; if either fails, the credentials are kept
+    so a later run can retry. The state entry is removed only after an unscoped
+    teardown that deleted everything and kept nothing.
+    """
+    from kb_connector.core import teardown as td
+
+    ctx = plan.ctx
+    cs = ctx.cs
+    result = TeardownResult(connector=plan.connector, state_path=ctx.state_path)
+
+    def _emit(event: TeardownEvent) -> None:
+        if on_event is not None:
+            on_event(event)
+
+    if not plan.delete:
+        return result
+
+    if cs.knowledge_base_id and cs.data_source_id:
+        target = ctx.target()
+        try:
+            active = td.find_active_ingestion_job(
+                target, cs.knowledge_base_id, cs.data_source_id
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed check must not block cleanup
+            active = None
+            _emit(TeardownEvent("job_check_failed", detail=str(exc)))
+        if active and not force:
+            result.blocked_by_job = active
+            return result
+        if active:
+            _emit(TeardownEvent("job_stopping", detail=active))
+            try:
+                status = td.stop_and_wait(
+                    target, cs.knowledge_base_id, cs.data_source_id, active
+                )
+            except Exception as exc:  # noqa: BLE001 - deletes proceed regardless
+                _emit(TeardownEvent("job_stop_failed", detail=str(exc)))
+            else:
+                _emit(TeardownEvent(
+                    "job_stopped" if status else "job_still_stopping", detail=status,
+                ))
+
+    ordered = sorted(
+        plan.delete, key=lambda i: 0 if i.kind in _CONTROL_PLANE_KINDS else 1
+    )
+    control_plane_failed = False
+    for item in ordered:
+        if control_plane_failed and item.kind not in _CONTROL_PLANE_KINDS:
+            result.skipped.append(item)
+            _emit(TeardownEvent("skipped", item))
+            continue
+        try:
+            _delete_item(ctx, cs, item, auth_method, device_client_id)
+        except Exception as exc:  # noqa: BLE001 - reported per resource
+            result.failed.append(item)
+            _emit(TeardownEvent("failed", item, str(exc)))
+            if item.kind in _CONTROL_PLANE_KINDS:
+                control_plane_failed = True
+            continue
+        result.deleted.append(item)
+        _emit(TeardownEvent("deleted", item))
+
+    nothing_left = not any([
+        cs.knowledge_base_id, cs.data_source_id, cs.secret_arn,
+        cs.kb_role_arn, cs.client_app_id, cs.cert_s3_bucket,
+    ])
+    if not plan.scoped and nothing_left and result.ok and not plan.keep:
+        result.state_path = ctx.forget()
+        result.state_cleared = True
+    else:
+        result.state_path = ctx.save()
+    return result
+
+
+def _delete_item(
+    ctx: Any, cs: Any, item: TeardownItem, auth_method: str,
+    device_client_id: str | None,
+) -> None:
+    """Delete one resource and clear its identifiers from state."""
+    from kb_connector.core import teardown as td
+
+    if item.kind == "ds":
+        if not cs.knowledge_base_id:
+            raise StateError(
+                "The data source cannot be deleted without its knowledge base "
+                "id, and state does not record one."
+            )
+        ctx.target().delete_data_source(cs.knowledge_base_id, item.identifier)
+        cs.data_source_id = None
+    elif item.kind == "kb":
+        ctx.target().delete_knowledge_base(item.identifier)
+        cs.knowledge_base_id = None
+    elif item.kind == "secret":
+        td.delete_secret(ctx.session(), item.identifier)
+        cs.secret_arn = None
+    elif item.kind == "role":
+        td.delete_role(ctx.session(), item.identifier)
+        cs.kb_role_arn = None
+    elif item.kind == "cert":
+        td.delete_cert(ctx.session(), cs.cert_s3_bucket, cs.cert_s3_key)
+        cs.cert_s3_bucket = None
+        cs.cert_s3_key = None
+    elif item.kind == "app":
+        td.delete_entra_app(
+            tenant_id=cs.tenant_id, object_id=cs.client_app_object_id,
+            auth_method=auth_method, device_client_id=device_client_id,
+        )
+        cs.client_app_id = None
+        cs.client_app_object_id = None
+
+
 # Re-export StateFile so consumers don't need to import from core.state
 __all__ = [
     "ConnectorSummary",
@@ -609,4 +869,10 @@ __all__ = [
     "monitor",
     "validate",
     "handoff",
+    "TeardownItem",
+    "TeardownPlan",
+    "TeardownEvent",
+    "TeardownResult",
+    "plan_teardown",
+    "execute_teardown",
 ]
