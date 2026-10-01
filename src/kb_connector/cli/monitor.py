@@ -64,18 +64,24 @@ def _run_monitor(args: argparse.Namespace) -> int:
 
     # An explicit --job means "resume this job" and implies --no-start.
     do_start = not args.no_start and not args.job
-    print("Starting ingestion job..." if do_start else "Polling ingestion job...")
+    # Progress lines are flushed so they reach a file or pipe as they happen,
+    # not only when the job ends.
+    print(
+        "Starting ingestion job..." if do_start else "Polling ingestion job...",
+        flush=True,
+    )
     started = time.monotonic()
 
     def _on_started(job_id: str) -> None:
-        print(f"  job {job_id}")
+        print(f"  job {job_id}", flush=True)
 
     def _on_poll(stats: IngestionStats) -> None:
         elapsed = int(time.monotonic() - started)
         print(
             f"  {elapsed // 60:>3}m{elapsed % 60:02d}s  {stats.status:<12} "
             f"scanned={stats.scanned} indexed={stats.indexed_total} "
-            f"failed={stats.failed}"
+            f"failed={stats.failed}",
+            flush=True,
         )
 
     result = service.monitor(
