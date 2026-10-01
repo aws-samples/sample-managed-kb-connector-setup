@@ -1,7 +1,6 @@
 """validate subcommand — verify a connector works end-to-end.
 
 Wraps service.validate, which runs structured checks:
-  * Token mint (informational, for Entra connectors).
   * Retrieve — for non-ACL connectors, a single retrieve.
   * For ACL-enabled connectors, three retrieves: with the authorized user
     (expect non-zero), with the unauthorized user (expect zero), and with
