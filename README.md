@@ -382,9 +382,14 @@ kb-connector monitor engineering-sp               # start a sync + poll to done
 kb-connector monitor engineering-sp --no-start    # poll the latest job
 ```
 
-Reports scanned, indexed, failed, and skipped counts. It flags the common case
-where ACL is enabled but the connector app can't read item-level permissions,
-which shows up as documents scanned but skipped instead of indexed.
+Prints a status line on every poll (elapsed time, status, scanned, indexed,
+failed), then the final counts. It flags the common case where ACL is enabled
+but the connector app can't read item-level permissions, which shows up as
+documents scanned but skipped instead of indexed.
+
+The job id is saved to state as soon as the job starts, so if the poll loop is
+interrupted, `--no-start` resumes watching the same job. `setup --sync` and the
+MCP monitor tool save it the same way.
 
 ### `validate`
 
@@ -465,7 +470,12 @@ than yanking credentials out from under a running crawl). `--force` calls
 `StopIngestionJob` first, waits briefly for a terminal state, then proceeds.
 If the data-source or knowledge-base delete fails, teardown stops before
 deleting the upstream credentials so the resources can be cleaned up on a
-later pass.
+later pass. Teardown exits non-zero when any delete fails or is skipped, and
+when it refuses because of a running job.
+
+Teardown deletes in the region recorded in state, falling back to the
+connector's config region. With neither, it stops before prompting rather than
+guessing.
 
 Resources the tool *adopted* rather than created are skipped and listed as
 "kept". That's what protects a knowledge base you attached to with `--kb`, and
