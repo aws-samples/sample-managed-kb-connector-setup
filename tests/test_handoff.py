@@ -176,3 +176,52 @@ def test_valid_document_is_returned_normalized():
     out = parse_handoff(_aws_doc())
     assert out["aws"]["secret_arn"] == _GOOD_SECRET
     assert out["version"] == "1"
+
+
+# --- T-02: importing a handoff must not hand teardown someone else's resources
+
+
+def _import(tmp_path, doc, cs):
+    import json
+
+    from kb_connector.cli.setup import _import_handoff
+
+    path = tmp_path / "handoff.json"
+    path.write_text(json.dumps(doc))
+    _import_handoff(str(path), cs, None)  # cfg is unused by the import
+
+
+def test_imported_aws_resources_are_recorded_external(tmp_path):
+    """The other admin created these, so teardown must leave them alone.
+
+    Without a record, is_tool_owned defaults to True and teardown would delete
+    the knowledge base and data source and force-delete the secret.
+    """
+    cs = ConnectorState()
+    _import(tmp_path, _aws_doc(), cs)
+    assert cs.knowledge_base_id == "ABC123DEF4"
+    for kind in ("kb", "ds", "secret"):
+        assert not cs.is_tool_owned(kind), f"{kind} imported as tool-owned"
+
+
+def test_imported_app_is_recorded_external(tmp_path):
+    cs = ConnectorState()
+    doc = {
+        "version": "1",
+        "connector": "c1",
+        "type": "sharepoint",
+        "direction": DIRECTION_SOURCE_TO_AWS,
+        "source": {"tenant_id": _GOOD_GUID, "client_id": _GOOD_GUID},
+    }
+    _import(tmp_path, doc, cs)
+    assert cs.client_app_id == _GOOD_GUID
+    assert not cs.is_tool_owned("app")
+
+
+def test_reimporting_an_id_state_already_owns_keeps_it_owned(tmp_path):
+    """The same value arriving again is not evidence that ownership changed."""
+    cs = ConnectorState(knowledge_base_id="ABC123DEF4")
+    cs.record_owned("kb")
+    _import(tmp_path, _aws_doc(), cs)
+    assert cs.is_tool_owned("kb")
+    assert not cs.is_tool_owned("ds")

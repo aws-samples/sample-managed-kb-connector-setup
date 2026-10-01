@@ -23,7 +23,13 @@ from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
 
 from kb_connector.core.config import ConnectorConfig, load_config
-from kb_connector.core.errors import AwsError, ConfigError, ConnectorError, StateError
+from kb_connector.core.errors import (
+    AwsError,
+    ConfigError,
+    ConnectorError,
+    ProviderError,
+    StateError,
+)
 from kb_connector.core.state import ConnectorState, load_state, save_state
 
 if TYPE_CHECKING:
@@ -31,6 +37,7 @@ if TYPE_CHECKING:
     # for --help and pure-logic runs.
     from boto3 import Session
 
+    from kb_connector.providers.microsoft.apps import AppRegistration
     from kb_connector.providers.microsoft.client import GraphClient
     from kb_connector.providers.microsoft.sites_selected import AdminAppCredentials
     from kb_connector.targets.base import Target
@@ -463,6 +470,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     # the control plane from state, because a knowledge base id alone does not
     # say which service holds it.
     cs.target = cfg.target
+    _record_region(cs, cfg)
 
     print(f"Setting up connector: {connector_name} (type: {cfg.type})")
     print(f"  region: {cfg.region or 'default'}")
@@ -537,6 +545,41 @@ def _run_setup(args: argparse.Namespace) -> int:
 
     print(f"  Next: kb-connector monitor {connector_name}    # start ingestion + watch it")
     return 0
+
+
+# State fields naming a regional AWS resource. If any is set, state already
+# records where this connector lives.
+_REGIONAL_STATE_FIELDS = (
+    "knowledge_base_id", "data_source_id", "secret_arn", "cert_s3_key",
+    "signing_key_arn",
+)
+
+
+def _record_region(cs: ConnectorState, cfg: ConnectorConfig) -> None:
+    """Record the region this run creates resources in, before it creates any.
+
+    Teardown deletes in the region state records. It used to be recorded only
+    when the data source was created, so a run that failed earlier (after the
+    secret, role or KB) left none, and teardown fell back to boto's default
+    region.
+
+    A run whose region differs from the one state already records is refused:
+    it would create new resources in one region while state still tracks the
+    old ones in another, and whichever region state ended up holding, teardown
+    would miss half of them.
+    """
+    if not cfg.region:
+        return
+    tracked = any(getattr(cs, f) for f in _REGIONAL_STATE_FIELDS)
+    if tracked and cs.region and cs.region != cfg.region:
+        raise ConfigError(
+            f"State records this connector's resources in {cs.region}, but this "
+            f"run would use {cfg.region}. Tear the connector down first "
+            f"(kb-connector teardown {cfg.name} --region {cs.region}), use a "
+            f"different connector name for the new region, or set region back "
+            f"to {cs.region}."
+        )
+    cs.region = cfg.region
 
 
 def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
@@ -631,10 +674,16 @@ def _provision_kb_and_ds(
         kb_obj = created.get("knowledgeBase", created)
         kb_id = kb_obj.get("knowledgeBaseId") or kb_obj.get("id")
         print(f"  Created knowledge base: {kb_id}")
+        # Recorded before the wait, as the data source is below. An encrypted KB
+        # can take past five minutes to become ACTIVE, and a timeout or FAILED
+        # status here used to leave a KB that state never mentioned: teardown
+        # could not find it and the next run collided with its name.
+        cs.knowledge_base_id = kb_id
+        cs.record_owned(state_mod.RESOURCE_KB)
+        cs.region = cfg.region
         print("  Waiting for KB to become ACTIVE...")
         target.wait_until_kb_active(kb_id)
         print("  KB is ACTIVE")
-        cs.record_owned(state_mod.RESOURCE_KB)
     else:
         # `kb_id` came from --kb or from state. If the operator pointed us at
         # this KB it predates the connector and may carry other data sources, so
@@ -929,6 +978,12 @@ def _setup_microsoft(
         app_name = args.app_name or f"kb-connector-{connector_name}"
         existing = apps.find_application_by_name(graph, app_name)
         if existing:
+            # Before any Graph write: everything below grants this app admin
+            # consent, so it must be one this tool can show it created.
+            _check_app_reuse(
+                cs, existing, app_name=app_name,
+                adopt=getattr(args, "adopt_existing_resources", False),
+            )
             app_id = existing["appId"]
             object_id = existing["id"]
             sp = apps.ensure_service_principal(graph, app_id)
@@ -937,6 +992,12 @@ def _setup_microsoft(
         else:
             reg = apps.create_application(graph, app_name)
             print(f"  Created app '{app_name}' (appId {reg.app_id})")
+
+        # Recorded now, before consent, certificate and site grants, any of
+        # which can fail. Recording it only after them meant a failure left a
+        # tool-created app untracked, and the next run then found it by name
+        # with no record and could not tell it from someone else's.
+        _record_app(cs, cfg, tenant_id, reg, reused=bool(existing))
 
         # Permissions + consent
         sites_sel = args.sites_selected or cfg.get("sites_selected", False)
@@ -1047,18 +1108,8 @@ def _setup_microsoft(
                 finally:
                     _delete_granter_app(graph, admin, admin_app_name)
 
-        # Update state with source-side results
-        cs.connector_type = cfg.type
-        cs.tenant_id = tenant_id
-        # Evaluated before the ids below are overwritten, so it compares against
-        # what an earlier pass recorded. An app found by display name is adopted
-        # only if state does not already record it as ours.
-        if existing:
-            _record_reused_resource(cs, state_mod.RESOURCE_APP, reg.object_id)
-        else:
-            cs.record_owned(state_mod.RESOURCE_APP)
-        cs.client_app_id = reg.app_id
-        cs.client_app_object_id = reg.object_id
+        # Update state with source-side results. The app itself was recorded
+        # when it was created or found, above.
         cs.cert_thumbprint_b64url = cert_thumbprint
         cs.cert_not_after = cert_not_after
 
@@ -1614,6 +1665,84 @@ def _should_reuse_certificate(
     return recorded in installed_thumbprints
 
 
+def _check_app_reuse(
+    cs: ConnectorState, existing: dict, *, app_name: str, adopt: bool
+) -> None:
+    """Refuse to reuse an Entra app this tool cannot show it created.
+
+    The app is found by display name, and the name is predictable
+    (`kb-connector-<connector>`). Entra lets ordinary users register apps by
+    default, so anyone can create an app with that name and add their own
+    client secret to it. Reusing it would then grant their app tenant-wide admin
+    consent. Uploading our certificate replaces the app's certificates but not
+    its client secrets, so their credential would keep working.
+
+    So an app found by name is reused only when state records that exact object
+    id as one this tool created. `--adopt-existing-resources` overrides, and in
+    that case the credentials already on the app are listed, because whoever
+    holds them gets the permissions consented next.
+    """
+    object_id = existing.get("id")
+    if cs.is_recorded_ours(state_mod.RESOURCE_APP, object_id):
+        return
+
+    secrets = existing.get("passwordCredentials") or []
+    certs_ = existing.get("keyCredentials") or []
+    held = (
+        f"It currently carries {len(secrets)} client secret(s) and "
+        f"{len(certs_)} certificate(s)."
+    )
+
+    if adopt:
+        print(
+            f"  WARNING: adopting existing Entra app '{app_name}' (object id "
+            f"{object_id}), which state does not record as created by this "
+            f"tool. {held} Anyone holding one of those gets the permissions "
+            f"about to be consented. Check its owners and credentials in the "
+            f"Entra portal.",
+            file=sys.stderr,
+        )
+        return
+
+    raise ProviderError(
+        f"An Entra app named '{app_name}' (object id {object_id}) already "
+        f"exists, and state does not record it as created by this tool. {held}\n\n"
+        f"Setup would grant this app tenant-wide admin consent, so it is not "
+        f"reused on the strength of its name alone: anyone who can register "
+        f"apps in the tenant can create one with this name.\n\n"
+        f"Ways forward:\n"
+        f"  • Pass --app-name with a distinct name to create a new app.\n"
+        f"  • If an earlier run of this tool created it, or you have verified "
+        f"its owners and credentials, re-run with --adopt-existing-resources. "
+        f"It is then recorded as external, so teardown leaves it alone.\n"
+        f"  • Otherwise, delete it: az ad app delete --id {object_id}"
+    )
+
+
+def _record_app(
+    cs: ConnectorState,
+    cfg: ConnectorConfig,
+    tenant_id: str,
+    reg: AppRegistration,
+    *,
+    reused: bool,
+) -> None:
+    """Record the connector's Entra app in state, with its ownership.
+
+    For a reused app, ownership is evaluated before the ids are overwritten,
+    so it compares against what an earlier pass recorded: an app found by
+    display name stays ours only if state already records it as ours.
+    """
+    cs.connector_type = cfg.type
+    cs.tenant_id = tenant_id
+    if reused:
+        _record_reused_resource(cs, state_mod.RESOURCE_APP, reg.object_id)
+    else:
+        cs.record_owned(state_mod.RESOURCE_APP)
+    cs.client_app_id = reg.app_id
+    cs.client_app_object_id = reg.object_id
+
+
 def _record_reused_resource(
     cs: ConnectorState, resource: str, found_id: str | None
 ) -> bool:
@@ -1752,19 +1881,46 @@ def _import_handoff(handoff_path: str, cs: ConnectorState, cfg: ConnectorConfig)
         # Source admin completed Stage 1; we have source-side details
         source = handoff.get("source", {})
         cs.tenant_id = source.get("tenant_id") or cs.tenant_id
-        cs.client_app_id = source.get("client_id") or cs.client_app_id
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_APP, "client_app_id", source.get("client_id")
+        )
         cs.connector_type = handoff.get("type") or cs.connector_type
         # Cert material would need to come from the file referenced in handoff
         print("  Imported handoff (direction: source -> AWS)")
     elif direction == DIRECTION_AWS_TO_SOURCE:
         aws = handoff.get("aws", {})
-        cs.knowledge_base_id = aws.get("knowledge_base_id") or cs.knowledge_base_id
-        cs.data_source_id = aws.get("data_source_id") or cs.data_source_id
-        cs.secret_arn = aws.get("secret_arn") or cs.secret_arn
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_KB, "knowledge_base_id",
+            aws.get("knowledge_base_id"),
+        )
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_DS, "data_source_id", aws.get("data_source_id")
+        )
+        _import_handoff_resource(
+            cs, state_mod.RESOURCE_SECRET, "secret_arn", aws.get("secret_arn")
+        )
         cs.region = aws.get("region") or cs.region
         print("  Imported handoff (direction: AWS -> source)")
     else:  # pragma: no cover - parse_handoff restricts direction to the two above
         raise ConfigError(f"Unsupported handoff direction {direction!r}.")
+
+
+def _import_handoff_resource(
+    cs: ConnectorState, resource: str, field_name: str, value: str | None
+) -> None:
+    """Copy one identifier from a handoff document into state, as external.
+
+    A handoff comes from another admin, so whatever it names was created by
+    someone else's run. Teardown treats a resource with no ownership record as
+    its own, so copying the id without a record would let it delete another
+    admin's knowledge base or force-delete their secret. An id state already
+    holds is left as recorded: importing the same value again is not evidence
+    that ownership changed.
+    """
+    if not value or getattr(cs, field_name) == value:
+        return
+    setattr(cs, field_name, value)
+    cs.record_external(resource)
 
 
 # --- S3 connector setup (no provider) ----------------------------------------
