@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from typing import TYPE_CHECKING
 
-from kb_connector.core.errors import ConnectorError
 
 if TYPE_CHECKING:
     # Annotation-only: core.monitor pulls in botocore, and this module is on the
@@ -58,11 +56,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the monitor subcommand."""
-    try:
-        return _run_monitor(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_monitor(args)
 
 
 def _run_monitor(args: argparse.Namespace) -> int:

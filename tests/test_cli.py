@@ -126,3 +126,35 @@ def test_diagnose_json_prints_only_json(monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "healthy"
     assert out["checks"][0]["name"] == "cert_expiry"
+
+
+# --- errors reach the top-level renderer ---------------------------------------
+
+
+def test_expired_token_from_a_command_gets_the_login_hint(monkeypatch, capsys):
+    from kb_connector import service
+    from kb_connector.cli.main import main
+    from kb_connector.core.errors import AwsError
+
+    def _expired(**kwargs):
+        raise AwsError("AWS error (ExpiredToken): token expired", code="ExpiredToken")
+
+    monkeypatch.setattr(service, "validate", _expired)
+    monkeypatch.setattr("sys.argv", ["kb-connector", "validate", "c1", "--profile", "dev"])
+    assert main() == 1
+    assert "aws sso login --profile dev" in capsys.readouterr().err
+
+
+def test_wait_timeout_is_both_a_connector_error_and_a_timeout(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from kb_connector.core.errors import ConnectorError, WaitTimeout
+    from kb_connector.core.knowledge_base import wait_until_ds_available
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    target = MagicMock()
+    target.get_data_source.return_value = {"dataSource": {"status": "CREATING"}}
+    with pytest.raises(WaitTimeout) as exc_info:
+        wait_until_ds_available(target, "KB", "DS", timeout_seconds=0)
+    assert isinstance(exc_info.value, ConnectorError)
+    assert isinstance(exc_info.value, TimeoutError)

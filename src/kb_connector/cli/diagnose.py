@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from typing import TYPE_CHECKING
 
-from kb_connector.core.errors import ConnectorError
 
 if TYPE_CHECKING:
     # Annotation-only: diagnostics pulls in botocore, and this module is on the
@@ -80,11 +78,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the diagnose subcommand."""
-    try:
-        return _run_diagnose(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_diagnose(args)
 
 
 def _run_diagnose(args: argparse.Namespace) -> int:

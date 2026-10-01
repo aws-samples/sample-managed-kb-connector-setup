@@ -192,11 +192,7 @@ def _target_choices() -> frozenset[str]:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the setup subcommand."""
-    try:
-        return _run_setup(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_setup(args)
 
 
 def _aws_session_and_account(cfg: ConnectorConfig) -> tuple[Any, str]:

@@ -10,7 +10,6 @@ import argparse
 import sys
 from typing import TYPE_CHECKING
 
-from kb_connector.core.errors import ConnectorError
 
 if TYPE_CHECKING:
     from kb_connector.service import TeardownEvent, TeardownPlan
@@ -71,11 +70,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the teardown subcommand."""
-    try:
-        return _run_teardown(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_teardown(args)
 
 
 def _run_teardown(args: argparse.Namespace) -> int:

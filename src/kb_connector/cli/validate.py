@@ -16,7 +16,6 @@ import argparse
 import sys
 
 from kb_connector import service
-from kb_connector.core.errors import ConnectorError
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -57,11 +56,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the validate subcommand."""
-    try:
-        return _run_validate(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_validate(args)
 
 
 def _run_validate(args: argparse.Namespace) -> int:

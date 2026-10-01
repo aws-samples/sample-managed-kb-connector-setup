@@ -8,9 +8,7 @@ Generate a portable handoff file for split-admin workflows:
 from __future__ import annotations
 
 import argparse
-import sys
 
-from kb_connector.core.errors import ConnectorError
 from kb_connector.core.fileio import atomic_write_json
 
 
@@ -37,11 +35,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the handoff subcommand."""
-    try:
-        return _run_handoff(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_handoff(args)
 
 
 def _run_handoff(args: argparse.Namespace) -> int:
