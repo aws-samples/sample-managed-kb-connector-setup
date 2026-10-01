@@ -323,9 +323,9 @@ source: Microsoft retired app-only tokens for the OneNote APIs on
 If a KB with the target name exists but state doesn't record it, setup
 will 409 on `CreateKnowledgeBase`. Setup has no logic that looks the KB
 up by name and reuses it. A KB setup created is recorded before the
-ACTIVE wait, so a timeout or failure there no longer causes this. What
-still does: the process being killed mid-run, a lost or deleted state
-file, or a KB created outside the tool under the same name.
+ACTIVE wait, so a timeout or failure there does not cause this. These
+do: the process being killed mid-run, a lost or deleted state file, or
+a KB created outside the tool under the same name.
 
 Workarounds while this is open:
 

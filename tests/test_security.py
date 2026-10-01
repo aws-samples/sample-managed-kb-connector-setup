@@ -868,8 +868,8 @@ def test_setup_refuses_a_squatted_app_before_any_graph_write(monkeypatch):
 # --- T-21: a resource is tracked from the moment it exists -------------------
 #
 # State is saved in setup's `finally`, which only helps if the id is already on
-# the in-memory state when the failure happens. These pin the two resources
-# whose ids used to be recorded only after later steps succeeded.
+# the in-memory state when the failure happens. These cover the app and the KB,
+# which have steps after their creation that can fail.
 
 
 def test_app_is_tracked_when_consent_fails(monkeypatch):

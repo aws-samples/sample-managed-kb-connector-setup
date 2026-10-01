@@ -404,7 +404,7 @@ def _run_region_case(monkeypatch, *, state_region, config_region, arg_region):
 
 
 def test_teardown_falls_back_to_the_config_region(monkeypatch):
-    """State without a region used to mean boto's default region."""
+    """State without a region falls back to config, not boto's default region."""
     sessions, deletes, err = _run_region_case(
         monkeypatch, state_region=None, config_region="eu-west-1", arg_region=None
     )
