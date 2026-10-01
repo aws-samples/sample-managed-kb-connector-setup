@@ -16,9 +16,14 @@ through small factory hooks the test suite can monkeypatch.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
-from kb_connector.core.config import ConnectorConfig, ToolConfig, load_config
+from kb_connector.context import (
+    SessionFactory as _SessionFactory,
+    TargetFactory as _TargetFactory,
+    resolve_context,
+)
+from kb_connector.core.config import load_config
 from kb_connector.core.diagnostics import (
     CheckResult,
     DiagnoseResult,
@@ -32,7 +37,7 @@ from kb_connector.core.diagnostics import (
 from kb_connector.core.errors import ConfigError, StateError
 from kb_connector.core.handoff import build_aws_to_source, build_source_to_aws
 from kb_connector.core.monitor import MonitorResult, poll_job, start_and_poll
-from kb_connector.core.state import ConnectorState, StateFile, load_state
+from kb_connector.core.state import StateFile, load_state
 
 
 # --- Result types added by the service layer ---------------------------------
@@ -80,96 +85,12 @@ class HandoffResult:
     document: dict
 
 
-# --- Factory hooks (overridable for tests) -----------------------------------
+# --- Factory types -----------------------------------------------------------
 
-
-def _default_session_factory(region: str | None, profile: str | None) -> Any:
-    """Build a boto3 Session. Imported lazily so tests don't pay for it."""
-    import boto3
-    return boto3.Session(region_name=region, profile_name=profile)
-
-
-def _default_target_factory(
-    *, session: Any, region: str, target: str | None = None
-) -> Any:
-    """Build the Target for a connector. Imported lazily so tests don't pay for it.
-
-    `target` is keyword-only with a default so existing callers that predate
-    multi-target support keep working and get the Bedrock managed KB.
-    """
-    from kb_connector.targets import get_target
-    return get_target(target, session=session, region=region)
-
-
-SessionFactory = Callable[[str | None, str | None], Any]
-TargetFactory = Callable[..., Any]
-
-
-def _resolve_target(cfg: Any, cs: Any) -> str | None:
-    """Pick the control plane for a connector, preferring config over state.
-
-    Config wins so editing `target` takes effect without clearing state, and
-    state is the fallback because a kb/ds pair passed directly on the command
-    line may not correspond to any configured connector. None means "let
-    get_target apply its default".
-    """
-    return (getattr(cfg, "target", None) if cfg else None) or (
-        getattr(cs, "target", None) if cs else None
-    )
-
-
-# --- Shared resolution helpers -----------------------------------------------
-
-
-def _resolve_connector_name(
-    config: ToolConfig,
-    connector_name: str | None,
-    *,
-    allow_direct: bool = False,
-    direct_ok: bool = False,
-) -> str:
-    """Resolve a connector name from the config (or auto-pick if there's only one).
-
-    `allow_direct=True` lets the caller use a synthetic '_direct' name when no
-    connectors are configured but they have provided overrides (kb/ds/region).
-    """
-    if connector_name:
-        return connector_name
-    names = config.connector_names()
-    if len(names) == 1:
-        return names[0]
-    if not names:
-        if allow_direct and direct_ok:
-            return "_direct"
-        raise ConfigError(
-            "No connectors configured. Run 'kb-connector init' or pass a connector name."
-        )
-    raise ConfigError(
-        f"Multiple connectors configured ({', '.join(names)}). Specify one."
-    )
-
-
-def _resolve_region_profile(
-    config: ToolConfig,
-    connector_name: str,
-    *,
-    region: str | None,
-    profile: str | None,
-) -> tuple[str, str | None, ConnectorConfig | None]:
-    """Pick region+profile (CLI override > connector cfg > defaults)."""
-    cfg: ConnectorConfig | None = None
-    if connector_name != "_direct" and connector_name in config.connector_names():
-        overrides: dict = {}
-        if region:
-            overrides["region"] = region
-        if profile:
-            overrides["profile"] = profile
-        cfg = config.resolve_connector(connector_name, cli_overrides=overrides)
-        region = region or cfg.region
-        profile = profile or cfg.profile
-    if not region:
-        raise ConfigError("No region available. Pass region or set it in config.")
-    return region, profile, cfg
+# Resolution lives in kb_connector.context. The factory types are re-exported
+# here because callers of this module annotate against them.
+SessionFactory = _SessionFactory
+TargetFactory = _TargetFactory
 
 
 # --- list --------------------------------------------------------------------
@@ -260,22 +181,17 @@ def diagnose(
     failed check. Document paths in the result are redacted unless
     `redact_logs=False`.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    name = _resolve_connector_name(
-        config, connector_name,
-        allow_direct=True, direct_ok=bool(kb_id and ds_id),
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        direct_ok=bool(kb_id and ds_id), session_factory=session_factory,
     )
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
-    )
-    cs = state_file.connectors.get(name) if name != "_direct" else None
+    region = ctx.require_region()
+    cfg, cs, name = ctx.cfg, ctx.cs, ctx.name
     credential = (cfg.credential if cfg else None) or "cert"
     connector_type = cfg.type if cfg else ((cs.connector_type if cs else None) or "sharepoint")
 
-    factory = session_factory or _default_session_factory
-    session = factory(region, profile)
+    session = ctx.session()
 
     checks: list[CheckResult] = []
 
@@ -345,17 +261,14 @@ def monitor(
     Defaults to *poll-only* (start=False) so an agent can't accidentally
     kick off ingestion. Pass start=True to begin a fresh job.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    name = _resolve_connector_name(
-        config, connector_name,
-        allow_direct=True, direct_ok=bool(kb_id and ds_id),
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        direct_ok=bool(kb_id and ds_id),
+        session_factory=session_factory, target_factory=target_factory,
     )
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
-    )
-    cs = state_file.connectors.get(name) if name != "_direct" else None
+    ctx.require_region()
+    cs = ctx.cs
 
     kb_id = kb_id or (cs.knowledge_base_id if cs else None)
     ds_id = ds_id or (cs.data_source_id if cs else None)
@@ -364,12 +277,7 @@ def monitor(
             "Need kb_id and ds_id, or run setup first to populate state."
         )
 
-    sess_factory = session_factory or _default_session_factory
-    tgt_factory = target_factory or _default_target_factory
-    session = sess_factory(region, profile)
-    target = tgt_factory(
-        session=session, region=region, target=_resolve_target(cfg, cs)
-    )
+    target = ctx.target()
 
     if start:
         return start_and_poll(
@@ -424,14 +332,12 @@ def validate(
     Test query and users come from the connector's [validation] config
     block by default; CLI/programmatic args override.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    name = _resolve_connector_name(config, connector_name)
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        session_factory=session_factory, target_factory=target_factory,
     )
-    cs = state_file.connectors.get(name)
+    cfg, cs, name = ctx.cfg, ctx.cs, ctx.name
 
     # Pull validation config from the connector. The block is optional — set it
     # once and `validate` becomes self-contained.
@@ -470,12 +376,8 @@ def validate(
     elif not target_kb:
         notes.append("Skipped retrieve: no kb_id available.")
     else:
-        sess_factory = session_factory or _default_session_factory
-        tgt_factory = target_factory or _default_target_factory
-        session = sess_factory(region, profile)
-        target = tgt_factory(
-            session=session, region=region, target=_resolve_target(cfg, cs)
-        )
+        ctx.require_region()
+        target = ctx.target()
 
         if acl_enabled:
             if authorized_user:
@@ -591,13 +493,10 @@ def handoff(
     `direction="aws"` produces source-to-aws (source admin -> AWS admin).
     `direction="source"` produces aws-to-source.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    cs: ConnectorState | None = state_file.connectors.get(connector_name)
-    cfg: ConnectorConfig | None = None
-    if connector_name in config.connector_names():
-        cfg = config.resolve_connector(connector_name)
+    ctx = resolve_context(
+        connector_name, config_path=config_path, state_path=state_path,
+    )
+    cs, cfg = ctx.cs, ctx.cfg
 
     if direction == "aws":
         document = build_source_to_aws(connector_name, cs, cfg)
