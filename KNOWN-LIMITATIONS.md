@@ -102,9 +102,11 @@ wired into config. Highlights:
 
 | Bedrock console label | API field | Status |
 |-----------------------|-----------|--------|
-| Advanced content indexing (visual content in documents, images) | `dataSource.vectorIngestionConfiguration.parsingConfiguration` (BEDROCK_FOUNDATION_MODEL strategy) | not exposed |
+| Image, audio and video extraction | `managedKnowledgeBaseConnectorConfiguration.mediaExtractionConfiguration` | through `overrides.create_data_source` |
 | Max file size (default 500 MB) | per-connector field on `dataEntityConfiguration` or filter | exposed for S3 and Web; missing for SharePoint, OneDrive, Confluence, Google Drive |
-| Document deletion safeguard | `dataSource.dataDeletionPolicy` (RETAIN vs DELETE) | not exposed; the service default is in effect |
+| Bulk-deletion safeguard during sync | `managedKnowledgeBaseConnectorConfiguration.deletionProtectionConfiguration` | through `overrides.create_data_source` |
+| Keep indexed content when the data source is deleted | `dataDeletionPolicy` (RETAIN vs DELETE) | through `overrides.create_data_source` |
+| Scheduled sync | `managedKnowledgeBaseConnectorConfiguration.syncSchedule` | not in botocore 1.43.32; needs a boto3 upgrade |
 
 Other gaps worth knowing about:
 
@@ -120,8 +122,8 @@ Other gaps worth knowing about:
 - **OneDrive** is missing `inclusionPatterns` / `exclusionPatterns` and
   the `modifiedDateBefore` / `modifiedDateAfter` since-date filters.
 - **Knowledge base** creation uses the service-default embedding model and
-  chunking strategy. There's no way to pick a specific embedder or override
-  chunk size, overlap, or chunking type yet.
+  chunking strategy. A custom embedding model can be set through
+  `overrides.create_knowledge_base`, but has not been validated end to end.
 - **Server-side encryption** (KMS key) on the data source is not exposed.
   `--kms-key-arn` covers the knowledge base, the connector secret, and the
   certificate bucket.
@@ -132,9 +134,12 @@ today is one of:
 
 - **Curated config field** for fields the builder surfaces (S3 prefix
   filters, Web crawl depth, SharePoint and OneDrive crawl toggles, etc.).
-- **`connector_params_overrides` table** for anything the builder doesn't
-  surface. The dict deep-merges onto the params the builder produced
-  before the data source is created. Validated end-to-end with a
+- **`overrides` table** for any field of the `CreateKnowledgeBase` or
+  `CreateDataSource` request. See
+  [Request overrides](README.md#request-overrides).
+- **`connector_params_overrides` table** for fields inside
+  `connectorParameters`. The dict deep-merges onto the params the builder
+  produced before the data source is created. Validated end-to-end with a
   SharePoint `filterConfiguration.modifiedDateBefore` override on a real
   knowledge base.
 
@@ -143,14 +148,14 @@ today is one of:
   modifiedDateBefore = "2025-01-01T00:00:00Z"
   ```
 
-The override path is intentionally unvalidated — anything the API accepts
-becomes available without code changes, and the tool doesn't pretend to
-verify fields it hasn't tested. The cost is that using it means knowing
-the API JSON shape; the curated fields are still where to look first.
+Fields outside `connectorParameters` are checked against the installed
+botocore model before setup makes any call. Fields inside it are not
+checked by the tool: anything the service accepts works without a code
+change. Using either path means knowing the API JSON shape; the curated
+fields are still where to look first.
 
-Curated fields for the most-requested knobs (visual content parsing, max
-file size, `dataDeletionPolicy`) are planned. The override path is the
-pressure-release valve in the meantime.
+Curated config keys for media extraction, deletion protection and
+`dataDeletionPolicy` are planned.
 
 ### Credential rotation isn't built
 
