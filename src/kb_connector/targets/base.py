@@ -32,8 +32,12 @@ class Target(ABC):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
+        overrides: dict[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Create a knowledge base; return the created KB object."""
+        """Create a knowledge base; return the created KB object.
+
+        `overrides` deep-merges into the request body (core.overrides).
+        """
         ...
 
     @abstractmethod

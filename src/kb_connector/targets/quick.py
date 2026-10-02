@@ -39,6 +39,7 @@ class QuickTarget(Target):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
+        overrides: dict[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         raise NotImplementedError(_NOT_AVAILABLE)
 

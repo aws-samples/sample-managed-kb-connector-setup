@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
 
 from kb_connector.core import knowledge_base as kb
 from kb_connector.core.errors import aws_error_from
+from kb_connector.core.overrides import deep_merge
 from kb_connector.targets.base import Target
 
 _P = ParamSpec("_P")
@@ -98,6 +99,7 @@ class BmkbTarget(Target):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
+        overrides: dict[str, Any] | None = None,
     ) -> CreateKnowledgeBaseResponseTypeDef:
         payload = kb.build_knowledge_base_payload(
             name=name,
@@ -105,6 +107,8 @@ class BmkbTarget(Target):
             embedding_model_arn=embedding_model_arn,
             kms_key_arn=kms_key_arn,
         )
+        if overrides:
+            payload = deep_merge(payload, overrides)
         return self._client.create_knowledge_base(**payload)
 
     @_as_aws_error

@@ -531,12 +531,12 @@ def test_ingestion_stats_warning_at_threshold():
 
 
 
-# --- Deep-merge for connector_params_overrides --------------------------------
+# --- Deep-merge for request overrides ------------------------------------------
 
 
 def test_deep_merge_adds_new_top_level_key():
     """A top-level override key absent from base is added intact."""
-    from kb_connector.cli.setup import _deep_merge
+    from kb_connector.core.overrides import deep_merge as _deep_merge
     base = {"type": "SHAREPOINT", "version": "1"}
     out = _deep_merge(base, {"filterConfiguration": {"modifiedDateBefore": "2026-01-01T00:00:00Z"}})
     assert out["filterConfiguration"] == {"modifiedDateBefore": "2026-01-01T00:00:00Z"}
@@ -547,7 +547,7 @@ def test_deep_merge_adds_new_top_level_key():
 
 def test_deep_merge_recurses_into_nested_dicts():
     """Overrides on nested keys merge with the base, not replace it."""
-    from kb_connector.cli.setup import _deep_merge
+    from kb_connector.core.overrides import deep_merge as _deep_merge
     base = {
         "dataEntityConfiguration": {
             "crawlFiles": True,
@@ -564,7 +564,7 @@ def test_deep_merge_recurses_into_nested_dicts():
 
 def test_deep_merge_lists_replace_not_concatenate():
     """List values replace; concatenation rarely matches user intent."""
-    from kb_connector.cli.setup import _deep_merge
+    from kb_connector.core.overrides import deep_merge as _deep_merge
     base = {"siteUrls": ["https://a.example.com"]}
     out = _deep_merge(base, {"siteUrls": ["https://b.example.com"]})
     assert out["siteUrls"] == ["https://b.example.com"]
@@ -572,7 +572,7 @@ def test_deep_merge_lists_replace_not_concatenate():
 
 def test_deep_merge_overrides_leaf_value():
     """Scalar overrides replace the base value."""
-    from kb_connector.cli.setup import _deep_merge
+    from kb_connector.core.overrides import deep_merge as _deep_merge
     base = {"aclEnabled": False}
     out = _deep_merge(base, {"aclEnabled": True})
     assert out["aclEnabled"] is True
