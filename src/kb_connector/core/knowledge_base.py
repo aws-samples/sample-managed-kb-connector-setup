@@ -27,6 +27,7 @@ def build_knowledge_base_payload(
     role_arn: str,
     embedding_model_arn: str | None = None,
     kms_key_arn: str | None = None,
+    tags: dict[str, str] | None = None,
 ) -> dict:
     """CreateKnowledgeBase body for a MANAGED knowledge base.
 
@@ -34,14 +35,15 @@ def build_knowledge_base_payload(
     (managed embedding). A customer-managed kms_key_arn encrypts the knowledge
     base through managedKnowledgeBaseConfiguration.
     serverSideEncryptionConfiguration; CreateKnowledgeBase has no top-level
-    key field, so this is the only place it belongs.
+    key field, so this is the only place it belongs. `tags` is sent as the
+    request's tag map when given.
     """
     config: dict = {}
     if embedding_model_arn:
         config["embeddingModelArn"] = embedding_model_arn
     if kms_key_arn:
         config["serverSideEncryptionConfiguration"] = {"kmsKeyArn": kms_key_arn}
-    return {
+    payload: dict = {
         "name": name,
         "roleArn": role_arn,
         "knowledgeBaseConfiguration": {
@@ -49,6 +51,9 @@ def build_knowledge_base_payload(
             "managedKnowledgeBaseConfiguration": config,
         },
     }
+    if tags:
+        payload["tags"] = dict(tags)
+    return payload
 
 
 def build_data_source_payload(

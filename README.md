@@ -261,7 +261,8 @@ then `~/.config/kb-connector/config.toml` for user-global defaults.
 ### Your own tags, and sharing an account
 
 Every resource the tool creates carries `ManagedBy=kb-connector` and
-`KbConnectorName=<connector>`. That's how a later run knows whether it created
+`KbConnectorName=<connector>`, except data sources, which the API does not
+tag. That's how a later run knows whether it created
 the role or secret it's about to modify, and how `teardown` knows what is safe
 to delete.
 

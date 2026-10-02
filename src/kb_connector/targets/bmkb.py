@@ -99,6 +99,7 @@ class BmkbTarget(Target):
         role_arn: str,
         embedding_model_arn: str | None = None,
         kms_key_arn: str | None = None,
+        tags: dict[str, str] | None = None,
         overrides: dict[str, Any] | None = None,
     ) -> CreateKnowledgeBaseResponseTypeDef:
         payload = kb.build_knowledge_base_payload(
@@ -106,6 +107,7 @@ class BmkbTarget(Target):
             role_arn=role_arn,
             embedding_model_arn=embedding_model_arn,
             kms_key_arn=kms_key_arn,
+            tags=tags,
         )
         if overrides:
             payload = deep_merge(payload, overrides)

@@ -205,3 +205,84 @@ def test_setup_rejects_a_bad_override_before_any_work(tmp_path, monkeypatch, cap
     monkeypatch.setattr("sys.argv", ["kb-connector", "setup", "c"])
     assert main() == 1
     assert "mediaExtractionConfig" in capsys.readouterr().err
+
+
+# --- knowledge base tags -------------------------------------------------------------
+
+
+def _create_kb(*, cfg_tags=None, overrides=None, no_tags=False, side_effect=None):
+    from kb_connector.cli.setup import _create_knowledge_base
+
+    target = MagicMock()
+    target.create_knowledge_base.side_effect = side_effect
+    args = argparse.Namespace(kms_key_arn=None, no_tags=no_tags)
+    cfg = ConnectorConfig(name="c", type="s3", region="us-west-2", tags=cfg_tags or {})
+    _create_knowledge_base(
+        target, args, cfg, "c", name="kb", role_arn="arn:aws:iam::111122223333:role/r",
+        overrides=overrides or {},
+    )
+    return target
+
+
+def test_kb_carries_ownership_and_operator_tags():
+    target = _create_kb(cfg_tags={"CostCenter": "1234"})
+    assert target.create_knowledge_base.call_args.kwargs["tags"] == {
+        "CostCenter": "1234", "ManagedBy": "kb-connector", "KbConnectorName": "c",
+    }
+
+
+def test_no_tags_sends_no_tool_tags():
+    target = _create_kb(cfg_tags={"CostCenter": "1234"}, no_tags=True)
+    assert target.create_knowledge_base.call_args.kwargs["tags"] is None
+
+
+def test_tag_permission_denied_retries_untagged(capsys):
+    from kb_connector.core.errors import AwsError
+
+    denied = AwsError(
+        "AWS error (AccessDeniedException): User is not authorized to perform: "
+        "bedrock:TagResource",
+        code="AccessDeniedException",
+    )
+    target = _create_kb(
+        overrides={"description": "d", "tags": {"Team": "x"}},
+        side_effect=[denied, {"knowledgeBase": {"knowledgeBaseId": "KB1"}}],
+    )
+    first, second = target.create_knowledge_base.call_args_list
+    assert first.kwargs["tags"]["ManagedBy"] == "kb-connector"
+    assert second.kwargs["tags"] is None
+    assert second.kwargs["overrides"] == {"description": "d"}
+    assert "bedrock:TagResource denied" in capsys.readouterr().err
+
+
+def test_other_create_errors_are_not_retried():
+    from kb_connector.core.errors import AwsError
+
+    with pytest.raises(AwsError, match="ValidationException"):
+        _create_kb(side_effect=AwsError("AWS error (ValidationException): bad", code="x"))
+
+
+def test_bmkb_sends_tags_with_override_tags_merged():
+    from kb_connector.targets.bmkb import BmkbTarget
+
+    client = MagicMock()
+    session = MagicMock()
+    session.client.return_value = client
+    BmkbTarget(session=session, region="us-west-2").create_knowledge_base(
+        name="kb", role_arn="arn:aws:iam::111122223333:role/r",
+        tags={"ManagedBy": "kb-connector", "KbConnectorName": "c"},
+        overrides={"tags": {"Team": "x"}},
+    )
+    assert client.create_knowledge_base.call_args.kwargs["tags"] == {
+        "ManagedBy": "kb-connector", "KbConnectorName": "c", "Team": "x",
+    }
+
+
+def test_tagged_kb_payload_matches_the_model():
+    from kb_connector.core.knowledge_base import build_knowledge_base_payload
+
+    payload = build_knowledge_base_payload(
+        name="kb", role_arn="arn:aws:iam::111122223333:role/r",
+        tags={"ManagedBy": "kb-connector"},
+    )
+    assert o._validate("CreateKnowledgeBase", payload) is None

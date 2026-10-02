@@ -640,10 +640,9 @@ def _provision_kb_and_ds(
                 "No KB role available. Provide --kb-role-arn or let the tool create one."
             )
         kb_name = args.kb_name or f"kb-connector-{connector_name}"
-        created = target.create_knowledge_base(
-            name=kb_name,
-            role_arn=kb_role_arn,
-            kms_key_arn=getattr(args, "kms_key_arn", None) or cfg.kms_key_arn,
+        created = _create_knowledge_base(
+            target, args, cfg, connector_name,
+            name=kb_name, role_arn=kb_role_arn,
             overrides=overrides.create_knowledge_base,
         )
         kb_obj = created.get("knowledgeBase", created)
@@ -718,6 +717,53 @@ def _provision_kb_and_ds(
     print("  Waiting for data source to become AVAILABLE...")
     target.wait_until_ds_available(kb_id, ds_id)
     print("  Data source is AVAILABLE")
+
+
+def _create_knowledge_base(
+    target: Target,
+    args: argparse.Namespace,
+    cfg: ConnectorConfig,
+    connector_name: str,
+    *,
+    name: str,
+    role_arn: str,
+    overrides: dict,
+) -> Any:
+    """Create the knowledge base with the ownership and operator tags.
+
+    Tagging on create needs bedrock:TagResource. If that is denied, the KB
+    is created untagged with a warning, as the role and secret are. Tags from
+    `overrides.create_knowledge_base` are dropped on that retry too.
+    `--no-tags` sends no tool tags at all.
+    """
+    from kb_connector.core.tagging import (
+        build_tag_dict,
+        is_tagging_access_error,
+        validate_extra_tags,
+    )
+
+    kms_key_arn = getattr(args, "kms_key_arn", None) or cfg.kms_key_arn
+    tags = None
+    if not getattr(args, "no_tags", False):
+        tags = build_tag_dict(connector_name, validate_extra_tags(cfg.tags))
+    try:
+        return target.create_knowledge_base(
+            name=name, role_arn=role_arn, kms_key_arn=kms_key_arn,
+            tags=tags, overrides=overrides,
+        )
+    except AwsError as exc:
+        if not (tags or overrides.get("tags")) or not is_tagging_access_error(exc):
+            raise
+        print(
+            f"  WARNING: created knowledge base without tags "
+            f"(bedrock:TagResource denied): {exc}",
+            file=sys.stderr,
+        )
+        untagged = {k: v for k, v in overrides.items() if k != "tags"}
+        return target.create_knowledge_base(
+            name=name, role_arn=role_arn, kms_key_arn=kms_key_arn,
+            tags=None, overrides=untagged,
+        )
 
 
 # Data source statuses from which there is no forward path: recreate instead of

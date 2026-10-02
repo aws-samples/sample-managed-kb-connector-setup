@@ -138,7 +138,7 @@ The permissions below are the full set across every subcommand. `diagnose`,
 | Service | Actions | Used by |
 |---|---|---|
 | STS | `GetCallerIdentity` | all |
-| Bedrock Agent | `CreateKnowledgeBase`, `GetKnowledgeBase`, `DeleteKnowledgeBase`, `CreateDataSource`, `GetDataSource`, `DeleteDataSource`, `StartIngestionJob`, `GetIngestionJob`, `ListIngestionJobs`, `StopIngestionJob`, `Retrieve` | setup, monitor, validate, teardown |
+| Bedrock Agent | `CreateKnowledgeBase`, `TagResource`, `GetKnowledgeBase`, `DeleteKnowledgeBase`, `CreateDataSource`, `GetDataSource`, `DeleteDataSource`, `StartIngestionJob`, `GetIngestionJob`, `ListIngestionJobs`, `StopIngestionJob`, `Retrieve` | setup, monitor, validate, teardown |
 | IAM | `GetRole`, `CreateRole`, `TagRole`, `ListRoleTags`, `UpdateAssumeRolePolicy`, `PutRolePolicy`, `GetRolePolicy`, `ListRolePolicies`, `ListAttachedRolePolicies`, `DeleteRolePolicy`, `DeleteRole`, `PassRole` | setup, teardown |
 | Secrets Manager | `CreateSecret`, `UpdateSecret`, `DescribeSecret`, `TagResource`, `GetSecretValue`, `DeleteSecret` | setup, diagnose, teardown |
 | S3 (cert mode) | `CreateBucket`, `ListBucket`, `GetBucketTagging`, `PutBucketTagging`, `PutBucketPublicAccessBlock`, `PutBucketEncryption`, `PutObject`, `PutObjectTagging`, `DeleteObject` | setup, teardown |
@@ -149,7 +149,8 @@ The permissions below are the full set across every subcommand. `diagnose`,
 Three of these are worth explaining, because a narrower policy fails in
 confusing ways:
 
-- **`iam:TagRole` / `secretsmanager:TagResource`.** Ownership tags are how the
+- **`iam:TagRole` / `secretsmanager:TagResource` / `bedrock:TagResource`.**
+  Ownership tags are how the
   tool proves it created a resource before modifying it, and how `teardown`
   decides what is safe to delete. Without these the tool still works — it
   creates resources untagged, warns, and records them in state so later runs
@@ -188,6 +189,7 @@ operator shouldn't run `teardown`.
       "Effect": "Allow",
       "Action": [
         "bedrock:CreateKnowledgeBase",
+        "bedrock:TagResource",
         "bedrock:GetKnowledgeBase",
         "bedrock:DeleteKnowledgeBase",
         "bedrock:CreateDataSource",

@@ -22,17 +22,18 @@ delivers elsewhere, pass `--log-group`. When the group is absent the check
 reports that rather than failing, since a missing group means "logging isn't set
 up", not "the connector is broken".
 
-### Ownership tagging needs two extra caller permissions
+### Ownership tagging needs three extra caller permissions
 
 Resources the tool creates are tagged `ManagedBy=kb-connector` and
 `KbConnectorName=<connector>`, which is what lets it prove ownership before
 modifying something that already exists and lets `teardown` tell created
 resources from adopted ones.
 
-`iam:CreateRole` with `Tags` also requires `iam:TagRole`, and
+`iam:CreateRole` with `Tags` also requires `iam:TagRole`,
 `secretsmanager:CreateSecret` with `Tags` requires
-`secretsmanager:TagResource`. If the caller lacks either, setup still succeeds —
-it retries untagged and warns. The state file records that the resource was
+`secretsmanager:TagResource`, and `bedrock:CreateKnowledgeBase` with `tags`
+requires `bedrock:TagResource`. If the caller lacks any of them, setup still
+succeeds — it retries untagged and warns. Data sources take no tags. The state file records that the resource was
 created without a tag, so a later run still recognizes it as the tool's own and
 reuses it rather than refusing. The same applies to `--no-tags`.
 
