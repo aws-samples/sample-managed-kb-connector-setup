@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from kb_connector.core.errors import AwsError
+from kb_connector.core.errors import AwsError, WaitTimeout
 
 
 # --- Payload builders --------------------------------------------------------
@@ -109,7 +109,7 @@ def wait_until_kb_active(
                 + (f": {reasons}" if reasons else "")
             )
         time.sleep(poll_interval_seconds)  # nosemgrep: arbitrary-sleep -- polling backoff
-    raise TimeoutError(
+    raise WaitTimeout(
         f"Knowledge base {kb_id} did not reach ACTIVE within "
         f"{timeout_seconds}s (last status {last_status or 'UNKNOWN'})."
     )
@@ -145,7 +145,7 @@ def wait_until_ds_available(
                 + (f": {reasons}" if reasons else "")
             )
         time.sleep(poll_interval_seconds)  # nosemgrep: arbitrary-sleep -- polling backoff
-    raise TimeoutError(
+    raise WaitTimeout(
         f"Data source {ds_id} did not reach AVAILABLE within "
         f"{timeout_seconds}s (last status {last_status or 'UNKNOWN'})."
     )

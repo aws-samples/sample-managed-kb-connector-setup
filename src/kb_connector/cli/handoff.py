@@ -8,13 +8,8 @@ Generate a portable handoff file for split-admin workflows:
 from __future__ import annotations
 
 import argparse
-import sys
 
-from kb_connector.core.config import load_config
-from kb_connector.core.errors import ConnectorError
 from kb_connector.core.fileio import atomic_write_json
-from kb_connector.core.handoff import build_aws_to_source, build_source_to_aws
-from kb_connector.core.state import load_state
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -40,30 +35,19 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the handoff subcommand."""
-    try:
-        return _run_handoff(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_handoff(args)
 
 
 def _run_handoff(args: argparse.Namespace) -> int:
-    config = load_config(getattr(args, "config", None))
-    state_file = load_state()
+    from kb_connector import service
 
     connector_name = args.connector
-    cs = state_file.get(connector_name)
-
-    # Resolve config (may be absent if user is operating outside their config)
-    cfg = None
-    if connector_name in config.connector_names():
-        cfg = config.resolve_connector(connector_name)
-
     direction = args.to
-    if direction == "aws":
-        handoff = build_source_to_aws(connector_name, cs, cfg)
-    else:
-        handoff = build_aws_to_source(connector_name, cs, cfg)
+    handoff = service.handoff(
+        connector_name=connector_name,
+        direction=direction,
+        config_path=getattr(args, "config", None),
+    ).document
 
     # Write output with owner-only permissions. The document holds no secret
     # values, but it does hold the tenant id, application id, and

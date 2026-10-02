@@ -69,6 +69,7 @@ def start_and_poll(
     poll_interval_seconds: int = 10,
     timeout_seconds: int = 1800,
     on_job_started: Callable[[str], None] | None = None,
+    on_poll: Callable[[IngestionStats], None] | None = None,
 ) -> MonitorResult:
     """Start an ingestion job and poll to terminal state.
 
@@ -86,6 +87,7 @@ def start_and_poll(
         target, kb_id=kb_id, ds_id=ds_id, job_id=job_id,
         poll_interval_seconds=poll_interval_seconds,
         timeout_seconds=timeout_seconds,
+        on_poll=on_poll,
     )
 
 
@@ -97,8 +99,13 @@ def poll_job(
     job_id: str,
     poll_interval_seconds: int = 10,
     timeout_seconds: int = 1800,
+    on_poll: Callable[[IngestionStats], None] | None = None,
 ) -> MonitorResult:
-    """Poll an existing ingestion job to terminal state."""
+    """Poll an existing ingestion job to terminal state.
+
+    `on_poll`, if supplied, receives the job's stats after every poll that has
+    not reached a terminal state.
+    """
     deadline = time.time() + timeout_seconds
     last_job: dict = {}
     while time.time() < deadline:
@@ -106,6 +113,8 @@ def poll_job(
         job = resp.get("ingestionJob", resp)
         status = (job.get("status") or "").upper()
         last_job = job
+        if status not in _TERMINAL and on_poll is not None:
+            on_poll(_parse_stats(job))
         if status in _TERMINAL:
             return MonitorResult(
                 job_id=job_id,

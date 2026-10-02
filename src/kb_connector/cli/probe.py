@@ -11,7 +11,6 @@ high-level commands (setup, diagnose) cover the common cases.
 from __future__ import annotations
 
 import argparse
-import sys
 
 from kb_connector.core.errors import ConnectorError
 
@@ -58,11 +57,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the probe subcommand."""
-    try:
-        return _run_probe(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_probe(args)
 
 
 def _run_probe(args: argparse.Namespace) -> int:

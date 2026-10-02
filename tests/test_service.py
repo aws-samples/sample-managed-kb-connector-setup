@@ -485,3 +485,134 @@ def test_diagnose_multiple_connectors_requires_choice(project_paths):
     # The fixture has two connectors and we don't pass a name.
     with pytest.raises(ConfigError, match="Multiple connectors"):
         service.diagnose(**project_paths)
+
+
+# --- monitor: job id persistence and progress ----------------------------------
+
+
+def _jobs_target(statuses: list[str]) -> MagicMock:
+    """A target that starts JOB-NEW and reports the given statuses in order."""
+    target = MagicMock()
+    target.start_ingestion_job.return_value = {"ingestionJob": {"ingestionJobId": "JOB-NEW"}}
+    target.get_ingestion_job.side_effect = [
+        {"ingestionJob": {"status": s, "statistics": {"numberOfDocumentsScanned": i}}}
+        for i, s in enumerate(statuses)
+    ]
+    return target
+
+
+def _saved_job_id(project_paths) -> str | None:
+    data = json.loads(Path(project_paths["state_path"]).read_text())
+    return data["connectors"]["engineering-sp"].get("last_ingestion_job_id")
+
+
+def test_monitor_start_records_job_id_before_polling(project_paths, monkeypatch):
+    """A poll loop that dies must not lose the job: the id is saved first."""
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    seen_at_first_poll: list = []
+    target = _jobs_target(["IN_PROGRESS", "COMPLETE"])
+
+    def _on_poll(stats):
+        seen_at_first_poll.append(_saved_job_id(project_paths))
+
+    result = service.monitor(
+        connector_name="engineering-sp", start=True,
+        session_factory=lambda r, p: MagicMock(), target_factory=lambda **_: target,
+        on_poll=_on_poll, **project_paths,
+    )
+    assert result.job_id == "JOB-NEW"
+    assert seen_at_first_poll == ["JOB-NEW"]
+    assert _saved_job_id(project_paths) == "JOB-NEW"
+
+
+def test_monitor_reports_progress_only_for_running_polls(project_paths, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    statuses: list[str] = []
+    started: list[str] = []
+    service.monitor(
+        connector_name="engineering-sp", start=True,
+        session_factory=lambda r, p: MagicMock(),
+        target_factory=lambda **_: _jobs_target(["STARTING", "IN_PROGRESS", "COMPLETE"]),
+        on_job_started=started.append,
+        on_poll=lambda stats: statuses.append(stats.status),
+        **project_paths,
+    )
+    assert started == ["JOB-NEW"]
+    assert statuses == ["STARTING", "IN_PROGRESS"]
+
+
+def test_monitor_direct_run_writes_no_state(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    state_path = tmp_path / "state.json"
+    result = service.monitor(
+        kb_id="KB1", ds_id="DS1", region="us-west-2", start=True,
+        state_path=str(state_path),
+        session_factory=lambda r, p: MagicMock(),
+        target_factory=lambda **_: _jobs_target(["COMPLETE"]),
+    )
+    assert result.job_id == "JOB-NEW"
+    assert not state_path.exists()
+
+
+# --- diagnose: directory check and streaming -----------------------------------
+
+
+def _with_app_in_state(project_paths, thumbprint="TP-OURS"):
+    state = Path(project_paths["state_path"])
+    data = json.loads(state.read_text())
+    data["connectors"]["engineering-sp"].update(
+        client_app_object_id="obj-1", cert_thumbprint_b64url=thumbprint,
+    )
+    state.write_text(json.dumps(data))
+
+
+def _healthy_aws_factory():
+    sm = MagicMock()
+    sm.get_secret_value.return_value = {
+        "SecretString": json.dumps({"clientId": "app-12345", "certificatePassword": "x"})
+    }
+    ct = MagicMock()
+    ct.lookup_events.return_value = {"Events": []}
+    return _stub_session_factory(secretsmanager=sm, cloudtrail=ct)
+
+
+@pytest.mark.parametrize("installed,passed", [
+    (["TP-OURS"], True),
+    (["TP-SOMEONE-ELSE"], False),
+    (None, True),  # Graph unreachable: unverified, not failing
+])
+def test_diagnose_directory_check(project_paths, installed, passed):
+    _with_app_in_state(project_paths)
+    result = service.diagnose(
+        connector_name="engineering-sp", check_directory=True,
+        session_factory=_healthy_aws_factory(),
+        thumbprint_reader=lambda cs: installed,
+        **project_paths,
+    )
+    check = next(c for c in result.checks if c.name == "certificate_installed")
+    assert check.passed is passed
+
+
+def test_diagnose_directory_check_is_opt_in(project_paths):
+    _with_app_in_state(project_paths)
+    calls: list = []
+    result = service.diagnose(
+        connector_name="engineering-sp",
+        session_factory=_healthy_aws_factory(),
+        thumbprint_reader=lambda cs: calls.append(cs) or [],
+        **project_paths,
+    )
+    assert calls == []
+    assert "certificate_installed" not in {c.name for c in result.checks}
+
+
+def test_diagnose_streams_each_check_in_order(project_paths):
+    seen: list[str] = []
+    result = service.diagnose(
+        connector_name="engineering-sp",
+        session_factory=_healthy_aws_factory(),
+        on_check=lambda c: seen.append(c.name),
+        **project_paths,
+    )
+    assert seen == [c.name for c in result.checks]

@@ -164,3 +164,19 @@ def test_handoff_tool_reports_a_bad_direction_without_raising(tmp_path: Path):
     assert structured is not None, f"could not extract result from {result!r}"
     assert structured["error_type"] == "ConfigError"
     assert "upload" in structured["error"]
+
+
+def test_validate_tool_defers_the_query_to_config(monkeypatch):
+    """Without a query argument, the [validation] query from config applies."""
+    from kb_connector import service
+
+    seen: dict = {}
+
+    def _fake_validate(**kwargs):
+        seen.update(kwargs)
+        return service.ValidateResult(connector="eng", healthy=True)
+
+    monkeypatch.setattr(service, "validate", _fake_validate)
+    server = _build_server()
+    asyncio.run(server.call_tool("kb_connector_validate", {"connector_name": "eng"}))
+    assert seen["query"] is None

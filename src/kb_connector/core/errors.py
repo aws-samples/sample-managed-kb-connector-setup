@@ -79,6 +79,13 @@ class GraphError(ConnectorError):
         self.body = body
 
 
+class WaitTimeout(ConnectorError, TimeoutError):
+    """A resource did not reach the expected status within the wait budget.
+
+    Also a TimeoutError, so callers catching that keep working.
+    """
+
+
 class ProviderError(ConnectorError):
     """A source-side identity provider operation failed (Entra, Google, etc.)."""
 

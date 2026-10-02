@@ -15,15 +15,22 @@ through small factory hooks the test suite can monkeypatch.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
-from kb_connector.core.config import ConnectorConfig, ToolConfig, load_config
+from kb_connector.context import (
+    SessionFactory as _SessionFactory,
+    TargetFactory as _TargetFactory,
+    resolve_context,
+)
+from kb_connector.core.config import load_config
 from kb_connector.core.diagnostics import (
     CheckResult,
     DiagnoseResult,
     build_diagnose_result,
     check_cert_expiry,
+    check_certificate_installed,
     check_cloudtrail_permissions,
     check_ingestion_logs,
     check_secret_validity,
@@ -31,8 +38,13 @@ from kb_connector.core.diagnostics import (
 )
 from kb_connector.core.errors import ConfigError, StateError
 from kb_connector.core.handoff import build_aws_to_source, build_source_to_aws
-from kb_connector.core.monitor import MonitorResult, poll_job, start_and_poll
-from kb_connector.core.state import ConnectorState, StateFile, load_state
+from kb_connector.core.monitor import (
+    IngestionStats,
+    MonitorResult,
+    poll_job,
+    start_and_poll,
+)
+from kb_connector.core.state import StateFile, load_state
 
 
 # --- Result types added by the service layer ---------------------------------
@@ -80,96 +92,12 @@ class HandoffResult:
     document: dict
 
 
-# --- Factory hooks (overridable for tests) -----------------------------------
+# --- Factory types -----------------------------------------------------------
 
-
-def _default_session_factory(region: str | None, profile: str | None) -> Any:
-    """Build a boto3 Session. Imported lazily so tests don't pay for it."""
-    import boto3
-    return boto3.Session(region_name=region, profile_name=profile)
-
-
-def _default_target_factory(
-    *, session: Any, region: str, target: str | None = None
-) -> Any:
-    """Build the Target for a connector. Imported lazily so tests don't pay for it.
-
-    `target` is keyword-only with a default so existing callers that predate
-    multi-target support keep working and get the Bedrock managed KB.
-    """
-    from kb_connector.targets import get_target
-    return get_target(target, session=session, region=region)
-
-
-SessionFactory = Callable[[str | None, str | None], Any]
-TargetFactory = Callable[..., Any]
-
-
-def _resolve_target(cfg: Any, cs: Any) -> str | None:
-    """Pick the control plane for a connector, preferring config over state.
-
-    Config wins so editing `target` takes effect without clearing state, and
-    state is the fallback because a kb/ds pair passed directly on the command
-    line may not correspond to any configured connector. None means "let
-    get_target apply its default".
-    """
-    return (getattr(cfg, "target", None) if cfg else None) or (
-        getattr(cs, "target", None) if cs else None
-    )
-
-
-# --- Shared resolution helpers -----------------------------------------------
-
-
-def _resolve_connector_name(
-    config: ToolConfig,
-    connector_name: str | None,
-    *,
-    allow_direct: bool = False,
-    direct_ok: bool = False,
-) -> str:
-    """Resolve a connector name from the config (or auto-pick if there's only one).
-
-    `allow_direct=True` lets the caller use a synthetic '_direct' name when no
-    connectors are configured but they have provided overrides (kb/ds/region).
-    """
-    if connector_name:
-        return connector_name
-    names = config.connector_names()
-    if len(names) == 1:
-        return names[0]
-    if not names:
-        if allow_direct and direct_ok:
-            return "_direct"
-        raise ConfigError(
-            "No connectors configured. Run 'kb-connector init' or pass a connector name."
-        )
-    raise ConfigError(
-        f"Multiple connectors configured ({', '.join(names)}). Specify one."
-    )
-
-
-def _resolve_region_profile(
-    config: ToolConfig,
-    connector_name: str,
-    *,
-    region: str | None,
-    profile: str | None,
-) -> tuple[str, str | None, ConnectorConfig | None]:
-    """Pick region+profile (CLI override > connector cfg > defaults)."""
-    cfg: ConnectorConfig | None = None
-    if connector_name != "_direct" and connector_name in config.connector_names():
-        overrides: dict = {}
-        if region:
-            overrides["region"] = region
-        if profile:
-            overrides["profile"] = profile
-        cfg = config.resolve_connector(connector_name, cli_overrides=overrides)
-        region = region or cfg.region
-        profile = profile or cfg.profile
-    if not region:
-        raise ConfigError("No region available. Pass region or set it in config.")
-    return region, profile, cfg
+# Resolution lives in kb_connector.context. The factory types are re-exported
+# here because callers of this module annotate against them.
+SessionFactory = _SessionFactory
+TargetFactory = _TargetFactory
 
 
 # --- list --------------------------------------------------------------------
@@ -245,9 +173,14 @@ def diagnose(
     include_logs: bool = False,
     log_group_name: str | None = None,
     redact_logs: bool = True,
+    check_directory: bool = False,
+    graph_auth_method: str = "az",
+    device_client_id: str | None = None,
     config_path: str | None = None,
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
+    thumbprint_reader: Callable[[Any], list[str] | None] | None = None,
+    on_check: Callable[[CheckResult], None] | None = None,
 ) -> DiagnoseResult:
     """Run the diagnostic checks and return a structured result.
 
@@ -259,29 +192,34 @@ def diagnose(
     base plus logs:FilterLogEvents, so for most callers it would just add a
     failed check. Document paths in the result are redacted unless
     `redact_logs=False`.
-    """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
 
-    name = _resolve_connector_name(
-        config, connector_name,
-        allow_direct=True, direct_ok=bool(kb_id and ds_id),
+    `check_directory` adds a Microsoft Graph lookup confirming the app still
+    carries the certificate this connector authenticates with. Without Graph
+    access that check reports as unverified. `on_check` receives each result as
+    it completes.
+    """
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        direct_ok=bool(kb_id and ds_id), session_factory=session_factory,
     )
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
-    )
-    cs = state_file.connectors.get(name) if name != "_direct" else None
+    region = ctx.require_region()
+    cfg, cs, name = ctx.cfg, ctx.cs, ctx.name
     credential = (cfg.credential if cfg else None) or "cert"
     connector_type = cfg.type if cfg else ((cs.connector_type if cs else None) or "sharepoint")
 
-    factory = session_factory or _default_session_factory
-    session = factory(region, profile)
+    session = ctx.session()
 
     checks: list[CheckResult] = []
 
+    def _add(check: CheckResult) -> None:
+        checks.append(check)
+        if on_check is not None:
+            on_check(check)
+
     secret_arn = cs.secret_arn if cs else None
     if secret_arn:
-        checks.append(check_secret_validity(
+        _add(check_secret_validity(
             session=session,
             secret_arn=secret_arn,
             connector_type=connector_type,
@@ -290,10 +228,23 @@ def diagnose(
 
     cert_not_after = cs.cert_not_after if cs else None
     if cert_not_after or credential == "cert":
-        checks.append(check_cert_expiry(cert_not_after=cert_not_after))
+        _add(check_cert_expiry(cert_not_after=cert_not_after))
+
+    # Expiry comes from state, so it cannot tell whether the directory still
+    # carries the certificate. This asks the directory.
+    if check_directory and credential == "cert" and cs and cs.client_app_object_id:
+        reader = thumbprint_reader or (
+            lambda state: _read_installed_thumbprints(
+                state, method=graph_auth_method, device_client_id=device_client_id,
+            )
+        )
+        _add(check_certificate_installed(
+            recorded_thumbprint=cs.cert_thumbprint_b64url,
+            installed_thumbprints=reader(cs),
+        ))
 
     role_arn = cs.kb_role_arn if cs else None
-    checks.append(check_cloudtrail_permissions(
+    _add(check_cloudtrail_permissions(
         session=session,
         region=region,
         role_arn=role_arn,
@@ -311,7 +262,7 @@ def diagnose(
                 "Log analysis needs a knowledge base id to derive the log group "
                 "name, or an explicit log_group_name."
             )
-        checks.append(check_ingestion_logs(
+        _add(check_ingestion_logs(
             session=session,
             log_group_name=group,
             lookback_minutes=lookback_minutes,
@@ -319,6 +270,29 @@ def diagnose(
         ))
 
     return build_diagnose_result(name, checks)
+
+
+def _read_installed_thumbprints(
+    cs: Any, *, method: str, device_client_id: str | None
+) -> list[str] | None:
+    """Read the app's certificate thumbprints, or None if Graph is unreachable.
+
+    None rather than an exception: an operator diagnosing the AWS side often has
+    no Graph access, and `check_certificate_installed` reports None as
+    unverified instead of failing the diagnosis.
+    """
+    if not cs.tenant_id or not cs.client_app_object_id:
+        return None
+    try:
+        from kb_connector.providers.microsoft.apps import list_certificate_thumbprints
+        from kb_connector.providers.microsoft.client import GraphClient
+
+        graph = GraphClient.from_auth(
+            method=method, tenant_id=cs.tenant_id, device_client_id=device_client_id,
+        )
+        return list_certificate_thumbprints(graph, cs.client_app_object_id)
+    except Exception:  # noqa: BLE001 - no Graph access is an expected outcome
+        return None
 
 
 # --- monitor -----------------------------------------------------------------
@@ -339,23 +313,27 @@ def monitor(
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
     target_factory: TargetFactory | None = None,
+    on_job_started: Callable[[str], None] | None = None,
+    on_poll: Callable[[IngestionStats], None] | None = None,
 ) -> MonitorResult:
     """Poll an ingestion job (or start a new one).
 
     Defaults to *poll-only* (start=False) so an agent can't accidentally
     kick off ingestion. Pass start=True to begin a fresh job.
-    """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
 
-    name = _resolve_connector_name(
-        config, connector_name,
-        allow_direct=True, direct_ok=bool(kb_id and ds_id),
+    The job id is written to state as soon as a started job exists, and again
+    when polling ends, so `monitor --no-start` can resume it. A DIRECT run (ids
+    given, no connector) writes no state. `on_job_started` and `on_poll` are
+    progress hooks for the caller.
+    """
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        direct_ok=bool(kb_id and ds_id),
+        session_factory=session_factory, target_factory=target_factory,
     )
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
-    )
-    cs = state_file.connectors.get(name) if name != "_direct" else None
+    ctx.require_region()
+    cs = ctx.cs
 
     kb_id = kb_id or (cs.knowledge_base_id if cs else None)
     ds_id = ds_id or (cs.data_source_id if cs else None)
@@ -364,31 +342,39 @@ def monitor(
             "Need kb_id and ds_id, or run setup first to populate state."
         )
 
-    sess_factory = session_factory or _default_session_factory
-    tgt_factory = target_factory or _default_target_factory
-    session = sess_factory(region, profile)
-    target = tgt_factory(
-        session=session, region=region, target=_resolve_target(cfg, cs)
-    )
+    def _record_job(started_id: str) -> None:
+        if not ctx.is_direct:
+            ctx.ensure_state().last_ingestion_job_id = started_id
+            ctx.save()
 
     if start:
-        return start_and_poll(
-            target, kb_id=kb_id, ds_id=ds_id,
+        def _started(started_id: str) -> None:
+            _record_job(started_id)
+            if on_job_started is not None:
+                on_job_started(started_id)
+
+        result = start_and_poll(
+            ctx.target(), kb_id=kb_id, ds_id=ds_id,
             poll_interval_seconds=poll_interval_seconds,
             timeout_seconds=timeout_seconds,
+            on_job_started=_started,
+            on_poll=on_poll,
         )
-
-    last_job_id = job_id or (cs.last_ingestion_job_id if cs else None)
-    if not last_job_id:
-        raise StateError(
-            "Poll-only mode requires a known job_id (in state or passed in). "
-            "Use start=True to begin a new job."
+    else:
+        last_job_id = job_id or (cs.last_ingestion_job_id if cs else None)
+        if not last_job_id:
+            raise StateError(
+                "No ingestion job to poll: none is recorded in state and none was "
+                "given. Pass a job id, or start a new job."
+            )
+        result = poll_job(
+            ctx.target(), kb_id=kb_id, ds_id=ds_id, job_id=last_job_id,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
+            on_poll=on_poll,
         )
-    return poll_job(
-        target, kb_id=kb_id, ds_id=ds_id, job_id=last_job_id,
-        poll_interval_seconds=poll_interval_seconds,
-        timeout_seconds=timeout_seconds,
-    )
+    _record_job(result.job_id)
+    return result
 
 
 # --- validate ----------------------------------------------------------------
@@ -424,14 +410,12 @@ def validate(
     Test query and users come from the connector's [validation] config
     block by default; CLI/programmatic args override.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    name = _resolve_connector_name(config, connector_name)
-    region, profile, cfg = _resolve_region_profile(
-        config, name, region=region, profile=profile,
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path,
+        session_factory=session_factory, target_factory=target_factory,
     )
-    cs = state_file.connectors.get(name)
+    cfg, cs, name = ctx.cfg, ctx.cs, ctx.name
 
     # Pull validation config from the connector. The block is optional — set it
     # once and `validate` becomes self-contained.
@@ -470,12 +454,8 @@ def validate(
     elif not target_kb:
         notes.append("Skipped retrieve: no kb_id available.")
     else:
-        sess_factory = session_factory or _default_session_factory
-        tgt_factory = target_factory or _default_target_factory
-        session = sess_factory(region, profile)
-        target = tgt_factory(
-            session=session, region=region, target=_resolve_target(cfg, cs)
-        )
+        ctx.require_region()
+        target = ctx.target()
 
         if acl_enabled:
             if authorized_user:
@@ -591,13 +571,10 @@ def handoff(
     `direction="aws"` produces source-to-aws (source admin -> AWS admin).
     `direction="source"` produces aws-to-source.
     """
-    config = load_config(config_path)
-    state_file = load_state(state_path)
-
-    cs: ConnectorState | None = state_file.connectors.get(connector_name)
-    cfg: ConnectorConfig | None = None
-    if connector_name in config.connector_names():
-        cfg = config.resolve_connector(connector_name)
+    ctx = resolve_context(
+        connector_name, config_path=config_path, state_path=state_path,
+    )
+    cs, cfg = ctx.cs, ctx.cfg
 
     if direction == "aws":
         document = build_source_to_aws(connector_name, cs, cfg)
@@ -617,6 +594,266 @@ def handoff(
     )
 
 
+# --- teardown ----------------------------------------------------------------
+
+# Resource kinds deleted through an AWS client. "app" goes through Graph.
+_AWS_KINDS = frozenset({"ds", "kb", "secret", "role", "cert"})
+# Deleted first. If either fails, the credentials they depend on are kept.
+_CONTROL_PLANE_KINDS = ("ds", "kb")
+TEARDOWN_KINDS = ("ds", "kb", "secret", "role", "cert", "app")
+
+
+@dataclass
+class TeardownItem:
+    """One tracked resource teardown would act on."""
+
+    kind: str          # one of TEARDOWN_KINDS
+    identifier: str
+    description: str
+    adopted: bool      # recorded as external rather than created by this tool
+
+
+@dataclass
+class TeardownPlan:
+    """What teardown would delete and keep. Computing it makes no AWS call."""
+
+    connector: str
+    connector_type: str | None
+    region: str | None
+    delete: list[TeardownItem] = field(default_factory=list)
+    keep: list[TeardownItem] = field(default_factory=list)
+    scoped: bool = False   # limited to one kind with `only`
+    ctx: Any = field(default=None, repr=False)
+
+    @property
+    def tracked(self) -> bool:
+        return bool(self.delete or self.keep)
+
+
+@dataclass
+class TeardownEvent:
+    """Progress from execute_teardown, in the order things happen."""
+
+    kind: Literal[
+        "job_check_failed", "job_stopping", "job_stopped", "job_still_stopping",
+        "job_stop_failed", "deleted", "failed", "skipped",
+    ]
+    item: TeardownItem | None = None
+    detail: str | None = None
+
+
+@dataclass
+class TeardownResult:
+    """Outcome of execute_teardown."""
+
+    connector: str
+    deleted: list[TeardownItem] = field(default_factory=list)
+    failed: list[TeardownItem] = field(default_factory=list)
+    skipped: list[TeardownItem] = field(default_factory=list)
+    # Set when an ingestion job was running and `force` was not passed. Nothing
+    # was deleted.
+    blocked_by_job: str | None = None
+    state_cleared: bool = False
+    state_path: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return not (self.failed or self.skipped or self.blocked_by_job)
+
+
+def plan_teardown(
+    *,
+    connector_name: str | None = None,
+    only: str | None = None,
+    include_adopted: bool = False,
+    region: str | None = None,
+    profile: str | None = None,
+    config_path: str | None = None,
+    state_path: str | None = None,
+    session_factory: SessionFactory | None = None,
+    target_factory: TargetFactory | None = None,
+) -> TeardownPlan:
+    """List what teardown would delete and keep, from state.
+
+    Resources recorded as adopted are kept unless `include_adopted`. A config
+    entry that fails to resolve does not block the plan, since state is what
+    teardown acts on. Raises ConfigError if anything AWS-side would be deleted
+    and no region is known: a guessed region sends every delete to a region
+    where the resources do not exist.
+    """
+    if only is not None and only not in TEARDOWN_KINDS:
+        raise ConfigError(
+            f"Unknown resource type {only!r}. Expected one of: "
+            f"{', '.join(TEARDOWN_KINDS)}."
+        )
+    ctx = resolve_context(
+        connector_name, region=region, profile=profile,
+        config_path=config_path, state_path=state_path, strict_config=False,
+        session_factory=session_factory, target_factory=target_factory,
+    )
+    cs = ctx.cs
+    plan = TeardownPlan(
+        connector=ctx.name,
+        connector_type=cs.connector_type if cs else None,
+        region=ctx.region,
+        scoped=only is not None,
+        ctx=ctx,
+    )
+    if cs is None:
+        return plan
+
+    candidates: list[tuple[str, str | None, str]] = [
+        ("ds", cs.data_source_id, f"Data source {cs.data_source_id}"),
+        ("kb", cs.knowledge_base_id, f"Knowledge base {cs.knowledge_base_id}"),
+        ("secret", cs.secret_arn, f"Secret {cs.secret_arn}"),
+        ("role", cs.kb_role_arn, f"IAM role {cs.kb_role_arn}"),
+        (
+            "cert",
+            f"s3://{cs.cert_s3_bucket}/{cs.cert_s3_key}"
+            if cs.cert_s3_bucket and cs.cert_s3_key else None,
+            f"Certificate s3://{cs.cert_s3_bucket}/{cs.cert_s3_key}",
+        ),
+        ("app", cs.client_app_id, f"Entra app {cs.client_app_id}"),
+    ]
+    for kind, identifier, description in candidates:
+        if not identifier or (only and kind != only):
+            continue
+        adopted = not cs.is_tool_owned(kind)
+        item = TeardownItem(kind, identifier, description, adopted)
+        (plan.keep if adopted and not include_adopted else plan.delete).append(item)
+
+    if any(item.kind in _AWS_KINDS for item in plan.delete):
+        ctx.require_region(
+            f"No region known for {ctx.name!r}: state does not record one and "
+            f"config does not set one. Pass the region the resources were "
+            f"created in."
+        )
+    return plan
+
+
+def execute_teardown(
+    plan: TeardownPlan,
+    *,
+    force: bool = False,
+    auth_method: str = "az",
+    device_client_id: str | None = None,
+    on_event: Callable[[TeardownEvent], None] | None = None,
+) -> TeardownResult:
+    """Delete what the plan lists, then update or clear the state entry.
+
+    Refuses while an ingestion job is running on the data source unless
+    `force`, which stops the job first. The data source and knowledge base are
+    deleted before the credentials; if either fails, the credentials are kept
+    so a later run can retry. The state entry is removed only after an unscoped
+    teardown that deleted everything and kept nothing.
+    """
+    from kb_connector.core import teardown as td
+
+    ctx = plan.ctx
+    cs = ctx.cs
+    result = TeardownResult(connector=plan.connector, state_path=ctx.state_path)
+
+    def _emit(event: TeardownEvent) -> None:
+        if on_event is not None:
+            on_event(event)
+
+    if not plan.delete:
+        return result
+
+    if cs.knowledge_base_id and cs.data_source_id:
+        target = ctx.target()
+        try:
+            active = td.find_active_ingestion_job(
+                target, cs.knowledge_base_id, cs.data_source_id
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed check must not block cleanup
+            active = None
+            _emit(TeardownEvent("job_check_failed", detail=str(exc)))
+        if active and not force:
+            result.blocked_by_job = active
+            return result
+        if active:
+            _emit(TeardownEvent("job_stopping", detail=active))
+            try:
+                status = td.stop_and_wait(
+                    target, cs.knowledge_base_id, cs.data_source_id, active
+                )
+            except Exception as exc:  # noqa: BLE001 - deletes proceed regardless
+                _emit(TeardownEvent("job_stop_failed", detail=str(exc)))
+            else:
+                _emit(TeardownEvent(
+                    "job_stopped" if status else "job_still_stopping", detail=status,
+                ))
+
+    ordered = sorted(
+        plan.delete, key=lambda i: 0 if i.kind in _CONTROL_PLANE_KINDS else 1
+    )
+    control_plane_failed = False
+    for item in ordered:
+        if control_plane_failed and item.kind not in _CONTROL_PLANE_KINDS:
+            result.skipped.append(item)
+            _emit(TeardownEvent("skipped", item))
+            continue
+        try:
+            _delete_item(ctx, cs, item, auth_method, device_client_id)
+        except Exception as exc:  # noqa: BLE001 - reported per resource
+            result.failed.append(item)
+            _emit(TeardownEvent("failed", item, str(exc)))
+            if item.kind in _CONTROL_PLANE_KINDS:
+                control_plane_failed = True
+            continue
+        result.deleted.append(item)
+        _emit(TeardownEvent("deleted", item))
+
+    nothing_left = not any([
+        cs.knowledge_base_id, cs.data_source_id, cs.secret_arn,
+        cs.kb_role_arn, cs.client_app_id, cs.cert_s3_bucket,
+    ])
+    if not plan.scoped and nothing_left and result.ok and not plan.keep:
+        result.state_path = ctx.forget()
+        result.state_cleared = True
+    else:
+        result.state_path = ctx.save()
+    return result
+
+
+def _delete_item(
+    ctx: Any, cs: Any, item: TeardownItem, auth_method: str,
+    device_client_id: str | None,
+) -> None:
+    """Delete one resource and clear its identifiers from state."""
+    from kb_connector.core import teardown as td
+
+    if item.kind == "ds":
+        if not cs.knowledge_base_id:
+            raise StateError(
+                "The data source cannot be deleted without its knowledge base "
+                "id, and state does not record one."
+            )
+        ctx.target().delete_data_source(cs.knowledge_base_id, item.identifier)
+        cs.data_source_id = None
+    elif item.kind == "kb":
+        ctx.target().delete_knowledge_base(item.identifier)
+        cs.knowledge_base_id = None
+    elif item.kind == "secret":
+        td.delete_secret(ctx.session(), item.identifier)
+        cs.secret_arn = None
+    elif item.kind == "role":
+        td.delete_role(ctx.session(), item.identifier)
+        cs.kb_role_arn = None
+    elif item.kind == "cert":
+        td.delete_cert(ctx.session(), cs.cert_s3_bucket, cs.cert_s3_key)
+        cs.cert_s3_bucket = None
+        cs.cert_s3_key = None
+    elif item.kind == "app":
+        td.delete_entra_app(
+            tenant_id=cs.tenant_id, object_id=cs.client_app_object_id,
+            auth_method=auth_method, device_client_id=device_client_id,
+        )
+        cs.client_app_id = None
+        cs.client_app_object_id = None
+
+
 # Re-export StateFile so consumers don't need to import from core.state
 __all__ = [
     "ConnectorSummary",
@@ -632,4 +869,10 @@ __all__ = [
     "monitor",
     "validate",
     "handoff",
+    "TeardownItem",
+    "TeardownPlan",
+    "TeardownEvent",
+    "TeardownResult",
+    "plan_teardown",
+    "execute_teardown",
 ]

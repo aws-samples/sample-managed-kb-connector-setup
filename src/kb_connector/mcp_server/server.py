@@ -200,9 +200,11 @@ def _build_server() -> Any:
     @mcp.tool(
         name="kb_connector_validate",
         description=(
-            "Validate that a connector's credentials and retrieve path are "
-            "healthy. Runs a token-mint informational check (Entra "
-            "connectors) and a test retrieve against the knowledge base."
+            "Validate that a connector's retrieve path is healthy. Runs a "
+            "test retrieve against the knowledge base, or for ACL-enabled "
+            "connectors the authorized / denied / no-user retrieve checks. "
+            "The query and users default to the connector's [validation] "
+            "config block."
         ),
     )
     def kb_connector_validate(
@@ -210,7 +212,7 @@ def _build_server() -> Any:
         region: str | None = None,
         profile: str | None = None,
         kb_id: str | None = None,
-        query: str = "test",
+        query: str | None = None,
         skip_retrieve: bool = False,
         config_path: str | None = None,
         state_path: str | None = None,

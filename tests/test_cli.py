@@ -104,3 +104,57 @@ def test_region_change_with_nothing_tracked_is_allowed():
     cs = ConnectorState(region="us-west-2")
     _record_region(cs, ConnectorConfig(name="c", type="s3", region="eu-west-1"))
     assert cs.region == "eu-west-1"
+
+
+# --- diagnose --json is machine-readable -------------------------------------
+
+
+def test_diagnose_json_prints_only_json(monkeypatch, capsys):
+    import json
+
+    from kb_connector import service
+    from kb_connector.core.diagnostics import CheckResult, build_diagnose_result
+
+    def _fake_diagnose(**kwargs):
+        check = CheckResult(name="cert_expiry", passed=True, details="ok", side="source")
+        kwargs["on_check"](check)
+        return build_diagnose_result("sp", [check])
+
+    monkeypatch.setattr(service, "diagnose", _fake_diagnose)
+    args = build_parser().parse_args(["--json", "diagnose", "sp"])
+    assert args.func(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "healthy"
+    assert out["checks"][0]["name"] == "cert_expiry"
+
+
+# --- errors reach the top-level renderer ---------------------------------------
+
+
+def test_expired_token_from_a_command_gets_the_login_hint(monkeypatch, capsys):
+    from kb_connector import service
+    from kb_connector.cli.main import main
+    from kb_connector.core.errors import AwsError
+
+    def _expired(**kwargs):
+        raise AwsError("AWS error (ExpiredToken): token expired", code="ExpiredToken")
+
+    monkeypatch.setattr(service, "validate", _expired)
+    monkeypatch.setattr("sys.argv", ["kb-connector", "validate", "c1", "--profile", "dev"])
+    assert main() == 1
+    assert "aws sso login --profile dev" in capsys.readouterr().err
+
+
+def test_wait_timeout_is_both_a_connector_error_and_a_timeout(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from kb_connector.core.errors import ConnectorError, WaitTimeout
+    from kb_connector.core.knowledge_base import wait_until_ds_available
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    target = MagicMock()
+    target.get_data_source.return_value = {"dataSource": {"status": "CREATING"}}
+    with pytest.raises(WaitTimeout) as exc_info:
+        wait_until_ds_available(target, "KB", "DS", timeout_seconds=0)
+    assert isinstance(exc_info.value, ConnectorError)
+    assert isinstance(exc_info.value, TimeoutError)

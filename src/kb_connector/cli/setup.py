@@ -192,11 +192,7 @@ def _target_choices() -> frozenset[str]:
 
 def run(args: argparse.Namespace) -> int:
     """Execute the setup subcommand."""
-    try:
-        return _run_setup(args)
-    except ConnectorError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        return 1
+    return _run_setup(args)
 
 
 def _aws_session_and_account(cfg: ConnectorConfig) -> tuple[Any, str]:
@@ -558,15 +554,12 @@ _REGIONAL_STATE_FIELDS = (
 def _record_region(cs: ConnectorState, cfg: ConnectorConfig) -> None:
     """Record the region this run creates resources in, before it creates any.
 
-    Teardown deletes in the region state records. It used to be recorded only
-    when the data source was created, so a run that failed earlier (after the
-    secret, role or KB) left none, and teardown fell back to boto's default
-    region.
+    Teardown deletes in the region state records, so it is recorded before the
+    first resource exists and a run that fails at any step leaves it set.
 
     A run whose region differs from the one state already records is refused:
-    it would create new resources in one region while state still tracks the
-    old ones in another, and whichever region state ended up holding, teardown
-    would miss half of them.
+    it would create resources in one region while state tracks others in
+    another, and teardown can only reach one of them.
     """
     if not cfg.region:
         return
@@ -674,10 +667,9 @@ def _provision_kb_and_ds(
         kb_obj = created.get("knowledgeBase", created)
         kb_id = kb_obj.get("knowledgeBaseId") or kb_obj.get("id")
         print(f"  Created knowledge base: {kb_id}")
-        # Recorded before the wait, as the data source is below. An encrypted KB
-        # can take past five minutes to become ACTIVE, and a timeout or FAILED
-        # status here used to leave a KB that state never mentioned: teardown
-        # could not find it and the next run collided with its name.
+        # Recorded before the wait, as the data source is below, so a timeout or
+        # FAILED status leaves the KB tracked for teardown and for the next run.
+        # An encrypted KB can take more than five minutes to become ACTIVE.
         cs.knowledge_base_id = kb_id
         cs.record_owned(state_mod.RESOURCE_KB)
         cs.region = cfg.region
@@ -993,10 +985,8 @@ def _setup_microsoft(
             reg = apps.create_application(graph, app_name)
             print(f"  Created app '{app_name}' (appId {reg.app_id})")
 
-        # Recorded now, before consent, certificate and site grants, any of
-        # which can fail. Recording it only after them meant a failure left a
-        # tool-created app untracked, and the next run then found it by name
-        # with no record and could not tell it from someone else's.
+        # Recorded before consent, certificate and site grants, any of which can
+        # fail, so the next run recognizes the app as one this tool created.
         _record_app(cs, cfg, tenant_id, reg, reused=bool(existing))
 
         # Permissions + consent
