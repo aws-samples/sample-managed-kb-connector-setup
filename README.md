@@ -261,7 +261,8 @@ then `~/.config/kb-connector/config.toml` for user-global defaults.
 ### Your own tags, and sharing an account
 
 Every resource the tool creates carries `ManagedBy=kb-connector` and
-`KbConnectorName=<connector>`. That's how a later run knows whether it created
+`KbConnectorName=<connector>`, except data sources, which the API does not
+tag. That's how a later run knows whether it created
 the role or secret it's about to modify, and how `teardown` knows what is safe
 to delete.
 
@@ -297,6 +298,49 @@ Two related knobs:
   with no tags to read, later runs can't verify ownership and will refuse to
   reuse what they find unless you also pass `--adopt-existing-resources`. If
   tagging isn't available to you, prefer `resource_prefix`.
+
+### Request overrides
+
+An `overrides` table deep-merges into the `CreateKnowledgeBase` and
+`CreateDataSource` requests setup sends, so any field those APIs accept can be
+set without a code change. Nested tables merge key by key; any other value,
+including a list, replaces what setup built.
+
+```toml
+# Image, audio and video extraction, a deletion safeguard, and keeping indexed
+# content when the data source is deleted.
+[connectors.videos.overrides.create_data_source]
+dataDeletionPolicy = "RETAIN"
+
+[connectors.videos.overrides.create_data_source.dataSourceConfiguration.managedKnowledgeBaseConnectorConfiguration]
+mediaExtractionConfiguration = { videoExtractionConfiguration = { videoExtractionStatus = "ENABLED" }, audioExtractionConfiguration = { audioExtractionStatus = "ENABLED" }, imageExtractionConfiguration = { imageExtractionStatus = "ENABLED" } }
+deletionProtectionConfiguration = { deletionProtectionStatus = "ENABLED", deletionProtectionThreshold = 15 }
+
+[connectors.videos.overrides.create_knowledge_base]
+description = "Training videos"
+```
+
+`connector_params_overrides` is still read. It merges into `connectorParameters`
+first, and `overrides.create_data_source` merges on top of it.
+
+Setup checks overrides before it makes any Graph or AWS call:
+
+- Fields setup sets itself (`name`, `roleArn`, `knowledgeBaseId`, `clientToken`)
+  are refused, with the flag to use instead. Tags go through the same checks as
+  the `[tags]` table, so the ownership tags cannot be set.
+- Everything outside `connectorParameters` is validated against the installed
+  botocore model, so a misspelled field or wrong type fails at the start of
+  setup. A field newer than the installed botocore fails the same way; upgrade
+  boto3 to use it. `connectorParameters` is a free-form document in the model,
+  so its contents are checked only by the service.
+
+Overrides apply when a resource is created. A knowledge base or data source that
+setup reuses is not updated; to apply a changed data source override, run
+`teardown --only ds` and then setup again.
+
+For video, raise the connector's maximum file size as well, since the default
+skips large files. With media extraction off the service accepts 1 to 500 MB.
+Media extraction needs no IAM permissions beyond the role setup creates.
 
 ### Config vs. state
 
@@ -347,11 +391,8 @@ creates the bucket if it's missing, and applies SSE plus a public-access block
 since the bucket holds the private key. Setting an explicit bucket overrides
 the default.
 
-For connector parameters the curated builder doesn't surface (SharePoint
-`filterConfiguration`, OneDrive `inclusionPatterns`, anything advanced),
-add a `[connectors.<name>.connector_params_overrides]` table; the dict
-deep-merges onto the built params before the data source is created. See
-[KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for the full discussion.
+For request fields the curated config doesn't surface, see
+[Request overrides](#request-overrides).
 
 ```bash
 kb-connector setup engineering-sp                 # both stages

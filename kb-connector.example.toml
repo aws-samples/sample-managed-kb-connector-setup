@@ -247,6 +247,15 @@ crawl_depth = 2
 # #     "/sites/engineering/Shared Documents/2025",
 # # ]
 #
-# Anything the API accepts becomes available without code changes. The override
-# path is intentionally unvalidated — using it means knowing the API JSON
-# shape; the curated fields above are still where to look first.
+# Anything the API accepts becomes available without code changes. Using it
+# means knowing the API JSON shape; the curated fields above are still where
+# to look first.
+#
+# For fields outside connectorParameters, use an overrides table. It merges
+# into the whole CreateDataSource or CreateKnowledgeBase request, and is
+# checked against the installed botocore model before setup makes any call.
+# Example: video extraction and a bulk-deletion safeguard.
+#
+# [connectors.videos.overrides.create_data_source.dataSourceConfiguration.managedKnowledgeBaseConnectorConfiguration]
+# mediaExtractionConfiguration = { videoExtractionConfiguration = { videoExtractionStatus = "ENABLED" } }
+# deletionProtectionConfiguration = { deletionProtectionStatus = "ENABLED", deletionProtectionThreshold = 15 }

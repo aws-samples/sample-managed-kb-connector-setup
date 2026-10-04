@@ -495,8 +495,10 @@ mistake.
 **Low · Tampering · TB-1→TB-4 · AS-6**
 
 A **TA-1** can use `connector_params_overrides` (deep-merged into
-`connectorParameters`) or `probe --connector-params` to submit arbitrary fields
-to `CreateDataSource`, bypassing all client-side validation and potentially
+`connectorParameters`), the `overrides` tables (deep-merged into the
+`CreateDataSource` and `CreateKnowledgeBase` requests), or
+`probe --connector-params` to submit arbitrary fields, bypassing all
+client-side validation of connector parameters and potentially
 pointing `secretArn` or `certificateS3Path` at resources the connector was not
 meant to use, negatively impacting the integrity of the data source
 configuration.
@@ -507,6 +509,12 @@ surface is larger than the curated builders cover, and pretending to validate
 untested fields would be worse than passing them through. The API authorizes
 every referenced resource against the caller's own credentials, so this does not
 cross an authorization boundary. `probe` is documented as a maintainer tool.
+
+The `overrides` tables refuse the fields setup sets itself (`name`, `roleArn`,
+`knowledgeBaseId`, `clientToken`), so the role setup scoped and the ids state
+records stay the ones the request uses. Tags are checked as the `[tags]` table
+is, so `ManagedBy` and `KbConnectorName` cannot be forged (T-03). Fields outside
+`connectorParameters` are validated against the botocore model before any call.
 
 ### T-15 — Ingestion log analysis discloses customer document paths
 **Low · Information disclosure · TB-1 · AS-10**

@@ -19,8 +19,10 @@ from dataclasses import dataclass, field as dataclass_field
 from getpass import getpass
 from typing import TYPE_CHECKING, Any
 
+from kb_connector.core import overrides as request_overrides
 from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
+from kb_connector.core.knowledge_base import build_data_source_payload
 
 from kb_connector.core.config import ConnectorConfig, load_config
 from kb_connector.core.errors import (
@@ -234,28 +236,6 @@ def _tracked_resource_summary(cs: ConnectorState) -> list[str]:
     if cs.client_app_id:
         lines.append(f"Entra app {cs.client_app_id}")
     return lines
-
-
-def _deep_merge(base: dict, overrides: dict) -> dict:
-    """Recursively merge `overrides` into `base`, returning a new dict.
-
-    Used to apply a TOML-supplied connector_params_overrides table onto the
-    params built by a connector builder. Nested dicts merge key-by-key; any
-    other value at a key replaces what was there. Lists replace, they don't
-    concatenate, since concatenation rarely matches user intent for fields
-    like inclusionItemPaths.
-    """
-    out = dict(base)
-    for key, val in overrides.items():
-        if (
-            key in out
-            and isinstance(out[key], dict)
-            and isinstance(val, dict)
-        ):
-            out[key] = _deep_merge(out[key], val)
-        else:
-            out[key] = val
-    return out
 
 
 @dataclass
@@ -473,6 +453,11 @@ def _run_setup(args: argparse.Namespace) -> int:
     if cfg.target != "bmkb":
         print(f"  target: {cfg.target}")
 
+    # Checked before any Graph or AWS call, so a malformed or misspelled
+    # override fails here rather than after resources exist.
+    if cfg.target == "bmkb":
+        request_overrides.check_against_model(request_overrides.load(cfg.raw))
+
     # Dispatch to the appropriate setup path. Persist state in a finally block
     # so that resources created before a mid-flight failure are still tracked
     # (and therefore cleanable by `teardown`). Setup is resumable: re-running
@@ -634,8 +619,7 @@ def _provision_kb_and_ds(
     cs: ConnectorState,
     connector_name: str,
     kb_role_arn: str | None,
-    connector_parameters: dict | None = None,
-    raw_ds_payload: dict | None = None,
+    connector_parameters: dict,
 ) -> None:
     """Create-or-reuse the KB, then create the DS and wait for AVAILABLE.
 
@@ -643,15 +627,12 @@ def _provision_kb_and_ds(
     (e.g. Quick) can be swapped in without touching this logic. Updates
     connector state (cs) in place.
 
-    Pass `connector_parameters` for managed-connector data sources, or
-    `raw_ds_payload` for connectors with a non-managed shape (e.g. S3).
-
-    Applies any [connectors.<name>.connector_params_overrides] dict from
-    config as a deep-merge onto `connector_parameters`. This is the escape
-    hatch for fields the curated builders don't surface (filterConfiguration,
-    advanced indexing, deletion policy, etc.) — see KNOWN-LIMITATIONS.md.
+    The connector's request overrides (core.overrides) deep-merge into the
+    CreateKnowledgeBase and CreateDataSource bodies. They apply when a
+    resource is created; a reused KB or data source is left as it is.
     """
     kb_id = args.knowledge_base_id or cs.knowledge_base_id
+    overrides = request_overrides.load(cfg.raw)
 
     if not kb_id:
         if not kb_role_arn:
@@ -659,10 +640,10 @@ def _provision_kb_and_ds(
                 "No KB role available. Provide --kb-role-arn or let the tool create one."
             )
         kb_name = args.kb_name or f"kb-connector-{connector_name}"
-        created = target.create_knowledge_base(
-            name=kb_name,
-            role_arn=kb_role_arn,
-            kms_key_arn=getattr(args, "kms_key_arn", None) or cfg.kms_key_arn,
+        created = _create_knowledge_base(
+            target, args, cfg, connector_name,
+            name=kb_name, role_arn=kb_role_arn,
+            overrides=overrides.create_knowledge_base,
         )
         kb_obj = created.get("knowledgeBase", created)
         kb_id = kb_obj.get("knowledgeBaseId") or kb_obj.get("id")
@@ -690,14 +671,13 @@ def _provision_kb_and_ds(
                 f"  Using existing KB: {kb_id} "
                 f"(external — teardown will not delete it)"
             )
+        if overrides.create_knowledge_base:
+            print(
+                "  NOTE: overrides.create_knowledge_base applies only when the "
+                "knowledge base is created; the existing one is unchanged."
+            )
 
     cs.knowledge_base_id = kb_id
-
-    # Apply user-provided connector parameter overrides as a deep-merge.
-    overrides = cfg.get("connector_params_overrides")
-    if overrides and connector_parameters is not None:
-        connector_parameters = _deep_merge(connector_parameters, overrides)
-        print(f"  Applied connector_params_overrides ({len(overrides)} top-level field(s))")
 
     ds_name = args.ds_name or f"{connector_name}-ds"
 
@@ -705,20 +685,28 @@ def _provision_kb_and_ds(
     # creating a new one. A data source in a terminal-bad state is neither
     # complete nor recoverable, so it's recreated rather than reused.
     existing_ds_id = cs.data_source_id
-    if existing_ds_id and raw_ds_payload is None:
+    if existing_ds_id:
         reuse_id = _reconcile_existing_data_source(target, kb_id, existing_ds_id)
         if reuse_id:
             print(f"  Reusing existing data source: {reuse_id} (AVAILABLE)")
+            if overrides.create_data_source:
+                print(
+                    "  NOTE: data source overrides apply only when the data "
+                    "source is created. To apply changes, run `teardown --only "
+                    "ds` and then setup again."
+                )
             cs.data_source_id = reuse_id
             cs.region = cfg.region
             return
 
+    payload = build_data_source_payload(
+        name=ds_name, connector_parameters=connector_parameters
+    )
+    if overrides.create_data_source:
+        payload = request_overrides.deep_merge(payload, overrides.create_data_source)
+        print("  Applied data source overrides")
     ds_id = _create_data_source_with_diagnostics(
-        target=target,
-        kb_id=kb_id,
-        ds_name=ds_name,
-        connector_parameters=connector_parameters,
-        raw_ds_payload=raw_ds_payload,
+        target=target, kb_id=kb_id, ds_name=ds_name, payload=payload,
     )
     print(f"  Created data source: {ds_id}")
     # Record the DS id immediately so a failed AVAILABLE wait is still tracked
@@ -729,6 +717,53 @@ def _provision_kb_and_ds(
     print("  Waiting for data source to become AVAILABLE...")
     target.wait_until_ds_available(kb_id, ds_id)
     print("  Data source is AVAILABLE")
+
+
+def _create_knowledge_base(
+    target: Target,
+    args: argparse.Namespace,
+    cfg: ConnectorConfig,
+    connector_name: str,
+    *,
+    name: str,
+    role_arn: str,
+    overrides: dict,
+) -> Any:
+    """Create the knowledge base with the ownership and operator tags.
+
+    Tagging on create needs bedrock:TagResource. If that is denied, the KB
+    is created untagged with a warning, as the role and secret are. Tags from
+    `overrides.create_knowledge_base` are dropped on that retry too.
+    `--no-tags` sends no tool tags at all.
+    """
+    from kb_connector.core.tagging import (
+        build_tag_dict,
+        is_tagging_access_error,
+        validate_extra_tags,
+    )
+
+    kms_key_arn = getattr(args, "kms_key_arn", None) or cfg.kms_key_arn
+    tags = None
+    if not getattr(args, "no_tags", False):
+        tags = build_tag_dict(connector_name, validate_extra_tags(cfg.tags))
+    try:
+        return target.create_knowledge_base(
+            name=name, role_arn=role_arn, kms_key_arn=kms_key_arn,
+            tags=tags, overrides=overrides,
+        )
+    except AwsError as exc:
+        if not (tags or overrides.get("tags")) or not is_tagging_access_error(exc):
+            raise
+        print(
+            f"  WARNING: created knowledge base without tags "
+            f"(bedrock:TagResource denied): {exc}",
+            file=sys.stderr,
+        )
+        untagged = {k: v for k, v in overrides.items() if k != "tags"}
+        return target.create_knowledge_base(
+            name=name, role_arn=role_arn, kms_key_arn=kms_key_arn,
+            tags=None, overrides=untagged,
+        )
 
 
 # Data source statuses from which there is no forward path: recreate instead of
@@ -784,8 +819,7 @@ def _create_data_source_with_diagnostics(
     target: Target,
     kb_id: str,
     ds_name: str,
-    connector_parameters: dict | None,
-    raw_ds_payload: dict | None,
+    payload: dict,
 ) -> str:
     """Create the data source, translating a name-collision 409 into guidance.
 
@@ -795,12 +829,7 @@ def _create_data_source_with_diagnostics(
     returns an actionable message rather than the raw API error.
     """
     try:
-        if raw_ds_payload is not None:
-            ds_resp = target.create_data_source_raw(kb_id, raw_ds_payload)
-        else:
-            ds_resp = target.create_data_source(
-                kb_id, name=ds_name, connector_parameters=connector_parameters or {}
-            )
+        ds_resp = target.create_data_source_raw(kb_id, payload)
     except AwsError as exc:
         text = str(exc)
         if "409" in text and "already exists" in text.lower():
