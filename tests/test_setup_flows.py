@@ -110,9 +110,11 @@ class _FakeCloud:
                 ownership=Ownership.CREATED if created else Ownership.OURS,
             )
 
-        def add_content_policy(session, role_name, bucket, account_id, *, inclusion_prefixes=None):
+        def add_content_policy(session, role_name, bucket, account_id, *,
+                               inclusion_prefixes=None,
+                               policy_name="kb-connector-s3-content-access"):
             self.roles.setdefault(role_name, {"policies": {}})["policies"][
-                "kb-connector-s3-content-access"] = bucket
+                policy_name] = bucket
 
         def extend(*, role_name, secret_arn, **_):
             self.extended.append((role_name, secret_arn))
@@ -319,7 +321,7 @@ def test_s3_on_an_existing_kb_gives_its_role_bucket_read(cloud):
     kb_id = _existing_kb(cloud)
     _write_config('[connectors.c]\ntype = "s3"\nbucket_name = "media"\n')
     assert _cli("setup", "c", "--kb", kb_id) == 0
-    assert cloud.roles["shared-kb-role"]["policies"]["kb-connector-s3-content-access"] == "media"
+    assert cloud.roles["shared-kb-role"]["policies"]["kb-connector-s3-content-access-c"] == "media"
     assert "kb-connector-c-role" not in cloud.roles
     state = _state()
     assert state["created_resources"]["kb"] == "external"
@@ -362,3 +364,31 @@ def test_an_oversized_file_limit_stops_setup_before_any_call(cloud, capsys, monk
     assert main() == 1
     assert "media extraction" in capsys.readouterr().err
     assert not (cloud.kbs or cloud.roles)
+
+
+def test_two_s3_connectors_on_one_kb_keep_both_bucket_grants(cloud):
+    _write_config(
+        '[connectors.a]\ntype = "s3"\nbucket_name = "bucket-a"\n\n'
+        '[connectors.b]\ntype = "s3"\nbucket_name = "bucket-b"\n'
+    )
+    assert _cli("setup", "a") == 0
+    kb_id = _state("a")["knowledge_base_id"]
+    assert _cli("setup", "b", "--kb", kb_id) == 0
+    policies = cloud.roles["kb-connector-a-role"]["policies"]
+    assert policies["kb-connector-s3-content-access"] == "bucket-a"
+    assert policies["kb-connector-s3-content-access-b"] == "bucket-b"
+
+
+def test_a_reserved_data_source_name_gets_the_wait_message():
+    from unittest.mock import MagicMock
+
+    from kb_connector.cli.setup import _create_data_source_with_diagnostics
+    from kb_connector.core.errors import AwsError
+
+    target = MagicMock()
+    target.create_data_source_raw.side_effect = AwsError(
+        "AWS error (ConflictException): DataSource with name c-ds already exists.",
+        code="ConflictException",
+    )
+    with pytest.raises(AwsError, match="wait a minute"):
+        _create_data_source_with_diagnostics(target=target, kb_id="KB", ds_name="c-ds", payload={})

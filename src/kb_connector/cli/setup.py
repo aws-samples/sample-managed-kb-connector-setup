@@ -846,7 +846,8 @@ def _create_data_source_with_diagnostics(
         ds_resp = target.create_data_source_raw(kb_id, payload)
     except AwsError as exc:
         text = str(exc)
-        if "409" in text and "already exists" in text.lower():
+        conflict = exc.code == "ConflictException" or "409" in text
+        if conflict and "already exists" in text.lower():
             raise AwsError(
                 f"A data source named {ds_name!r} already exists on knowledge "
                 f"base {kb_id}. If you just ran teardown, Bedrock deletes data "
@@ -1863,8 +1864,9 @@ def _extend_existing_kb_role(
 
     Only adds: the secret and certificate go into statements recognized by Sid,
     or a separate supplemental policy, and S3 content read goes into its own
-    named policy. The role belongs to the KB the operator pointed at, so it is
-    recorded as external unless state already records it as ours. A failure is
+    policy named for this connector, so it cannot replace another connector's
+    grant on the same role. The role belongs to the KB the operator pointed at,
+    so it is recorded as external unless state already records it as ours. A failure is
     reported and setup continues, since the role may already grant access.
     """
     from kb_connector.core import provisioning
@@ -1911,6 +1913,7 @@ def _extend_existing_kb_role(
             _add_s3_content_policy(
                 session, role_name, content_bucket, account_id,
                 inclusion_prefixes=cfg.get("inclusion_prefixes"),
+                policy_name=provisioning.s3_content_policy_name(cfg.name),
             )
             print(f"  Added read access to s3://{content_bucket}")
             changed = True
@@ -2106,6 +2109,7 @@ def _add_s3_content_policy(
     account_id: str,
     *,
     inclusion_prefixes: list[str] | None = None,
+    policy_name: str = "kb-connector-s3-content-access",
 ) -> None:
     """Add S3 read permissions for the content bucket to the KB role.
 
@@ -2152,7 +2156,7 @@ def _add_s3_content_policy(
     }
     iam.put_role_policy(
         RoleName=role_name,
-        PolicyName="kb-connector-s3-content-access",
+        PolicyName=policy_name,
         PolicyDocument=_json.dumps(policy),
     )
     if prefixes:
