@@ -85,11 +85,13 @@ VALIDATION_KEYS = ("query", "authorized_user", "unauthorized_user")
 # Keys shared by SharePoint and OneDrive. Setup reads them; none reach
 # connectorParameters except tenant_id.
 MICROSOFT_FIELDS: tuple[Field, ...] = (
-    Field("tenant_id", str, "Microsoft Entra tenant id.", required=True, ask=True),
+    Field("tenant_id", str,
+          "Microsoft Entra tenant id. Can be set once in [defaults.microsoft].",
+          required=True, ask=True),
     Field("auth_method", str, "How setup gets a Microsoft Graph token.",
           default="az", choices=("az", "device_code"), in_params=False),
     Field("cert_s3_bucket", str,
-          "Bucket for the certificate. Defaults to kb-connector-certs-<account>-<region>.",
+          "Bucket for the certificate. Defaults to `kb-connector-certs-<account>-<region>`.",
           in_params=False),
     Field("cert_s3_key_prefix", str, "Key prefix for the certificate object.",
           in_params=False),

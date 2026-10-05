@@ -269,3 +269,18 @@ def test_media_extraction_raises_the_limit():
 def test_above_the_verified_media_limit_warns():
     with pytest.warns(ConfigWarning, match="1500"):
         _check(2000, **_MEDIA_ON)
+
+
+def test_config_reference_is_current():
+    """CONFIG-REFERENCE.md is generated; regenerate it after changing a Field."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "gen_config_reference", root / "scripts" / "gen_config_reference.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (root / "CONFIG-REFERENCE.md").read_text() == module.render(), (
+        "Run: python scripts/gen_config_reference.py"
+    )

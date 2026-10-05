@@ -21,6 +21,7 @@ failing when one does, which is usually the harder problem.
 | Document | Answers |
 |---|---|
 | This README | How do I install it, configure a connector, and run the commands? |
+| [CONFIG-REFERENCE.md](CONFIG-REFERENCE.md) | Which config keys does each connector take? |
 | [IDENTITY-AND-PERMISSIONS.md](IDENTITY-AND-PERMISSIONS.md) | What does it create, where do credentials live, and what does the caller need? |
 | [THREAT-MODEL.md](THREAT-MODEL.md) | What can go wrong, which threats are mitigated, and what risk is left? |
 | [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) | What doesn't work yet, and what is exercised end to end? |
