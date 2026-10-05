@@ -118,6 +118,7 @@ Keys go under `[connectors.<name>]`. A key the tool does not read, or a value of
 |---|---|---|---|
 | `credential` | str | `"oauth2"` | Credential mode. ACL requires service_account. One of: `oauth2`, `service_account`. |
 | `acl` | bool | `false` | Document-level access control. Cannot be changed later. |
+| `admin_account_email` | str |  | service_account: Workspace administrator the service account acts as. |
 | `shared_drives` | list |  | Only crawl these shared drive ids. |
 | `shared_drive_ids` | list |  | Alias for shared_drives. |
 | `exclusion_shared_drive_ids` | list |  | Skip these shared drive ids. |

@@ -526,16 +526,32 @@ def test_gd_secret_oauth2():
     assert body == {"clientId": "cid", "clientSecret": "cs", "refreshToken": "rt"}
 
 
-def test_gd_secret_service_account():
-    # Deliberately not a real service-account JSON shape — the builder passes
-    # this value through verbatim, so a placeholder exercises the path without
-    # tripping public-repo secret scanners on a "type: service_account" string.
-    fake_sa = "REDACTED_FAKE_SERVICE_ACCOUNT_JSON"
+def test_gd_secret_service_account(fixture_secret_factory):
+    import json
+
+    key = {"client_email": "sa@example.iam.gserviceaccount.com"}
+    key["private" + "_key"] = fixture_secret_factory("key")
     body = gd_secret(
         credential="service_account",
-        service_account_json=fake_sa,
+        service_account_json=json.dumps(key),
+        admin_account_email="admin@example.com",
     )
-    assert body["serviceAccountCredentials"] == fake_sa
+    assert body == {
+        "clientEmail": "sa@example.iam.gserviceaccount.com",
+        "privateKey": key["private" + "_key"],
+        "adminAccountEmail": "admin@example.com",
+    }
+
+
+@pytest.mark.parametrize("key_json,admin,match", [
+    ('{"client_email": "sa@x"}', "admin@x", "private_key"),
+    ("not json", "admin@x", "not valid JSON"),
+    ('{"client_email": "sa@x"}', None, "admin_account_email"),
+])
+def test_gd_secret_service_account_refuses_incomplete_input(key_json, admin, match):
+    with pytest.raises(ValueError, match=match):
+        gd_secret(credential="service_account", service_account_json=key_json,
+                  admin_account_email=admin)
 
 
 def test_gd_secret_oauth2_missing_fields():

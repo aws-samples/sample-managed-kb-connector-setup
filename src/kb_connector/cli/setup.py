@@ -2341,6 +2341,7 @@ def _setup_guided(
                 client_secret=getattr(cs, "_client_secret", None),
                 refresh_token=getattr(cs, "_refresh_token", None),
                 service_account_json=getattr(cs, "_sa_json", None),
+                admin_account_email=cfg.get("admin_account_email"),
             )
 
         secret_res = provisioning.put_secret(

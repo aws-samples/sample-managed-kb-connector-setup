@@ -126,8 +126,15 @@ def build_secret_body(
     client_secret: str | None = None,
     refresh_token: str | None = None,
     service_account_json: str | None = None,
+    admin_account_email: str | None = None,
 ) -> dict:
-    """Build the Secrets Manager secret JSON for a Google Drive connector."""
+    """Build the Secrets Manager secret JSON for a Google Drive connector.
+
+    For a service account, `service_account_json` is the downloaded key file.
+    The connector takes its `client_email` and `private_key`, plus the Workspace
+    administrator the service account impersonates through domain-wide
+    delegation.
+    """
     cred = credential.strip().lower()
 
     if cred == "oauth2":
@@ -144,7 +151,28 @@ def build_secret_body(
     if cred == "service_account":
         if not service_account_json:
             raise ValueError("service_account_json required for service_account credential.")
-        return {"serviceAccountCredentials": service_account_json}
+        if not admin_account_email:
+            raise ValueError(
+                "admin_account_email is required for service_account: the Workspace "
+                "administrator the service account acts as."
+            )
+        import json
+
+        try:
+            key = json.loads(service_account_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Service account key file is not valid JSON: {exc.msg}.") from None
+        missing = [k for k in ("client_email", "private_key") if not key.get(k)]
+        if missing:
+            raise ValueError(
+                f"Service account key file has no {', '.join(missing)}. Use the JSON "
+                f"key downloaded from Google Cloud for the service account."
+            )
+        return {
+            "clientEmail": key["client_email"],
+            "privateKey": key["private_key"],
+            "adminAccountEmail": admin_account_email,
+        }
 
     raise ValueError(f"Unknown credential {credential!r} for Google Drive.")
 
@@ -160,6 +188,9 @@ class GoogleDriveConnector(ConnectorSpec):
               default="oauth2", choices=("oauth2", "service_account"), ask=True),
         Field("acl", bool, "Document-level access control. Cannot be changed later.",
               default=False, ask=True),
+        Field("admin_account_email", str,
+              "service_account: Workspace administrator the service account acts as.",
+              in_params=False, ask=True),
         Field("shared_drives", list, "Only crawl these shared drive ids.", ask=True),
         Field("shared_drive_ids", list, "Alias for shared_drives."),
         Field("exclusion_shared_drive_ids", list, "Skip these shared drive ids."),

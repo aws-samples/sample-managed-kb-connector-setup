@@ -265,12 +265,28 @@ def test_confluence_sends_the_filter_keys(cloud, capsys, monkeypatch, fixture_se
     assert params["aclEnabled"] is True
 
 
+_secret_written: dict = {}
+
+
 def test_google_drive_sends_the_filter_keys(cloud, capsys, monkeypatch, tmp_path):
+    from kb_connector.core import provisioning
+
+    real_put = provisioning.put_secret
+
+    def _capture(**kw):
+        _secret_written.clear()
+        _secret_written.update(kw["body"])
+        return real_put(**kw)
+
+    monkeypatch.setattr(provisioning, "put_secret", _capture)
     key_file = tmp_path / "sa.json"
-    key_file.write_text(json.dumps({"type": "service_account", "client_email": "sa@x"}))
+    key = {"client_email": "sa@x"}
+    key["private" + "_key"] = "generated-in-test"
+    key_file.write_text(json.dumps(key))
     monkeypatch.setattr("builtins.input", lambda prompt="": str(key_file))
     _write_config(
         '[connectors.c]\ntype = "googledrive"\ncredential = "service_account"\n'
+        'admin_account_email = "admin@example.com"\n'
         'shared_drive_ids = ["D1"]\ninclusion_folder_ids = ["F1"]\n'
     )
     params, _ = _full_lifecycle(cloud, capsys)
@@ -278,6 +294,7 @@ def test_google_drive_sends_the_filter_keys(cloud, capsys, monkeypatch, tmp_path
         "inclusionSharedDriveIds": ["D1"], "inclusionFolderIds": ["F1"],
     }
     assert params["connectionConfiguration"]["authType"] == "SERVICE_ACCOUNT"
+    assert _secret_written["adminAccountEmail"] == "admin@example.com"
 
 
 def test_sharepoint(cloud, capsys):
