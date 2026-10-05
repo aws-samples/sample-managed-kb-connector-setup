@@ -10,8 +10,19 @@ Stage 2: Always automated (KB + DS creation with web crawl config).
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
-from kb_connector.interactive import SetupStep
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import (
+    BuildContext,
+    ConnectorSpec,
+    Field,
+    MAX_FILE_SIZE_HELP,
+    check_max_file_size,
+)
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
+    from kb_connector.core.overrides import RequestOverrides
 
 
 # Auth type mapping
@@ -239,48 +250,45 @@ def build_secret_body(
 class WebConnector(ConnectorSpec):
     """Web crawler managed connector spec."""
 
-    connector_type = "WEB"
-    provider = None  # no 3P identity provider for NO_AUTH
+    type = "web"
+    api_type = "WEB"
+    provider = None
+    fields = (
+        Field("seed_urls", list, "URLs to start crawling from. Set this or sitemap_urls.",
+              ask=True),
+        Field("sitemap_urls", list, "Sitemap URLs to crawl."),
+        Field("auth_mode", str, "Authentication for the crawl target.", default="no_auth",
+              choices=("no_auth", "basic_auth"), ask=True),
+        Field("username", str, "basic_auth user name.", in_params=False),
+        Field("password", str,
+              "basic_auth password. Prefer leaving this out and entering it when prompted.",
+              in_params=False),
+        Field("crawl_depth", int, "Maximum link depth from the seed URLs.", ask=True),
+        Field("max_links_per_url", int, "Maximum links followed per page."),
+        Field("max_crawled_urls_per_minute", int, "Crawl rate limit."),
+        Field("sync_scope", str, "How far the crawler follows links.",
+              choices=tuple(sorted(_SYNC_SCOPES))),
+        Field("crawl_attachments", bool, "Crawl linked attachments.", default=False),
+        Field("max_file_size_mb", (int, str), MAX_FILE_SIZE_HELP),
+        Field("inclusion_filters", list, "Only crawl URLs matching these patterns."),
+        Field("exclusion_filters", list, "Skip URLs matching these patterns."),
+    )
 
-    def setup_steps(self, config: dict) -> list[SetupStep]:
-        return []  # Web setup is driven directly by cli/setup.py
-
-    def build_connector_params(self, config: dict, state: dict) -> dict:
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
         return build_connector_params(
-            seed_urls=config.get("seed_urls"),
-            auth_mode=config.get("auth_mode", "no_auth"),
-            secret_arn=state.get("secret_arn"),
-            sitemap_urls=config.get("sitemap_urls"),
-            crawl_depth=config.get("crawl_depth"),
-            max_links_per_url=config.get("max_links_per_url"),
-            max_crawled_urls_per_minute=config.get("max_crawled_urls_per_minute"),
-            sync_scope=config.get("sync_scope"),
-            crawl_attachments=config.get("crawl_attachments", False),
-            max_file_size_mb=config.get("max_file_size_mb"),
-            inclusion_filters=config.get("inclusion_filters"),
-            exclusion_filters=config.get("exclusion_filters"),
+            seed_urls=self.value(cfg, "seed_urls"),
+            auth_mode=self.value(cfg, "auth_mode"),
+            secret_arn=ctx.secret_arn,
+            sitemap_urls=self.value(cfg, "sitemap_urls"),
+            crawl_depth=self.value(cfg, "crawl_depth"),
+            max_links_per_url=self.value(cfg, "max_links_per_url"),
+            max_crawled_urls_per_minute=self.value(cfg, "max_crawled_urls_per_minute"),
+            sync_scope=self.value(cfg, "sync_scope"),
+            crawl_attachments=self.value(cfg, "crawl_attachments"),
+            max_file_size_mb=self.value(cfg, "max_file_size_mb"),
+            inclusion_filters=self.value(cfg, "inclusion_filters"),
+            exclusion_filters=self.value(cfg, "exclusion_filters"),
         )
 
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return build_secret_body(
-            auth_mode=config.get("auth_mode", "no_auth"),
-            username=config.get("username"),
-            password=config.get("password"),
-        )
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("seed_urls", type=list, required=True, prompt="Seed URLs to crawl"),
-            ConfigField("auth_mode", default="no_auth",
-                        prompt="Auth mode (no_auth, basic_auth)"),
-            ConfigField("sitemap_urls", type=list, required=False, prompt="Sitemap URLs"),
-            ConfigField("crawl_depth", type=int, required=False, prompt="Max crawl depth"),
-            ConfigField("max_links_per_url", type=int, required=False,
-                        prompt="Max links per URL"),
-            ConfigField("crawl_attachments", type=bool, default=False,
-                        prompt="Crawl attachments?"),
-            ConfigField("inclusion_filters", type=list, required=False,
-                        prompt="URL inclusion patterns"),
-            ConfigField("exclusion_filters", type=list, required=False,
-                        prompt="URL exclusion patterns"),
-        ]
+    def check(self, cfg: ConnectorConfig, overrides: RequestOverrides) -> None:
+        check_max_file_size(cfg.get("max_file_size_mb"), overrides)

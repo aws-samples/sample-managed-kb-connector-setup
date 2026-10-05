@@ -439,3 +439,25 @@ def test_profile_comes_from_config(tmp_path, monkeypatch):
     rec = _Recorder().install(monkeypatch)
     assert _teardown("--yes") == 0
     assert rec.sessions[0] == ("us-west-2", "team-profile")
+
+
+def test_delete_role_removes_per_connector_content_policies():
+    session, iam = _iam_session(inline=[
+        "kb-connector-access", "kb-connector-s3-content-access",
+        "kb-connector-s3-content-access-other",
+    ])
+    td.delete_role(session, _ROLE_ARN)
+    assert iam.delete_role_policy.call_count == 3
+    iam.delete_role.assert_called_once()
+
+
+@pytest.mark.parametrize("name", [
+    "kb-connector-s3-content-access-",
+    "kb-connector-s3-content-access-bad name",
+    "kb-connector-s3-content-accessx",
+])
+def test_lookalike_content_policy_names_are_foreign(name):
+    session, iam = _iam_session(inline=["kb-connector-access", name])
+    with pytest.raises(ConnectorError, match="did not create"):
+        td.delete_role(session, _ROLE_ARN)
+    iam.delete_role_policy.assert_not_called()

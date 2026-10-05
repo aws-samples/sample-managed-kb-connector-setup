@@ -18,7 +18,13 @@ Shape validated against the live bedrock-agent API:
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import BuildContext, ConnectorSpec, Field
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
+
 from kb_connector.interactive import SetupStep
 
 
@@ -156,8 +162,38 @@ def build_secret_body(
 class ConfluenceConnector(ConnectorSpec):
     """Confluence managed connector spec."""
 
-    connector_type = "CONFLUENCE"
+    type = "confluence"
+    api_type = "CONFLUENCE"
     provider = "atlassian"
+    fields = (
+        Field("host_url", str, "Confluence URL, for example https://company.atlassian.net.",
+              required=True, ask=True),
+        Field("credential", str, "Credential mode. ACL requires basic.", default="oauth2",
+              choices=("oauth2", "basic", "basic_auth"), ask=True),
+        Field("hosting_type", str, "Hosting type.", default="SAAS"),
+        Field("acl", bool, "Document-level access control. Cannot be changed later.",
+              default=False, ask=True),
+        Field("space_keys", list, "Only crawl these spaces.", ask=True),
+        Field("exclusion_space_keys", list, "Skip these spaces."),
+        Field("inclusion_mime_types", list, "Only crawl these MIME types."),
+        Field("exclusion_mime_types", list, "Skip these MIME types."),
+        Field("data_entities", dict,
+              "Content types to crawl, for example { crawl_page = true, crawl_blog = false }."),
+    )
+
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
+        return build_connector_params(
+            host_url=self.value(cfg, "host_url") or "",
+            credential=cfg.credential or self.field("credential").default,
+            secret_arn=ctx.secret_arn or "",
+            acl=cfg.acl if ctx.acl is None else ctx.acl,
+            hosting_type=self.value(cfg, "hosting_type"),
+            space_keys=self.value(cfg, "space_keys"),
+            exclusion_space_keys=self.value(cfg, "exclusion_space_keys"),
+            inclusion_mime_types=self.value(cfg, "inclusion_mime_types"),
+            exclusion_mime_types=self.value(cfg, "exclusion_mime_types"),
+            data_entities=self.value(cfg, "data_entities"),
+        )
 
     def setup_steps(self, config: dict) -> list[SetupStep]:
         """Confluence setup is guided: user creates OAuth app in Atlassian."""
@@ -178,43 +214,6 @@ class ConfluenceConnector(ConnectorSpec):
             ),
         ]
 
-    def build_connector_params(self, config: dict, state: dict) -> dict:
-        return build_connector_params(
-            host_url=config["host_url"],
-            credential=config.get("credential", "oauth2"),
-            secret_arn=state["secret_arn"],
-            acl=config.get("acl", False),
-            hosting_type=config.get("hosting_type", "SAAS"),
-            space_keys=config.get("space_keys"),
-            exclusion_space_keys=config.get("exclusion_space_keys"),
-            inclusion_mime_types=config.get("inclusion_mime_types"),
-            exclusion_mime_types=config.get("exclusion_mime_types"),
-            data_entities=config.get("data_entities"),
-        )
-
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return build_secret_body(
-            credential=config.get("credential", "oauth2"),
-            client_id=state.get("client_id"),
-            client_secret=state.get("client_secret"),
-            access_token=state.get("access_token"),
-            refresh_token=state.get("refresh_token"),
-            username=state.get("username"),
-            api_token=state.get("api_token"),
-        )
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("host_url", required=True,
-                        prompt="Confluence host URL (e.g. https://company.atlassian.net)"),
-            ConfigField("credential", default="oauth2",
-                        prompt="Credential mode (oauth2, basic)"),
-            ConfigField("hosting_type", default="SAAS",
-                        prompt="Hosting type (SAAS, SERVER, DATA_CENTER)"),
-            ConfigField("acl", type=bool, default=False, prompt="Enable document-level ACL?"),
-            ConfigField("space_keys", type=list, required=False,
-                        prompt="Space keys to include (blank for all)"),
-        ]
 
 
 # --- Guided setup helpers ----------------------------------------------------

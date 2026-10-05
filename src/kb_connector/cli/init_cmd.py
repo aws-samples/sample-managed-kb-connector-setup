@@ -15,6 +15,7 @@ import os
 import re
 import sys
 
+from kb_connector.connectors.base import Field
 from kb_connector.core.errors import ConfigError, ConnectorError
 from kb_connector.core.fileio import atomic_write_bytes
 
@@ -197,9 +198,9 @@ def _prompt_defaults() -> dict:
     if profile:
         defaults["profile"] = profile
 
-    owner = _prompt_optional("Owner name (suffixes resource names)")
-    if owner:
-        defaults["owner"] = owner
+    prefix = _prompt_optional("Prefix for derived resource names")
+    if prefix:
+        defaults["resource_prefix"] = prefix
 
     cert_bucket = _prompt_optional("S3 bucket for certificates")
     if cert_bucket:
@@ -219,109 +220,68 @@ def _prompt_defaults() -> dict:
 
 
 def _prompt_connector(defaults: dict) -> tuple[str, dict] | None:
-    """Prompt for a single connector definition. Returns None to stop."""
+    """Prompt for one connector. Returns None to stop.
+
+    The questions come from the connector's spec: every required key, plus the
+    keys marked `ask`. Answers equal to a key's default are not written.
+    """
+    from kb_connector.connectors import all_specs
+
     if not _prompt_yn("\n  Add a connector?", default=True):
         return None
 
     name = _prompt("Connector name (short label)")
-    connector_type = _prompt_choice(
-        "Connector type",
-        ["sharepoint", "onedrive", "s3", "web", "confluence", "googledrive"],
-    )
+    specs = all_specs()
+    connector_type = _prompt_choice("Connector type", list(specs))
+    spec = specs[connector_type]
 
     config: dict = {"type": connector_type}
-
-    if connector_type in ("sharepoint", "onedrive"):
-        _prompt_microsoft_connector(config, connector_type, defaults)
-    elif connector_type == "s3":
-        _prompt_s3_connector(config)
-    elif connector_type == "web":
-        _prompt_web_connector(config)
-    elif connector_type == "confluence":
-        _prompt_confluence_connector(config)
-    elif connector_type == "googledrive":
-        _prompt_googledrive_connector(config)
-
+    for f in spec.fields:
+        if not (f.required or f.ask):
+            continue
+        if f.key == "tenant_id" and defaults.get("microsoft", {}).get("tenant_id"):
+            continue
+        if f.key == "sites_selected" and connector_type != "sharepoint":
+            continue
+        value = _prompt_field(f)
+        if value is not None and value != f.default:
+            config[f.key] = value
     return name, config
 
 
-def _prompt_microsoft_connector(config: dict, connector_type: str, defaults: dict) -> None:
-    """Prompt for SharePoint/OneDrive-specific fields."""
-    # Tenant ID (may already be in defaults)
-    ms_defaults = defaults.get("microsoft", {})
-    if not ms_defaults.get("tenant_id"):
-        tenant_id = _prompt("Microsoft Entra tenant ID",
-                            validate=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-        config["tenant_id"] = tenant_id
+_TENANT_ID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
-    # SharePoint only has one usable mode, so there's nothing to choose:
-    # 'client_secret' can't supply the certificateS3Path the connector requires,
-    # and 'ropc' isn't automated here (see KNOWN-LIMITATIONS.md).
-    if connector_type == "sharepoint":
-        credential = "cert"
-        print("  Credential mode: cert (the only mode SharePoint supports)")
-    else:
-        credential = _prompt_choice(
-            "Credential mode",
-            ["cert", "client_secret", "oauth2_refresh"],
-            default="cert",
-        )
-    config["credential"] = credential
 
-    acl = _prompt_yn("  Enable ACL (document-level access control)?", default=True)
-    config["acl"] = acl
-
-    if connector_type == "sharepoint":
-        urls: list[str] = []
+def _prompt_field(f: Field) -> object:
+    """Ask for one field's value, parsed to its kind. None means left blank."""
+    label = f"{f.help.rstrip('.')} [{f.key}]"
+    kinds = f.kind if isinstance(f.kind, tuple) else (f.kind,)
+    if bool in kinds:
+        return _prompt_yn(f"  {label}?", default=bool(f.default))
+    if f.choices:
+        return _prompt_choice(label, list(f.choices), default=f.default or "")
+    if list in kinds:
+        return _prompt_list(label, required=f.required)
+    if int in kinds:
         while True:
-            url = _prompt("SharePoint site URL")
-            urls.append(url)
-            if not _prompt_yn("  Add another site URL?", default=False):
-                break
-        config["site_urls"] = urls
-
-        host = _prompt_optional("SharePoint host (e.g. contoso.sharepoint.com)")
-        if host:
-            config["sharepoint_host"] = host
-
-        if _prompt_yn("  Use Sites.Selected (least-privilege)?", default=False):
-            config["sites_selected"] = True
+            raw = _prompt_optional(label)
+            if not raw:
+                return None
+            if raw.isdigit():
+                return int(raw)
+            print("    (a whole number)")
+    validate = _TENANT_ID_RE if f.key == "tenant_id" else None
+    if f.required:
+        return _prompt(label, validate=validate)
+    return _prompt_optional(label) or None
 
 
-def _prompt_s3_connector(config: dict) -> None:
-    """Prompt for S3-specific fields."""
-    config["bucket_name"] = _prompt("S3 bucket name")
-    acl = _prompt_yn("  Enable document-level ACL?", default=False)
-    config["acl"] = acl
-    if acl:
-        config["acl_s3_uri"] = _prompt("S3 URI to global ACL JSON file")
-
-
-def _prompt_web_connector(config: dict) -> None:
-    """Prompt for Web-specific fields."""
-    urls: list[str] = []
+def _prompt_list(label: str, *, required: bool) -> list[str] | None:
+    """Ask for values one at a time until a blank line."""
+    values: list[str] = []
     while True:
-        url = _prompt("Seed URL")
-        urls.append(url)
-        if not _prompt_yn("  Add another seed URL?", default=False):
-            break
-    config["seed_urls"] = urls
-
-    auth_mode = _prompt_choice("Auth mode", ["no_auth", "basic_auth"], default="no_auth")
-    if auth_mode != "no_auth":
-        config["auth_mode"] = auth_mode
-
-    depth = _prompt_optional("Max crawl depth (blank for default)")
-    if depth:
-        config["crawl_depth"] = int(depth)
-
-
-def _prompt_confluence_connector(config: dict) -> None:
-    """Prompt for Confluence-specific fields."""
-    config["host_url"] = _prompt("Confluence host URL (e.g. https://company.atlassian.net/wiki)")
-    config["credential"] = _prompt_choice("Credential mode", ["oauth2", "basic_auth"], default="oauth2")
-
-
-def _prompt_googledrive_connector(config: dict) -> None:
-    """Prompt for Google Drive-specific fields."""
-    config["credential"] = _prompt_choice("Credential mode", ["oauth2", "service_account"], default="oauth2")
+        prompt = label if not values else "  another (blank to finish)"
+        value = _prompt(prompt) if required and not values else _prompt_optional(prompt)
+        if not value:
+            return values or None
+        values.append(value)

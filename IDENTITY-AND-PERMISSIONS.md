@@ -308,7 +308,13 @@ than creating a redundant role. It only ever *adds* resource ARNs to statements
 it recognizes by `Sid`, and never widens an action. If it finds no statement it
 recognizes, it attaches a separate policy named
 `kb-connector-supplemental-access` instead of editing one it didn't author, so
-you can see exactly what was added.
+you can see exactly what was added. For the S3 connector it also attaches
+`kb-connector-s3-content-access`, granting read on the content bucket. Teardown
+does not remove these from a role it did not create.
+
+A role passed with `--kb-role-arn` is used as given: setup does not change it,
+so it must already grant access to the connector's secret, certificate and
+content bucket.
 
 ## Resource ownership and reuse
 

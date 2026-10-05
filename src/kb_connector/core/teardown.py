@@ -133,10 +133,11 @@ def delete_role(session: Any, role_arn: str) -> None:
     * The role is in an instance profile: an EC2 workload depends on it.
     * Inline policies this tool did not author.
 
-    Recognition is by exact name against TOOL_INLINE_POLICY_NAMES, not a
-    `kb-connector` prefix, which would also match policies the tool never wrote.
+    Recognition is by `is_tool_policy_name`: exact names, plus the per-connector
+    S3 content policy. Not a `kb-connector` prefix, which would also match
+    policies the tool never wrote.
     """
-    from kb_connector.core.provisioning import TOOL_INLINE_POLICY_NAMES
+    from kb_connector.core.provisioning import is_tool_policy_name
 
     iam = session.client("iam")
     role_name = role_name_from_arn(role_arn)
@@ -164,8 +165,8 @@ def delete_role(session: Any, role_arn: str) -> None:
         )
 
     all_policies = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
-    ours = [p for p in all_policies if p in TOOL_INLINE_POLICY_NAMES]
-    foreign = [p for p in all_policies if p not in TOOL_INLINE_POLICY_NAMES]
+    ours = [p for p in all_policies if is_tool_policy_name(p)]
+    foreign = [p for p in all_policies if not is_tool_policy_name(p)]
 
     if foreign:
         names = ", ".join(foreign)

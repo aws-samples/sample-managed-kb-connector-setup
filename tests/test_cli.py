@@ -158,3 +158,24 @@ def test_wait_timeout_is_both_a_connector_error_and_a_timeout(monkeypatch):
         wait_until_ds_available(target, "KB", "DS", timeout_seconds=0)
     assert isinstance(exc_info.value, ConnectorError)
     assert isinstance(exc_info.value, TimeoutError)
+
+
+# --- config warnings ------------------------------------------------------------
+
+
+def test_config_warnings_print_once_as_plain_lines(tmp_path, monkeypatch, capsys):
+    import warnings
+
+    from kb_connector.cli.main import main
+
+    (tmp_path / "kb-connector.toml").write_text(
+        '[connectors.c]\ntype = "s3"\nregion = "us-west-2"\nbucket_name = "b"\n'
+        "max_file_size = 100\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["kb-connector", "validate", "c", "--skip-retrieve"])
+    with warnings.catch_warnings():
+        assert main() == 1  # no checks ran; the warning is what this tests
+    err = capsys.readouterr().err
+    line = "Warning: [connectors.c]: unknown key 'max_file_size' is ignored. Did you mean 'max_file_size_mb'?"
+    assert err.count(line) == 1

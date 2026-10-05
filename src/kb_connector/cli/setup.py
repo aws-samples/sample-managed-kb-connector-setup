@@ -19,6 +19,8 @@ from dataclasses import dataclass, field as dataclass_field
 from getpass import getpass
 from typing import TYPE_CHECKING, Any
 
+from kb_connector.connectors import get_spec
+from kb_connector.connectors.base import BuildContext, ConnectorSpec
 from kb_connector.core import overrides as request_overrides
 from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
@@ -454,9 +456,14 @@ def _run_setup(args: argparse.Namespace) -> int:
         print(f"  target: {cfg.target}")
 
     # Checked before any Graph or AWS call, so a malformed or misspelled
-    # override fails here rather than after resources exist.
+    # override, or a value the service rejects, fails here rather than after
+    # resources exist.
     if cfg.target == "bmkb":
-        request_overrides.check_against_model(request_overrides.load(cfg.raw))
+        loaded_overrides = request_overrides.load(cfg.raw)
+        request_overrides.check_against_model(loaded_overrides)
+        spec = get_spec(cfg.type)
+        if spec is not None:
+            spec.check(cfg, loaded_overrides)
 
     # Dispatch to the appropriate setup path. Persist state in a finally block
     # so that resources created before a mid-flight failure are still tracked
@@ -558,6 +565,13 @@ def _record_region(cs: ConnectorState, cfg: ConnectorConfig) -> None:
             f"to {cs.region}."
         )
     cs.region = cfg.region
+
+
+def _spec(cfg: ConnectorConfig) -> ConnectorSpec:
+    spec = get_spec(cfg.type)
+    if spec is None:
+        raise ConfigError(f"Connector type {cfg.type!r} setup not yet implemented.")
+    return spec
 
 
 def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
@@ -832,7 +846,8 @@ def _create_data_source_with_diagnostics(
         ds_resp = target.create_data_source_raw(kb_id, payload)
     except AwsError as exc:
         text = str(exc)
-        if "409" in text and "already exists" in text.lower():
+        conflict = exc.code == "ConflictException" or "409" in text
+        if conflict and "already exists" in text.lower():
             raise AwsError(
                 f"A data source named {ds_name!r} already exists on knowledge "
                 f"base {kb_id}. If you just ran teardown, Bedrock deletes data "
@@ -861,12 +876,9 @@ def _setup_microsoft(
 ) -> None:
     """Full SP/OD setup: Stage 1 (Entra) + Stage 2 (AWS)."""
     from kb_connector.connectors.sharepoint import (
-        filter_config_from_config as sp_filter_config,
-        build_connector_params as sp_params,
         build_secret_body as sp_secret,
     )
     from kb_connector.connectors.onedrive import (
-        build_connector_params as od_params,
         build_secret_body as od_secret,
     )
     from kb_connector.providers.microsoft.client import GraphClient
@@ -1167,7 +1179,6 @@ def _setup_microsoft(
             args, cfg, connector_name, account_id, uses_cert=uses_cert
         )
         secret_name = names["secret_name"]
-        kb_role_name = names["kb_role_name"]
         cert_s3_bucket = names["cert_bucket"]
         cert_s3_key = names["cert_key"]
         if uses_cert and not (args.cert_s3_bucket or cfg.cert_s3_bucket):
@@ -1288,73 +1299,24 @@ def _setup_microsoft(
             cs.secret_arn = secret_arn
             cs.record_ownership(state_mod.RESOURCE_SECRET, secret_res.state_marker)
 
-        # IAM role
-        kb_id = args.knowledge_base_id or cs.knowledge_base_id
-        kb_role_arn = args.kb_role_arn or cs.kb_role_arn
-
-        if kb_id and not args.no_create_kb_role:
-            # Reusing existing KB — extend its role
-            _extend_existing_kb_role(session, cfg, cs, kb_id, secret_arn,
-                                    cert_s3_bucket, cert_s3_key, uses_cert,
-                                    account_id=account_id, opts=opts)
-        elif not args.no_create_kb_role:
-            role_res = provisioning.ensure_kb_role(
-                session=session,
-                role_name=kb_role_name,
-                account_id=account_id,
-                region=cfg.region,
-                secret_arn=secret_arn,
-                cert_bucket=cert_s3_bucket if uses_cert else None,
-                cert_key=cert_s3_key if uses_cert else None,
-                cert_key_prefix=cfg.cert_s3_key_prefix if uses_cert else None,
-                kms_key_arn=opts.kms_key_arn,
-                connector_name=connector_name,
-                tags_enabled=opts.tags_enabled,
-                extra_tags=opts.tags,
-                adopt_existing=opts.adopt_existing,
-                created_untagged=cs.created_untagged(state_mod.RESOURCE_ROLE),
-            )
-            kb_role_arn = role_res.arn
-            print(f"  Provisioned IAM role: {kb_role_arn}")
-            cs.kb_role_arn = kb_role_arn
-            cs.record_ownership(state_mod.RESOURCE_ROLE, role_res.state_marker)
-            # IAM propagation
-            print("  Waiting for IAM propagation...")
-            time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
-        elif kb_role_arn:
-            # From --kb-role-arn, or from state on a re-run. Adopted unless state
-            # already records this same role as one this tool created.
-            _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
+        kb_role_arn = _ensure_kb_role(
+            args=args, cfg=cfg, cs=cs, connector_name=connector_name,
+            session=session, account_id=account_id, opts=opts,
+            secret_arn=secret_arn,
+            cert_s3_bucket=cert_s3_bucket if uses_cert else None,
+            cert_s3_key=cert_s3_key if uses_cert else None,
+        )
 
         # Create KB (if needed) + data source via the target abstraction
         target = _build_target(cfg, session)
 
-        if cfg.type == "sharepoint":
-            site_urls = cfg.get("site_urls", [])
-            connector_params = sp_params(
-                credential=credential,
-                tenant_id=tenant_id,
-                secret_arn=secret_arn,
-                acl=acl,
-                site_urls=site_urls,
-                cert_s3_bucket=cert_s3_bucket if uses_cert else None,
-                cert_s3_key=cert_s3_key if uses_cert else None,
-                crawl_files=cfg.get("crawl_files", True),
-                crawl_pages=cfg.get("crawl_pages", True),
-                filter_config=sp_filter_config(cfg.raw),
-            )
-        else:  # onedrive
-            connector_params = od_params(
-                credential=credential,
-                tenant_id=tenant_id,
-                secret_arn=secret_arn,
-                acl=acl,
-                cert_s3_bucket=cert_s3_bucket if uses_cert else None,
-                cert_s3_key=cert_s3_key if uses_cert else None,
-                crawl_personal_drives=cfg.get("crawl_personal_drives", True),
-                crawl_shared_with_me=cfg.get("crawl_shared_with_me", False),
-                inclusion_user_emails=cfg.get("inclusion_user_emails"),
-            )
+        connector_params = _spec(cfg).build_connector_params(cfg, BuildContext(
+            account_id=account_id,
+            secret_arn=secret_arn,
+            cert_s3_bucket=cert_s3_bucket if uses_cert else None,
+            cert_s3_key=cert_s3_key if uses_cert else None,
+            acl=acl,
+        ))
 
         _provision_kb_and_ds(
             target=target,
@@ -1805,70 +1767,166 @@ def _delete_granter_app(
         )
 
 
+def _ensure_kb_role(
+    *,
+    args: argparse.Namespace,
+    cfg: ConnectorConfig,
+    cs: ConnectorState,
+    connector_name: str,
+    session: Session,
+    account_id: str,
+    opts: _ProvisionOptions,
+    secret_arn: str | None,
+    cert_s3_bucket: str | None = None,
+    cert_s3_key: str | None = None,
+    content_bucket: str | None = None,
+) -> str | None:
+    """Return the KB role, giving it access to this connector's credentials.
+
+    * `--no-create-kb-role`: `--kb-role-arn`, or the role in state, as given.
+    * A knowledge base this tool did not create (`--kb`, or one recorded as
+      external): that KB's role, extended add-only with the connector's secret,
+      certificate and S3 content bucket.
+    * A role this tool did not create (`--kb-role-arn`): used as given.
+    * Otherwise the connector's own role, created or updated in place. On a
+      re-run that is the role state records, not a newly derived name.
+    """
+    from kb_connector.core import provisioning
+    from kb_connector.core.teardown import role_name_from_arn
+
+    if args.no_create_kb_role:
+        role_arn = args.kb_role_arn or cs.kb_role_arn
+        if role_arn:
+            _record_reused_resource(cs, state_mod.RESOURCE_ROLE, role_arn)
+        return role_arn
+
+    kb_id = args.knowledge_base_id or cs.knowledge_base_id
+    if kb_id and not cs.is_recorded_ours(state_mod.RESOURCE_KB, kb_id):
+        return _extend_existing_kb_role(
+            session, cfg, cs, kb_id, secret_arn, cert_s3_bucket, cert_s3_key,
+            account_id=account_id, opts=opts, content_bucket=content_bucket,
+        )
+
+    given = args.kb_role_arn or cs.kb_role_arn
+    if given and not cs.is_recorded_ours(state_mod.RESOURCE_ROLE, given):
+        _record_reused_resource(cs, state_mod.RESOURCE_ROLE, given)
+        return given
+
+    role_name = (
+        role_name_from_arn(cs.kb_role_arn) if cs.kb_role_arn
+        else args.kb_role_name or _derived_name(cfg, f"kb-connector-{connector_name}-role")
+    )
+    cert_prefix = cfg.cert_s3_key_prefix if cert_s3_bucket else None
+    role_res = provisioning.ensure_kb_role(
+        session=session,
+        role_name=role_name,
+        account_id=account_id,
+        region=cfg.region or "",
+        secret_arn=secret_arn,
+        cert_bucket=cert_s3_bucket,
+        cert_key=cert_s3_key,
+        cert_key_prefix=cert_prefix,
+        kms_key_arn=opts.kms_key_arn,
+        connector_name=connector_name,
+        tags_enabled=opts.tags_enabled,
+        extra_tags=opts.tags,
+        adopt_existing=opts.adopt_existing,
+        created_untagged=cs.created_untagged(state_mod.RESOURCE_ROLE),
+    )
+    if content_bucket:
+        _add_s3_content_policy(
+            session, role_name, content_bucket, account_id,
+            inclusion_prefixes=cfg.get("inclusion_prefixes"),
+        )
+    print(f"  {'Provisioned' if role_res.created else 'Updated'} IAM role: {role_res.arn}")
+    cs.kb_role_arn = role_res.arn
+    cs.record_ownership(state_mod.RESOURCE_ROLE, role_res.state_marker)
+    if role_res.created:
+        print("  Waiting for IAM propagation...")
+        time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
+    return role_res.arn
+
+
 def _extend_existing_kb_role(
     session: Session,
     cfg: ConnectorConfig,
     cs: ConnectorState,
     kb_id: str,
-    secret_arn: str,
+    secret_arn: str | None,
     cert_s3_bucket: str | None,
     cert_s3_key: str | None,
-    uses_cert: bool,
     *,
-    account_id: str | None = None,
-    opts: _ProvisionOptions | None = None,
-) -> None:
-    """Extend an existing KB's role to cover the new secret + cert.
+    account_id: str,
+    opts: _ProvisionOptions,
+    content_bucket: str | None = None,
+) -> str | None:
+    """Extend an existing KB's role to reach this connector's credentials.
 
-    The role belongs to a knowledge base the operator pointed us at, so it is
-    recorded as external: teardown must never delete a role that predates this
-    connector and may be shared with other data sources on the same KB.
+    Only adds: the secret and certificate go into statements recognized by Sid,
+    or a separate supplemental policy, and S3 content read goes into its own
+    policy named for this connector, so it cannot replace another connector's
+    grant on the same role. The role belongs to the KB the operator pointed at,
+    so it is recorded as external unless state already records it as ours. A failure is
+    reported and setup continues, since the role may already grant access.
     """
     from kb_connector.core import provisioning
+    from kb_connector.core.teardown import role_name_from_arn
 
     target = _build_target(cfg, session)
     try:
         resp = target.get_knowledge_base(kb_id)
         kb_obj = resp.get("knowledgeBase", resp)
-        role_arn = kb_obj.get("roleArn")
+        role_arn: str | None = kb_obj.get("roleArn")
     except Exception as exc:
         print(f"  WARNING: could not read KB {kb_id} to discover role: {exc}")
-        return
-
+        return None
     if not role_arn:
         print(f"  WARNING: KB {kb_id} has no roleArn; skipping role extension.")
-        return
+        return None
 
-    # Extract role name from ARN
-    role_name = role_arn.split(":role/")[-1].rsplit("/", 1)[-1]
+    role_name = role_name_from_arn(role_arn)
     print(f"  Extending existing KB role: {role_name}")
-
-    try:
-        summary = provisioning.extend_kb_role_for_secret(
-            session=session,
-            role_name=role_name,
-            secret_arn=secret_arn,
-            cert_bucket=cert_s3_bucket if uses_cert else None,
-            cert_key=cert_s3_key if uses_cert else None,
-            cert_key_prefix=cfg.cert_s3_key_prefix if uses_cert else None,
-            account_id=account_id,
-            region=cfg.region,
-            kms_key_arn=opts.kms_key_arn if opts else None,
-        )
-        if summary["secret_added"] or summary["cert_added"]:
-            print(f"  Extended role policy ({', '.join(summary['policies_updated'])})")
-            time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
-        else:
-            print("  Role policy already covers these credentials")
-    except AwsError as exc:
-        print(f"  WARNING: could not extend role: {exc}")
+    changed = False
+    if secret_arn:
+        cert_prefix = cfg.cert_s3_key_prefix if cert_s3_bucket else None
+        try:
+            summary = provisioning.extend_kb_role_for_secret(
+                session=session,
+                role_name=role_name,
+                secret_arn=secret_arn,
+                cert_bucket=cert_s3_bucket,
+                cert_key=cert_s3_key,
+                cert_key_prefix=cert_prefix,
+                account_id=account_id,
+                region=cfg.region,
+                kms_key_arn=opts.kms_key_arn,
+            )
+            if summary["secret_added"] or summary["cert_added"]:
+                print("  Extended role policy to read this connector's credentials")
+                changed = True
+            else:
+                print("  Role policy already covers these credentials")
+        except AwsError as exc:
+            print(f"  WARNING: could not extend role: {exc}")
+    if content_bucket:
+        try:
+            _add_s3_content_policy(
+                session, role_name, content_bucket, account_id,
+                inclusion_prefixes=cfg.get("inclusion_prefixes"),
+                policy_name=provisioning.s3_content_policy_name(cfg.name),
+            )
+            print(f"  Added read access to s3://{content_bucket}")
+            changed = True
+        except Exception as exc:  # noqa: BLE001 - reported; the role may already allow it
+            print(f"  WARNING: could not add S3 read access to the role: {exc}")
+    if changed:
+        time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
 
     # Recorded before kb_role_arn is overwritten, so it compares against what an
-    # earlier pass stored. The role belongs to whoever owns the KB: external when
-    # the operator supplied the KB, but ours when a re-run rediscovered the KB
-    # and role this tool created.
+    # earlier pass stored.
     _record_reused_resource(cs, state_mod.RESOURCE_ROLE, role_arn)
     cs.kb_role_arn = role_arn
+    return role_arn
 
 
 def _import_handoff(handoff_path: str, cs: ConnectorState, cfg: ConnectorConfig) -> None:
@@ -1959,8 +2017,6 @@ def _setup_s3(
 
     print("\n── AWS-side setup (S3) ──")
 
-    from kb_connector.connectors.s3 import build_connector_params as s3_params
-    from kb_connector.core import provisioning
 
     if not cfg.region:
         raise ConfigError("region is required for AWS-side setup.")
@@ -1976,61 +2032,16 @@ def _setup_s3(
     if not bucket_name:
         raise ConfigError("bucket_name is required for S3 connector.")
 
-    # IAM role
-    kb_id = args.knowledge_base_id or cs.knowledge_base_id
-    kb_role_arn = args.kb_role_arn or cs.kb_role_arn
-    kb_role_name = args.kb_role_name or _derived_name(
-        cfg, f"kb-connector-{connector_name}-role"
+    kb_role_arn = _ensure_kb_role(
+        args=args, cfg=cfg, cs=cs, connector_name=connector_name,
+        session=session, account_id=account_id, opts=opts,
+        secret_arn=None, content_bucket=bucket_name,
     )
-
-    if not kb_id and not args.no_create_kb_role and not kb_role_arn:
-        # S3 connector: role needs s3:GetObject on the content bucket
-        role_res = provisioning.ensure_kb_role(
-            session=session,
-            role_name=kb_role_name,
-            account_id=account_id,
-            region=cfg.region,
-            secret_arn=None,  # no secret for S3
-            cert_bucket=None,
-            cert_key=None,
-            kms_key_arn=opts.kms_key_arn,
-            connector_name=connector_name,
-            tags_enabled=opts.tags_enabled,
-            extra_tags=opts.tags,
-            adopt_existing=opts.adopt_existing,
-            created_untagged=cs.created_untagged(state_mod.RESOURCE_ROLE),
-        )
-        kb_role_arn = role_res.arn
-        # Add S3 read permissions for the content bucket
-        _add_s3_content_policy(
-            session, kb_role_name, bucket_name, account_id,
-            inclusion_prefixes=cfg.get("inclusion_prefixes"),
-        )
-        print(f"  Provisioned IAM role: {kb_role_arn}")
-        cs.kb_role_arn = kb_role_arn
-        cs.record_ownership(state_mod.RESOURCE_ROLE, role_res.state_marker)
-        print("  Waiting for IAM propagation...")
-        time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
-    elif kb_role_arn:
-        # From --kb-role-arn, or from state on a re-run. Adopted unless
-        # state already records this same role as one this tool created.
-        _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
     # Create KB + S3 data source (managed-connector envelope, same as others)
     target = _build_target(cfg, session)
-    connector_params = s3_params(
-        bucket_name=bucket_name,
-        # bucketOwnerAccountId is required by the service; default to the
-        # caller's account for the common same-account case.
-        bucket_owner_account_id=cfg.get("bucket_owner_account_id") or account_id,
-        acl=cfg.acl,
-        acl_s3_uri=cfg.get("acl_s3_uri"),
-        inclusion_prefixes=cfg.get("inclusion_prefixes"),
-        exclusion_prefixes=cfg.get("exclusion_prefixes"),
-        inclusion_patterns=cfg.get("inclusion_patterns"),
-        exclusion_patterns=cfg.get("exclusion_patterns"),
-        max_file_size_mb=cfg.get("max_file_size_mb"),
-        metadata_files_prefix=cfg.get("metadata_files_prefix"),
+    connector_params = _spec(cfg).build_connector_params(
+        cfg, BuildContext(account_id=account_id)
     )
     _provision_kb_and_ds(
         target=target,
@@ -2098,6 +2109,7 @@ def _add_s3_content_policy(
     account_id: str,
     *,
     inclusion_prefixes: list[str] | None = None,
+    policy_name: str = "kb-connector-s3-content-access",
 ) -> None:
     """Add S3 read permissions for the content bucket to the KB role.
 
@@ -2144,7 +2156,7 @@ def _add_s3_content_policy(
     }
     iam.put_role_policy(
         RoleName=role_name,
-        PolicyName="kb-connector-s3-content-access",
+        PolicyName=policy_name,
         PolicyDocument=_json.dumps(policy),
     )
     if prefixes:
@@ -2172,7 +2184,7 @@ def _setup_web(
 
     print("\n── AWS-side setup (Web) ──")
 
-    from kb_connector.connectors.web import build_connector_params as web_params, build_secret_body as web_secret
+    from kb_connector.connectors.web import build_secret_body as web_secret
     from kb_connector.core import provisioning
 
     if not cfg.region:
@@ -2218,55 +2230,16 @@ def _setup_web(
             cs.secret_arn = secret_arn
             cs.record_ownership(state_mod.RESOURCE_SECRET, secret_res.state_marker)
 
-    # IAM role
-    kb_id = args.knowledge_base_id or cs.knowledge_base_id
-    kb_role_arn = args.kb_role_arn or cs.kb_role_arn
-    kb_role_name = args.kb_role_name or _derived_name(
-        cfg, f"kb-connector-{connector_name}-role"
+    kb_role_arn = _ensure_kb_role(
+        args=args, cfg=cfg, cs=cs, connector_name=connector_name,
+        session=session, account_id=account_id, opts=opts,
+        secret_arn=secret_arn,
     )
-
-    if not kb_id and not args.no_create_kb_role and not kb_role_arn:
-        role_res = provisioning.ensure_kb_role(
-            session=session,
-            role_name=kb_role_name,
-            account_id=account_id,
-            region=cfg.region,
-            secret_arn=secret_arn,
-            cert_bucket=None,
-            cert_key=None,
-            kms_key_arn=opts.kms_key_arn,
-            connector_name=connector_name,
-            tags_enabled=opts.tags_enabled,
-            extra_tags=opts.tags,
-            adopt_existing=opts.adopt_existing,
-            created_untagged=cs.created_untagged(state_mod.RESOURCE_ROLE),
-        )
-        kb_role_arn = role_res.arn
-        print(f"  Provisioned IAM role: {kb_role_arn}")
-        cs.kb_role_arn = kb_role_arn
-        cs.record_ownership(state_mod.RESOURCE_ROLE, role_res.state_marker)
-        print("  Waiting for IAM propagation...")
-        time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
-    elif kb_role_arn:
-        # From --kb-role-arn, or from state on a re-run. Adopted unless
-        # state already records this same role as one this tool created.
-        _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
     # Create KB + Web data source via the target abstraction
     target = _build_target(cfg, session)
-    connector_params = web_params(
-        seed_urls=seed_urls,
-        auth_mode=auth_mode,
-        secret_arn=secret_arn,
-        sitemap_urls=sitemap_urls,
-        crawl_depth=cfg.get("crawl_depth"),
-        max_links_per_url=cfg.get("max_links_per_url"),
-        max_crawled_urls_per_minute=cfg.get("max_crawled_urls_per_minute"),
-        sync_scope=cfg.get("sync_scope"),
-        crawl_attachments=cfg.get("crawl_attachments", False),
-        max_file_size_mb=cfg.get("max_file_size_mb"),
-        inclusion_filters=cfg.get("inclusion_filters"),
-        exclusion_filters=cfg.get("exclusion_filters"),
+    connector_params = _spec(cfg).build_connector_params(
+        cfg, BuildContext(account_id=account_id, secret_arn=secret_arn)
     )
     _provision_kb_and_ds(
         target=target,
@@ -2296,17 +2269,8 @@ def _setup_guided(
     Stage 1: Print instructions, wait for user to confirm, validate.
     Stage 2: Write secret + create AWS resources (automated).
     """
-    from kb_connector.connectors.base import ConnectorSpec
-    from kb_connector.connectors.confluence import (
-        ConfluenceConnector,
-        build_connector_params as conf_params,
-        build_secret_body as conf_secret,
-    )
-    from kb_connector.connectors.googledrive import (
-        GoogleDriveConnector,
-        build_connector_params as gd_params,
-        build_secret_body as gd_secret,
-    )
+    from kb_connector.connectors.confluence import build_secret_body as conf_secret
+    from kb_connector.connectors.googledrive import build_secret_body as gd_secret
     from kb_connector.core import provisioning
 
     cs.connector_type = connector_type
@@ -2315,13 +2279,7 @@ def _setup_guided(
     if stage in ("1", "both"):
         print(f"\n── Stage 1: Source-side ({connector_type}) — GUIDED ──")
 
-        connector_impl: ConnectorSpec
-        if connector_type == "confluence":
-            connector_impl = ConfluenceConnector()
-        else:
-            connector_impl = GoogleDriveConnector()
-
-        steps = connector_impl.setup_steps(cfg.raw)
+        steps = _spec(cfg).setup_steps(cfg.raw)
         for step in steps:
             print(f"\n  Step: {step.description}")
             step.execute(cfg.raw)
@@ -2383,6 +2341,7 @@ def _setup_guided(
                 client_secret=getattr(cs, "_client_secret", None),
                 refresh_token=getattr(cs, "_refresh_token", None),
                 service_account_json=getattr(cs, "_sa_json", None),
+                admin_account_email=cfg.get("admin_account_email"),
             )
 
         secret_res = provisioning.put_secret(
@@ -2400,59 +2359,18 @@ def _setup_guided(
         cs.secret_arn = secret_arn
         cs.record_ownership(state_mod.RESOURCE_SECRET, secret_res.state_marker)
 
-        # IAM role
-        kb_id = args.knowledge_base_id or cs.knowledge_base_id
-        kb_role_arn = args.kb_role_arn or cs.kb_role_arn
-        kb_role_name = args.kb_role_name or _derived_name(
-            cfg, f"kb-connector-{connector_name}-role"
+        kb_role_arn = _ensure_kb_role(
+            args=args, cfg=cfg, cs=cs, connector_name=connector_name,
+            session=session, account_id=account_id, opts=opts,
+            secret_arn=secret_arn,
         )
-
-        if not kb_id and not args.no_create_kb_role and not kb_role_arn:
-            role_res = provisioning.ensure_kb_role(
-                session=session,
-                role_name=kb_role_name,
-                account_id=account_id,
-                region=cfg.region,
-                secret_arn=secret_arn,
-                cert_bucket=None,
-                cert_key=None,
-                kms_key_arn=opts.kms_key_arn,
-                connector_name=connector_name,
-                tags_enabled=opts.tags_enabled,
-                extra_tags=opts.tags,
-                adopt_existing=opts.adopt_existing,
-                created_untagged=cs.created_untagged(state_mod.RESOURCE_ROLE),
-            )
-            kb_role_arn = role_res.arn
-            print(f"  Provisioned IAM role: {kb_role_arn}")
-            cs.kb_role_arn = kb_role_arn
-            cs.record_ownership(state_mod.RESOURCE_ROLE, role_res.state_marker)
-            print("  Waiting for IAM propagation...")
-            time.sleep(10)  # nosemgrep: arbitrary-sleep -- IAM propagation delay
-        elif kb_role_arn:
-            # From --kb-role-arn, or from state on a re-run. Adopted unless
-            # state already records this same role as one this tool created.
-            _record_reused_resource(cs, state_mod.RESOURCE_ROLE, kb_role_arn)
 
         # Create KB + data source via the target abstraction
         target = _build_target(cfg, session)
 
-        if connector_type == "confluence":
-            connector_params = conf_params(
-                host_url=cfg.get("host_url", ""),
-                credential=cfg.get("credential", "oauth2"),
-                secret_arn=secret_arn,
-                acl=cfg.acl,
-                hosting_type=cfg.get("hosting_type", "SAAS"),
-                space_keys=cfg.get("space_keys"),
-            )
-        else:  # googledrive
-            connector_params = gd_params(
-                credential=cfg.get("credential", "oauth2"),
-                secret_arn=secret_arn,
-                acl=cfg.acl,
-                shared_drive_ids=cfg.get("shared_drives"),
-            )
+        connector_params = _spec(cfg).build_connector_params(
+            cfg, BuildContext(account_id=account_id, secret_arn=secret_arn)
+        )
 
         _provision_kb_and_ds(
             target=target,

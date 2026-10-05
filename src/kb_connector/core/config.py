@@ -14,7 +14,9 @@ State is a separate JSON file (see state.py).
 
 from __future__ import annotations
 
+import difflib
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -164,7 +166,7 @@ class ToolConfig:
                 return env[key]
             return None
 
-        return ConnectorConfig(
+        cfg = ConnectorConfig(
             name=name,
             type=connector_type,
             raw=connector_raw,
@@ -187,6 +189,100 @@ class ToolConfig:
             ),
             resource_prefix=pick("resource_prefix"),
         )
+        # After construction, so a value config resolution refuses raises
+        # rather than also warning.
+        check_config_keys(name, connector_raw, self.defaults)
+        return cfg
+
+
+class ConfigWarning(UserWarning):
+    """A config key or value that is ignored or treated other than written."""
+
+
+# Keys [defaults] is read for, and the [defaults.microsoft] keys.
+_DEFAULT_KEYS = frozenset({
+    "region", "profile", "target", "credential", "acl", "tenant_id", "auth_method",
+    "cert_s3_bucket", "cert_s3_key_prefix", "owner", "kms_key_arn",
+    "signing_key_arn", "signing_key_alias", "cert_valid_days", "resource_prefix",
+    "microsoft", "tags",
+})
+_MICROSOFT_DEFAULT_KEYS = frozenset({"tenant_id", "auth_method", "cert_valid_days"})
+
+_KIND_NAMES = {str: "a string", int: "an integer", bool: "true or false",
+               list: "a list of strings", dict: "a table"}
+
+
+def check_config_keys(name: str, connector_raw: dict, defaults: dict) -> None:
+    """Warn about keys the tool ignores and values of the wrong type.
+
+    Warnings, not errors, so an existing config keeps working; each names the
+    closest valid key when there is one.
+    """
+    from kb_connector.connectors import get_spec
+    from kb_connector.connectors.base import VALIDATION_KEYS
+
+    where = f"[connectors.{name}]"
+    spec = get_spec(str(connector_raw.get("type", "")))
+    if spec is None:
+        _warn(f"{where}: unknown type {connector_raw.get('type')!r}; its keys are not checked.")
+    else:
+        fields = {f.key: f for f in spec.all_fields()}
+        for key, value in connector_raw.items():
+            f = fields.get(key)
+            if f is None:
+                _warn_unknown(where, key, fields)
+                continue
+            problem = _kind_problem(value, f.kind, f.choices)
+            if problem:
+                _warn(f"{where}: {key} {problem}")
+        validation = connector_raw.get("validation")
+        if isinstance(validation, dict):
+            for key in validation:
+                if key not in VALIDATION_KEYS:
+                    _warn_unknown(f"{where[:-1]}.validation]", key, VALIDATION_KEYS)
+
+    for key in defaults:
+        if key not in _DEFAULT_KEYS:
+            _warn_unknown("[defaults]", key, _DEFAULT_KEYS)
+    microsoft = defaults.get("microsoft")
+    if isinstance(microsoft, dict):
+        for key in microsoft:
+            if key not in _MICROSOFT_DEFAULT_KEYS:
+                _warn_unknown("[defaults.microsoft]", key, _MICROSOFT_DEFAULT_KEYS)
+
+
+def _kind_problem(value: Any, kind: Any, choices: tuple[str, ...]) -> str | None:
+    kinds = kind if isinstance(kind, tuple) else (kind,)
+    if bool in kinds and isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return (
+            f"should be true or false without quotes; the string {value!r} is "
+            f"treated as true."
+        )
+    ok = False
+    for k in kinds:
+        if k is int and isinstance(value, int) and not isinstance(value, bool):
+            ok = True
+        elif k is list and isinstance(value, list) and all(isinstance(v, str) for v in value):
+            ok = True
+        elif k not in (int, list) and isinstance(value, k):
+            ok = True
+    if not ok:
+        expected = " or ".join(_KIND_NAMES.get(k, k.__name__) for k in kinds)
+        return f"should be {expected}, got {type(value).__name__} {value!r}."
+    if choices and isinstance(value, str):
+        if value.strip().lower() not in {c.lower() for c in choices}:
+            return f"is {value!r}; expected one of: {', '.join(choices)}."
+    return None
+
+
+def _warn_unknown(where: str, key: str, valid: Any) -> None:
+    close = difflib.get_close_matches(key, list(valid), n=1, cutoff=0.6)
+    hint = f" Did you mean {close[0]!r}?" if close else ""
+    _warn(f"{where}: unknown key {key!r} is ignored.{hint}")
+
+
+def _warn(message: str) -> None:
+    warnings.warn(message, ConfigWarning, stacklevel=3)
 
 
 def _validate_cert_valid_days(raw: Any) -> int | None:

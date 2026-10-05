@@ -616,11 +616,42 @@ def build_inline_policy(
 # teardown would delete them. A new put_role_policy call site must add its name
 # here; test_tool_policy_names_cover_every_authored_policy enforces that for
 # the defaults.
+S3_CONTENT_POLICY_NAME = "kb-connector-s3-content-access"
+
 TOOL_INLINE_POLICY_NAMES = frozenset({
     "kb-connector-access",               # ensure_kb_role
     "kb-connector-supplemental-access",  # _attach_supplemental_access_policy
-    "kb-connector-s3-content-access",    # cli/setup.py, S3 content sources
+    S3_CONTENT_POLICY_NAME,              # cli/setup.py, the connector's own role
 })
+
+
+def s3_content_policy_name(connector_name: str | None) -> str:
+    """Name of the S3 content-read policy a connector writes.
+
+    On the connector's own role the name is fixed. On a role shared with other
+    connectors (an existing knowledge base's), it carries the connector name,
+    so each connector's bucket grant is a separate policy and one connector
+    cannot replace another's.
+    """
+    if not connector_name:
+        return S3_CONTENT_POLICY_NAME
+    return f"{S3_CONTENT_POLICY_NAME}-{connector_name}"
+
+
+def is_tool_policy_name(name: str) -> bool:
+    """Whether this tool authored an inline policy with this name.
+
+    Exact names, plus `kb-connector-s3-content-access-<connector>` where the
+    suffix is a valid connector name.
+    """
+    from kb_connector.core.identifiers import _NAME_COMPONENT_RE
+
+    if name in TOOL_INLINE_POLICY_NAMES:
+        return True
+    prefix = f"{S3_CONTENT_POLICY_NAME}-"
+    return name.startswith(prefix) and bool(
+        _NAME_COMPONENT_RE.match(name[len(prefix):])
+    )
 
 
 def ensure_kb_role(
