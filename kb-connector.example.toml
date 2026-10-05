@@ -53,11 +53,6 @@ region = "us-west-2"
 [defaults.microsoft]
 # tenant_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # auth_method = "az"              # "az" (Azure CLI) | "device_code"
-# device_code_client_id = "..."   # only needed if auth_method = "device_code"
-
-# Google Workspace defaults (future)
-# [defaults.google]
-# project_id = "my-gcp-project"
 
 # ─── Connector definitions ───────────────────────────────────────────────────
 #
@@ -154,7 +149,7 @@ crawl_depth = 2
 # thumbprint yet. See KNOWN-LIMITATIONS.md.
 #
 # [connectors.engineering-quick]
-# type = "sharepoint"             # the only type supported with target = "quick"
+# type = "sharepoint"             # sharepoint or onedrive with target = "quick"
 # target = "quick"
 # credential = "cert"             # required: the credential is a KMS key pair
 # region = "us-east-1"            # must match your Quick instance's Region.

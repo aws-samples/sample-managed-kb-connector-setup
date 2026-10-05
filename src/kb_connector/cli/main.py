@@ -112,6 +112,24 @@ def _render_known_error(exc: BaseException, *, profile: str | None) -> str | Non
     return None
 
 
+def _show_config_warnings() -> None:
+    """Print config warnings once each, as plain lines on stderr."""
+    import warnings
+
+    from kb_connector.core.config import ConfigWarning
+
+    warnings.simplefilter("default", ConfigWarning)
+    previous = warnings.showwarning
+
+    def _show(message, category, filename, lineno, file=None, line=None):  # type: ignore[no-untyped-def]
+        if issubclass(category, ConfigWarning):
+            print(f"Warning: {message}", file=sys.stderr)
+        else:
+            previous(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _show
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -172,6 +190,7 @@ def main() -> int:
     # calls establish: every handler takes the parsed args and returns an exit
     # code.
     handler: Callable[[argparse.Namespace], int] = args.func
+    _show_config_warnings()
     try:
         return handler(args)
     except KeyboardInterrupt:

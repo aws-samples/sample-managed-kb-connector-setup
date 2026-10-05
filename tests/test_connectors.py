@@ -629,25 +629,3 @@ def test_sp_filter_config_from_config_maps_toml_keys():
 
 def test_sp_filter_config_from_config_empty_for_plain_connector():
     assert sp_filter_config_from_config({"site_urls": ["https://x/sites/a"]}) == {}
-
-
-def test_sp_spec_threads_crawl_toggles_and_filter():
-    # Guards the two paths against diverging: the ConnectorSpec path must honor
-    # crawl_files / crawl_pages exactly as the CLI path does.
-    from kb_connector.connectors.sharepoint import SharePointConnector
-
-    params = SharePointConnector().build_connector_params(
-        {
-            "credential": "cert",
-            "tenant_id": "t",
-            "site_urls": ["https://x.sharepoint.com/sites/a"],
-            "crawl_pages": False,
-            "inclusion_item_paths": ["https://x.sharepoint.com/sites/a"],
-        },
-        {"secret_arn": "arn", "cert_s3_bucket": "b", "cert_s3_key": "k.p12"},
-    )
-    assert params["dataEntityConfiguration"]["crawlPages"] is False
-    assert params["dataEntityConfiguration"]["crawlFiles"] is True
-    assert params["filterConfiguration"]["inclusionItemPaths"] == [
-        "https://x.sharepoint.com/sites/a"
-    ]

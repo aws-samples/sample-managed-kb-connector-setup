@@ -19,7 +19,13 @@ Shape validated against the live bedrock-agent API:
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import BuildContext, ConnectorSpec, Field
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
+
 from kb_connector.interactive import SetupStep
 
 
@@ -146,8 +152,40 @@ def build_secret_body(
 class GoogleDriveConnector(ConnectorSpec):
     """Google Drive managed connector spec."""
 
-    connector_type = "GOOGLEDRIVE"
+    type = "googledrive"
+    api_type = "GOOGLEDRIVE"
     provider = "google"
+    fields = (
+        Field("credential", str, "Credential mode. ACL requires service_account.",
+              default="oauth2", choices=("oauth2", "service_account"), ask=True),
+        Field("acl", bool, "Document-level access control. Cannot be changed later.",
+              default=False, ask=True),
+        Field("shared_drives", list, "Only crawl these shared drive ids.", ask=True),
+        Field("shared_drive_ids", list, "Alias for shared_drives."),
+        Field("exclusion_shared_drive_ids", list, "Skip these shared drive ids."),
+        Field("inclusion_mime_types", list, "Only crawl these MIME types."),
+        Field("exclusion_mime_types", list, "Skip these MIME types."),
+        Field("inclusion_folder_ids", list, "Only crawl these folder ids."),
+        Field("inclusion_file_ids", list, "Only crawl these file ids."),
+        Field("data_entities", dict,
+              "Drives to crawl, for example { crawl_my_drive = true, crawl_shared_drives = true }."),
+    )
+
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
+        return build_connector_params(
+            credential=cfg.credential or self.field("credential").default,
+            secret_arn=ctx.secret_arn or "",
+            acl=cfg.acl if ctx.acl is None else ctx.acl,
+            shared_drive_ids=(
+                self.value(cfg, "shared_drives") or self.value(cfg, "shared_drive_ids")
+            ),
+            exclusion_shared_drive_ids=self.value(cfg, "exclusion_shared_drive_ids"),
+            inclusion_mime_types=self.value(cfg, "inclusion_mime_types"),
+            exclusion_mime_types=self.value(cfg, "exclusion_mime_types"),
+            inclusion_folder_ids=self.value(cfg, "inclusion_folder_ids"),
+            inclusion_file_ids=self.value(cfg, "inclusion_file_ids"),
+            data_entities=self.value(cfg, "data_entities"),
+        )
 
     def setup_steps(self, config: dict) -> list[SetupStep]:
         """Google Drive setup is guided: user creates OAuth/SA in GCP."""
@@ -172,37 +210,6 @@ class GoogleDriveConnector(ConnectorSpec):
             ),
         ]
 
-    def build_connector_params(self, config: dict, state: dict) -> dict:
-        return build_connector_params(
-            credential=config.get("credential", "oauth2"),
-            secret_arn=state["secret_arn"],
-            acl=config.get("acl", False),
-            shared_drive_ids=config.get("shared_drives") or config.get("shared_drive_ids"),
-            exclusion_shared_drive_ids=config.get("exclusion_shared_drive_ids"),
-            inclusion_mime_types=config.get("inclusion_mime_types"),
-            exclusion_mime_types=config.get("exclusion_mime_types"),
-            inclusion_folder_ids=config.get("inclusion_folder_ids"),
-            inclusion_file_ids=config.get("inclusion_file_ids"),
-            data_entities=config.get("data_entities"),
-        )
-
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return build_secret_body(
-            credential=config.get("credential", "oauth2"),
-            client_id=state.get("client_id"),
-            client_secret=state.get("client_secret"),
-            refresh_token=state.get("refresh_token"),
-            service_account_json=state.get("service_account_json"),
-        )
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("credential", default="oauth2",
-                        prompt="Credential mode (oauth2, service_account)"),
-            ConfigField("acl", type=bool, default=False, prompt="Enable document-level ACL?"),
-            ConfigField("shared_drives", type=list, required=False,
-                        prompt="Shared Drive IDs to include (blank for all)"),
-        ]
 
 
 # --- Guided setup helpers ----------------------------------------------------

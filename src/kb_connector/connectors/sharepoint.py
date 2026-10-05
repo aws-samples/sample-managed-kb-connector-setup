@@ -9,8 +9,17 @@ Handles the full connector surface for SharePoint managed connectors:
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
-from kb_connector.interactive import SetupStep
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import (
+    BuildContext,
+    ConnectorSpec,
+    Field,
+    MICROSOFT_FIELDS,
+)
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
 
 
 # --- Auth type mapping -------------------------------------------------------
@@ -213,69 +222,45 @@ def build_secret_body(
 class SharePointConnector(ConnectorSpec):
     """SharePoint managed connector spec."""
 
-    connector_type = "SHAREPOINT"
+    type = "sharepoint"
+    api_type = "SHAREPOINT"
     provider = "microsoft"
+    fields = MICROSOFT_FIELDS + (
+        Field("credential", str, "Credential mode. Only cert is automated.",
+              default="cert", choices=("cert", "client_secret", "ropc")),
+        Field("acl", bool, "Document-level access control. Cannot be changed later.",
+              default=False, ask=True),
+        Field("site_urls", list, "Sites to crawl, as /sites/<name> URLs.",
+              required=True, ask=True),
+        Field("sharepoint_host", str, "Tenant host, for example contoso.sharepoint.com.",
+              in_params=False, ask=True),
+        Field("sharepoint_domain", str,
+              "Quick target: tenant root URL the Quick console asks for.", in_params=False),
+        Field("crawl_files", bool, "Crawl files.", default=True),
+        Field("crawl_pages", bool, "Crawl pages.", default=True),
+        Field("inclusion_item_paths", list,
+              "Paths to crawl. Replaces the site_urls crawl rather than narrowing it."),
+        Field("exclusion_item_paths", list, "Paths to skip."),
+        Field("inclusion_file_name_patterns", list, "File name patterns to include (regex)."),
+        Field("exclusion_file_name_patterns", list, "File name patterns to skip (regex)."),
+        Field("inclusion_file_path", list, "File path patterns to include (regex)."),
+        Field("exclusion_file_path", list, "File path patterns to skip (regex)."),
+        Field("modified_date_after", str, "Only items modified after this ISO 8601 time."),
+        Field("modified_date_before", str, "Only items modified before this ISO 8601 time."),
+    )
 
-    def setup_steps(self, config: dict) -> list[SetupStep]:
-        return []  # SharePoint setup is driven directly by cli/setup.py
-
-    def build_connector_params(self, config: dict, state: dict) -> dict:
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
+        credential = cfg.credential or self.field("credential").default
+        uses_cert = credential.strip().lower() == "cert"
         return build_connector_params(
-            credential=config.get("credential", "cert"),
-            tenant_id=config["tenant_id"],
-            secret_arn=state["secret_arn"],
-            acl=config.get("acl", False),
-            site_urls=config.get("site_urls", []),
-            cert_s3_bucket=state.get("cert_s3_bucket"),
-            cert_s3_key=state.get("cert_s3_key"),
-            crawl_files=config.get("crawl_files", True),
-            crawl_pages=config.get("crawl_pages", True),
-            filter_config=filter_config_from_config(config),
+            credential=credential,
+            tenant_id=cfg.tenant_id or "",
+            secret_arn=ctx.secret_arn or "",
+            acl=cfg.acl if ctx.acl is None else ctx.acl,
+            site_urls=self.value(cfg, "site_urls") or [],
+            cert_s3_bucket=ctx.cert_s3_bucket if uses_cert else None,
+            cert_s3_key=ctx.cert_s3_key if uses_cert else None,
+            crawl_files=self.value(cfg, "crawl_files"),
+            crawl_pages=self.value(cfg, "crawl_pages"),
+            filter_config=filter_config_from_config(cfg.raw),
         )
-
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return build_secret_body(
-            credential=config.get("credential", "cert"),
-            client_id=state["client_app_id"],
-            client_secret=state.get("client_secret"),
-            certificate_password=state.get("certificate_password"),
-            private_key_b64_pkcs8=state.get("private_key_b64_pkcs8"),
-        )
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("site_urls", type=list, prompt="SharePoint site URLs"),
-            ConfigField("sharepoint_host", required=False, prompt="SharePoint host (e.g. contoso.sharepoint.com)"),
-            ConfigField("credential", default="cert", prompt="Credential mode (cert)"),
-            ConfigField("acl", type=bool, default=False, prompt="Enable document-level ACL?"),
-            ConfigField("sites_selected", type=bool, default=False, prompt="Use Sites.Selected (least-privilege)?"),
-            ConfigField("crawl_files", type=bool, default=True, prompt="Crawl files?"),
-            ConfigField("crawl_pages", type=bool, default=True, prompt="Crawl pages?"),
-            # filterConfiguration. inclusion_item_paths is deliberately first and
-            # carries a warning: it is the one filter key that changes the crawl
-            # mode rather than narrowing the result set.
-            ConfigField(
-                "inclusion_item_paths", type=list, required=False,
-                prompt="Inclusion item paths (full URLs; REPLACES the site_urls crawl)",
-                warning=(
-                    "inclusionItemPaths overrides site_urls: when set, the service "
-                    "skips site-URL validation and crawls only these paths. A site "
-                    "root listed here does not produce the same result as the same "
-                    "site in site_urls."
-                ),
-            ),
-            ConfigField("exclusion_item_paths", type=list, required=False,
-                        prompt="Exclusion item paths (full URLs)"),
-            ConfigField("inclusion_file_name_patterns", type=list, required=False,
-                        prompt="Inclusion file name patterns (regex)"),
-            ConfigField("exclusion_file_name_patterns", type=list, required=False,
-                        prompt="Exclusion file name patterns (regex)"),
-            ConfigField("inclusion_file_path", type=list, required=False,
-                        prompt="Inclusion file path patterns (regex)"),
-            ConfigField("exclusion_file_path", type=list, required=False,
-                        prompt="Exclusion file path patterns (regex)"),
-            ConfigField("modified_date_after", required=False,
-                        prompt="Only crawl items modified after (ISO8601)"),
-            ConfigField("modified_date_before", required=False,
-                        prompt="Only crawl items modified before (ISO8601)"),
-        ]

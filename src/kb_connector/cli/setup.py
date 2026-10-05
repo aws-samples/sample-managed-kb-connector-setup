@@ -19,6 +19,8 @@ from dataclasses import dataclass, field as dataclass_field
 from getpass import getpass
 from typing import TYPE_CHECKING, Any
 
+from kb_connector.connectors import get_spec
+from kb_connector.connectors.base import BuildContext, ConnectorSpec
 from kb_connector.core import overrides as request_overrides
 from kb_connector.core import state as state_mod
 from kb_connector.core.diagnostics import describe_endpoints
@@ -454,9 +456,14 @@ def _run_setup(args: argparse.Namespace) -> int:
         print(f"  target: {cfg.target}")
 
     # Checked before any Graph or AWS call, so a malformed or misspelled
-    # override fails here rather than after resources exist.
+    # override, or a value the service rejects, fails here rather than after
+    # resources exist.
     if cfg.target == "bmkb":
-        request_overrides.check_against_model(request_overrides.load(cfg.raw))
+        loaded_overrides = request_overrides.load(cfg.raw)
+        request_overrides.check_against_model(loaded_overrides)
+        spec = get_spec(cfg.type)
+        if spec is not None:
+            spec.check(cfg, loaded_overrides)
 
     # Dispatch to the appropriate setup path. Persist state in a finally block
     # so that resources created before a mid-flight failure are still tracked
@@ -558,6 +565,13 @@ def _record_region(cs: ConnectorState, cfg: ConnectorConfig) -> None:
             f"to {cs.region}."
         )
     cs.region = cfg.region
+
+
+def _spec(cfg: ConnectorConfig) -> ConnectorSpec:
+    spec = get_spec(cfg.type)
+    if spec is None:
+        raise ConfigError(f"Connector type {cfg.type!r} setup not yet implemented.")
+    return spec
 
 
 def _run_sync(args: argparse.Namespace, connector_name: str) -> int:
@@ -861,12 +875,9 @@ def _setup_microsoft(
 ) -> None:
     """Full SP/OD setup: Stage 1 (Entra) + Stage 2 (AWS)."""
     from kb_connector.connectors.sharepoint import (
-        filter_config_from_config as sp_filter_config,
-        build_connector_params as sp_params,
         build_secret_body as sp_secret,
     )
     from kb_connector.connectors.onedrive import (
-        build_connector_params as od_params,
         build_secret_body as od_secret,
     )
     from kb_connector.providers.microsoft.client import GraphClient
@@ -1329,32 +1340,13 @@ def _setup_microsoft(
         # Create KB (if needed) + data source via the target abstraction
         target = _build_target(cfg, session)
 
-        if cfg.type == "sharepoint":
-            site_urls = cfg.get("site_urls", [])
-            connector_params = sp_params(
-                credential=credential,
-                tenant_id=tenant_id,
-                secret_arn=secret_arn,
-                acl=acl,
-                site_urls=site_urls,
-                cert_s3_bucket=cert_s3_bucket if uses_cert else None,
-                cert_s3_key=cert_s3_key if uses_cert else None,
-                crawl_files=cfg.get("crawl_files", True),
-                crawl_pages=cfg.get("crawl_pages", True),
-                filter_config=sp_filter_config(cfg.raw),
-            )
-        else:  # onedrive
-            connector_params = od_params(
-                credential=credential,
-                tenant_id=tenant_id,
-                secret_arn=secret_arn,
-                acl=acl,
-                cert_s3_bucket=cert_s3_bucket if uses_cert else None,
-                cert_s3_key=cert_s3_key if uses_cert else None,
-                crawl_personal_drives=cfg.get("crawl_personal_drives", True),
-                crawl_shared_with_me=cfg.get("crawl_shared_with_me", False),
-                inclusion_user_emails=cfg.get("inclusion_user_emails"),
-            )
+        connector_params = _spec(cfg).build_connector_params(cfg, BuildContext(
+            account_id=account_id,
+            secret_arn=secret_arn,
+            cert_s3_bucket=cert_s3_bucket if uses_cert else None,
+            cert_s3_key=cert_s3_key if uses_cert else None,
+            acl=acl,
+        ))
 
         _provision_kb_and_ds(
             target=target,
@@ -1959,7 +1951,6 @@ def _setup_s3(
 
     print("\n── AWS-side setup (S3) ──")
 
-    from kb_connector.connectors.s3 import build_connector_params as s3_params
     from kb_connector.core import provisioning
 
     if not cfg.region:
@@ -2018,19 +2009,8 @@ def _setup_s3(
 
     # Create KB + S3 data source (managed-connector envelope, same as others)
     target = _build_target(cfg, session)
-    connector_params = s3_params(
-        bucket_name=bucket_name,
-        # bucketOwnerAccountId is required by the service; default to the
-        # caller's account for the common same-account case.
-        bucket_owner_account_id=cfg.get("bucket_owner_account_id") or account_id,
-        acl=cfg.acl,
-        acl_s3_uri=cfg.get("acl_s3_uri"),
-        inclusion_prefixes=cfg.get("inclusion_prefixes"),
-        exclusion_prefixes=cfg.get("exclusion_prefixes"),
-        inclusion_patterns=cfg.get("inclusion_patterns"),
-        exclusion_patterns=cfg.get("exclusion_patterns"),
-        max_file_size_mb=cfg.get("max_file_size_mb"),
-        metadata_files_prefix=cfg.get("metadata_files_prefix"),
+    connector_params = _spec(cfg).build_connector_params(
+        cfg, BuildContext(account_id=account_id)
     )
     _provision_kb_and_ds(
         target=target,
@@ -2172,7 +2152,7 @@ def _setup_web(
 
     print("\n── AWS-side setup (Web) ──")
 
-    from kb_connector.connectors.web import build_connector_params as web_params, build_secret_body as web_secret
+    from kb_connector.connectors.web import build_secret_body as web_secret
     from kb_connector.core import provisioning
 
     if not cfg.region:
@@ -2254,19 +2234,8 @@ def _setup_web(
 
     # Create KB + Web data source via the target abstraction
     target = _build_target(cfg, session)
-    connector_params = web_params(
-        seed_urls=seed_urls,
-        auth_mode=auth_mode,
-        secret_arn=secret_arn,
-        sitemap_urls=sitemap_urls,
-        crawl_depth=cfg.get("crawl_depth"),
-        max_links_per_url=cfg.get("max_links_per_url"),
-        max_crawled_urls_per_minute=cfg.get("max_crawled_urls_per_minute"),
-        sync_scope=cfg.get("sync_scope"),
-        crawl_attachments=cfg.get("crawl_attachments", False),
-        max_file_size_mb=cfg.get("max_file_size_mb"),
-        inclusion_filters=cfg.get("inclusion_filters"),
-        exclusion_filters=cfg.get("exclusion_filters"),
+    connector_params = _spec(cfg).build_connector_params(
+        cfg, BuildContext(account_id=account_id, secret_arn=secret_arn)
     )
     _provision_kb_and_ds(
         target=target,
@@ -2296,17 +2265,8 @@ def _setup_guided(
     Stage 1: Print instructions, wait for user to confirm, validate.
     Stage 2: Write secret + create AWS resources (automated).
     """
-    from kb_connector.connectors.base import ConnectorSpec
-    from kb_connector.connectors.confluence import (
-        ConfluenceConnector,
-        build_connector_params as conf_params,
-        build_secret_body as conf_secret,
-    )
-    from kb_connector.connectors.googledrive import (
-        GoogleDriveConnector,
-        build_connector_params as gd_params,
-        build_secret_body as gd_secret,
-    )
+    from kb_connector.connectors.confluence import build_secret_body as conf_secret
+    from kb_connector.connectors.googledrive import build_secret_body as gd_secret
     from kb_connector.core import provisioning
 
     cs.connector_type = connector_type
@@ -2315,13 +2275,7 @@ def _setup_guided(
     if stage in ("1", "both"):
         print(f"\n── Stage 1: Source-side ({connector_type}) — GUIDED ──")
 
-        connector_impl: ConnectorSpec
-        if connector_type == "confluence":
-            connector_impl = ConfluenceConnector()
-        else:
-            connector_impl = GoogleDriveConnector()
-
-        steps = connector_impl.setup_steps(cfg.raw)
+        steps = _spec(cfg).setup_steps(cfg.raw)
         for step in steps:
             print(f"\n  Step: {step.description}")
             step.execute(cfg.raw)
@@ -2437,22 +2391,9 @@ def _setup_guided(
         # Create KB + data source via the target abstraction
         target = _build_target(cfg, session)
 
-        if connector_type == "confluence":
-            connector_params = conf_params(
-                host_url=cfg.get("host_url", ""),
-                credential=cfg.get("credential", "oauth2"),
-                secret_arn=secret_arn,
-                acl=cfg.acl,
-                hosting_type=cfg.get("hosting_type", "SAAS"),
-                space_keys=cfg.get("space_keys"),
-            )
-        else:  # googledrive
-            connector_params = gd_params(
-                credential=cfg.get("credential", "oauth2"),
-                secret_arn=secret_arn,
-                acl=cfg.acl,
-                shared_drive_ids=cfg.get("shared_drives"),
-            )
+        connector_params = _spec(cfg).build_connector_params(
+            cfg, BuildContext(account_id=account_id, secret_arn=secret_arn)
+        )
 
         _provision_kb_and_ds(
             target=target,

@@ -6,8 +6,17 @@ OneDrive crawling is hosted on SharePoint, so similar auth requirements apply.
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
-from kb_connector.interactive import SetupStep
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import (
+    BuildContext,
+    ConnectorSpec,
+    Field,
+    MICROSOFT_FIELDS,
+)
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
 
 
 # --- Auth type mapping -------------------------------------------------------
@@ -142,36 +151,31 @@ def build_secret_body(
 class OneDriveConnector(ConnectorSpec):
     """OneDrive managed connector spec."""
 
-    connector_type = "ONEDRIVE"
+    type = "onedrive"
+    api_type = "ONEDRIVE"
     provider = "microsoft"
+    fields = MICROSOFT_FIELDS + (
+        Field("credential", str, "Credential mode.", default="cert",
+              choices=("cert", "client_secret", "oauth2_refresh"), ask=True),
+        Field("acl", bool, "Document-level access control. Cannot be changed later.",
+              default=False, ask=True),
+        Field("crawl_personal_drives", bool, "Crawl users' personal drives.", default=True),
+        Field("crawl_shared_with_me", bool, "Crawl items shared with each user.",
+              default=False),
+        Field("inclusion_user_emails", list, "Only crawl these users' drives.", ask=True),
+    )
 
-    def setup_steps(self, config: dict) -> list[SetupStep]:
-        return []  # OneDrive setup is driven directly by cli/setup.py
-
-    def build_connector_params(self, config: dict, state: dict) -> dict:
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
+        credential = cfg.credential or self.field("credential").default
+        uses_cert = credential.strip().lower() == "cert"
         return build_connector_params(
-            credential=config.get("credential", "cert"),
-            tenant_id=config["tenant_id"],
-            secret_arn=state["secret_arn"],
-            acl=config.get("acl", False),
-            cert_s3_bucket=state.get("cert_s3_bucket"),
-            cert_s3_key=state.get("cert_s3_key"),
+            credential=credential,
+            tenant_id=cfg.tenant_id or "",
+            secret_arn=ctx.secret_arn or "",
+            acl=cfg.acl if ctx.acl is None else ctx.acl,
+            cert_s3_bucket=ctx.cert_s3_bucket if uses_cert else None,
+            cert_s3_key=ctx.cert_s3_key if uses_cert else None,
+            crawl_personal_drives=self.value(cfg, "crawl_personal_drives"),
+            crawl_shared_with_me=self.value(cfg, "crawl_shared_with_me"),
+            inclusion_user_emails=self.value(cfg, "inclusion_user_emails"),
         )
-
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return build_secret_body(
-            credential=config.get("credential", "cert"),
-            client_id=state["client_app_id"],
-            client_secret=state.get("client_secret"),
-            certificate_password=state.get("certificate_password"),
-            private_key_b64_pkcs8=state.get("private_key_b64_pkcs8"),
-        )
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("credential", default="cert", prompt="Credential mode (cert, client_secret, oauth2_refresh)"),
-            ConfigField("acl", type=bool, default=False, prompt="Enable document-level ACL?"),
-            ConfigField("crawl_personal_drives", type=bool, default=True, prompt="Crawl personal drives?"),
-            ConfigField("crawl_shared_with_me", type=bool, default=False, prompt="Crawl shared-with-me items?"),
-            ConfigField("inclusion_user_emails", type=list, required=False, prompt="Filter to specific user emails"),
-        ]

@@ -17,8 +17,19 @@ accessControlConfiguration); maxFileSizeInMegaBytes is a string.
 
 from __future__ import annotations
 
-from kb_connector.connectors.base import ConfigField, ConnectorSpec
-from kb_connector.interactive import SetupStep
+from typing import TYPE_CHECKING
+
+from kb_connector.connectors.base import (
+    BuildContext,
+    ConnectorSpec,
+    Field,
+    MAX_FILE_SIZE_HELP,
+    check_max_file_size,
+)
+
+if TYPE_CHECKING:
+    from kb_connector.core.config import ConnectorConfig
+    from kb_connector.core.overrides import RequestOverrides
 
 
 def build_connector_params(
@@ -84,43 +95,42 @@ def build_connector_params(
 class S3Connector(ConnectorSpec):
     """S3 managed connector spec."""
 
-    connector_type = "S3"
-    provider = None  # no 3P identity provider
+    type = "s3"
+    api_type = "S3"
+    provider = None
+    fields = (
+        Field("bucket_name", str, "Bucket to crawl.", required=True, ask=True),
+        Field("bucket_owner_account_id", str,
+              "Account that owns the bucket. Defaults to the caller's account."),
+        Field("acl", bool, "Document-level access control. Cannot be changed later.",
+              default=False, ask=True),
+        Field("acl_s3_uri", str, "S3 URI of the global ACL file. Used when acl is true."),
+        Field("inclusion_prefixes", list, "Only crawl these key prefixes.", ask=True),
+        Field("exclusion_prefixes", list, "Skip these key prefixes."),
+        Field("inclusion_patterns", list, "Only crawl keys matching these patterns.",
+              ask=True),
+        Field("exclusion_patterns", list, "Skip keys matching these patterns.", ask=True),
+        Field("max_file_size_mb", (int, str), MAX_FILE_SIZE_HELP, ask=True),
+        Field("metadata_files_prefix", str, "Prefix of .metadata.json sidecar files."),
+    )
 
-    def setup_steps(self, config: dict) -> list[SetupStep]:
-        return []  # S3 setup is driven directly by cli/setup.py
-
-    def build_connector_params(self, config: dict, state: dict) -> dict:
+    def build_connector_params(self, cfg: ConnectorConfig, ctx: BuildContext) -> dict:
+        max_size = self.value(cfg, "max_file_size_mb")
         return build_connector_params(
-            bucket_name=config["bucket_name"],
-            bucket_owner_account_id=config.get("bucket_owner_account_id"),
-            acl=config.get("acl", False),
-            acl_s3_uri=config.get("acl_s3_uri"),
-            inclusion_prefixes=config.get("inclusion_prefixes"),
-            exclusion_prefixes=config.get("exclusion_prefixes"),
-            inclusion_patterns=config.get("inclusion_patterns"),
-            exclusion_patterns=config.get("exclusion_patterns"),
-            max_file_size_mb=config.get("max_file_size_mb"),
-            metadata_files_prefix=config.get("metadata_files_prefix"),
+            bucket_name=self.value(cfg, "bucket_name") or "",
+            bucket_owner_account_id=(
+                self.value(cfg, "bucket_owner_account_id") or ctx.account_id
+            ),
+            acl=cfg.acl if ctx.acl is None else ctx.acl,
+            acl_s3_uri=self.value(cfg, "acl_s3_uri"),
+            inclusion_prefixes=self.value(cfg, "inclusion_prefixes"),
+            exclusion_prefixes=self.value(cfg, "exclusion_prefixes"),
+            inclusion_patterns=self.value(cfg, "inclusion_patterns"),
+            exclusion_patterns=self.value(cfg, "exclusion_patterns"),
+            # The service takes this field as a string.
+            max_file_size_mb=None if max_size is None else str(max_size),
+            metadata_files_prefix=self.value(cfg, "metadata_files_prefix"),
         )
 
-    def build_secret_body(self, config: dict, state: dict) -> dict | None:
-        return None  # S3 connector uses no secret
-
-    def config_fields(self) -> list[ConfigField]:
-        return [
-            ConfigField("bucket_name", required=True, prompt="S3 bucket name"),
-            ConfigField("bucket_owner_account_id", required=False,
-                        prompt="Bucket owner account (12-digit, for cross-account)"),
-            ConfigField("acl", type=bool, default=False,
-                        prompt="Enable document-level ACL?",
-                        warning="Permanent — cannot be disabled after creation"),
-            ConfigField("acl_s3_uri", required_if="acl",
-                        prompt="S3 URI to global ACL JSON file"),
-            ConfigField("inclusion_prefixes", type=list, required=False,
-                        prompt="Include only objects with these prefixes"),
-            ConfigField("exclusion_prefixes", type=list, required=False,
-                        prompt="Exclude objects with these prefixes"),
-            ConfigField("metadata_files_prefix", required=False,
-                        prompt="Prefix for .metadata.json sidecar files"),
-        ]
+    def check(self, cfg: ConnectorConfig, overrides: RequestOverrides) -> None:
+        check_max_file_size(cfg.get("max_file_size_mb"), overrides)
