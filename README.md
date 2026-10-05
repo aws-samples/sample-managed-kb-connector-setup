@@ -188,6 +188,12 @@ Configuration is **TOML-first**. One file holds all your connectors and shared
 defaults. Copy [`kb-connector.example.toml`](kb-connector.example.toml) to
 `./kb-connector.toml`, or run `kb-connector init`.
 
+[CONFIG-REFERENCE.md](CONFIG-REFERENCE.md) lists every key each connector
+takes. A key the tool does not read, or a value of the wrong type, prints a
+warning naming the closest valid key, so a typo like `max_file_size` is
+reported instead of silently ignored. A value the service would reject, such as
+`max_file_size_mb` above its limit, stops setup before it creates anything.
+
 ```toml
 [defaults]
 region = "us-west-2"
@@ -374,7 +380,9 @@ console and then collects the credentials.
 
 Stage 2 (AWS-side) is always automated. It writes the secret, uploads the
 certificate, creates or extends the IAM role, creates the Knowledge Base and
-data source, and waits for them to become active.
+data source, and waits for them to become active. With `--kb`, it extends the
+existing knowledge base's role for every connector type; a role passed with
+`--kb-role-arn` is used as given.
 
 When both stages run together, setup runs an **ownership preflight** first: a
 read-only check of whether it owns the AWS resources it's about to touch, which

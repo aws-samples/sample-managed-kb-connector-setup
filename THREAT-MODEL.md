@@ -568,7 +568,12 @@ attaches a separate policy named `kb-connector-supplemental-access` rather than
 editing someone else's statement, so the addition is auditable and individually
 removable. Extension still only ever *adds* resource ARNs — never removes them,
 never widens actions, and it skips `Deny` statements and statements already
-containing `"*"`.
+containing `"*"`. For the S3 connector, read on the content bucket goes into a
+separate policy named `kb-connector-s3-content-access`, scoped to
+`inclusion_prefixes` when set.
+
+**Residual:** policies added to a role the tool did not create are not tracked,
+so teardown leaves them in place.
 
 ### T-17 — OData filter injection redirects app lookup
 **Low · Tampering · TB-3 · AS-5**
