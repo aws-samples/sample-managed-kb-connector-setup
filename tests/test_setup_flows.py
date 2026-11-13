@@ -49,11 +49,24 @@ class _FakeQuickSight:
         self.customer_role_arn: str | None = None
         self.authorized_keys: set = set()
         self.kb_ingestion = "QUEUED"
+        self.deny_tagging = False        # creates with Tags fail as TagResource denied
         self.calls: list = []            # (operation, kwargs) for every create
         self.deletions = deletions       # shared with _FakeCloud, in order
 
     def _arn(self, kind: str, rid: str) -> str:
         return f"arn:aws:quicksight:{_QUICK_REGION}:{_ACCOUNT}:{kind}/{rid}"
+
+    def _check_tagging(self, kw: dict, operation: str) -> None:
+        if self.deny_tagging and kw.get("Tags"):
+            raise _client_error(
+                "AccessDeniedException",
+                "User is not authorized to perform: quicksight:TagResource",
+                operation, 403,
+            )
+
+    def creates(self, operation: str) -> list:
+        """The kwargs of every call to `operation` (create_data_source, ...)."""
+        return [kw for op, kw in self.calls if op == operation]
 
     def create_data_source(self, **kw):
         self.calls.append(("create_data_source", kw))
@@ -68,6 +81,7 @@ class _FakeQuickSight:
         if ds_id in self.data_sources:
             raise _client_error("ResourceExistsException", f"{ds_id} exists",
                                 "CreateDataSource", 409)
+        self._check_tagging(kw, "CreateDataSource")
         arn = self._arn("datasource", ds_id)
         self.data_sources[ds_id] = {
             "Arn": arn, "DataSourceId": ds_id, "Name": kw["Name"], "Type": kw["Type"],
@@ -101,6 +115,7 @@ class _FakeQuickSight:
         if kb_id in self.kbs:
             raise _client_error("ResourceExistsException", f"{kb_id} exists",
                                 "CreateKnowledgeBase", 409)
+        self._check_tagging(kw, "CreateKnowledgeBase")
         arn = self._arn("knowledgebase", kb_id)
         self.kbs[kb_id] = {
             "KnowledgeBaseArn": arn, "KnowledgeBaseId": kb_id, "Name": kw["Name"],
@@ -925,6 +940,464 @@ def test_monitor_refuses_a_quick_connector(cloud, capsys, monkeypatch):
     err = capsys.readouterr().err
     assert "no knowledge-base sync API" in err
     assert "kb-connector validate c" in err
+
+
+# --- Quick setup ------------------------------------------------------------------------
+
+
+def _resolved(name: str = "c"):
+    from kb_connector.core.config import load_config
+
+    return load_config(None).resolve_connector(name)
+
+
+def _assert_no_key_access_written(cloud) -> None:
+    """Setup never writes a key policy statement, a grant or an IAM policy."""
+    assert cloud.kms.extra_statements == [] and cloud.kms.grants == []
+    assert cloud.iam.simulations == []
+
+
+def _setup_unauthorized(cloud, capsys) -> str:
+    """First Quick run: the key is not yet authorized. Returns its output."""
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    return capsys.readouterr().out
+
+
+def test_quick_sharepoint_setup_lifecycle(cloud, capsys):
+    from kb_connector.quick import templates
+
+    _quick_config()
+
+    # Run 1: Quick cannot sign with the new key yet.
+    out = _setup_unauthorized(cloud, capsys)
+    state = _state()
+    key_arn = state["signing_key_arn"]
+    thumbprint = state["cert_thumbprint_b64url"]
+    assert "not yet authorized" in out
+    assert "Setup is not finished" in out and "Setup complete." not in out
+    assert "Select keys" in out and key_arn in out
+    assert "Failed to generate JWT assertion" in out
+    assert "aws-quicksight-kms-role-v0" not in out
+    assert not (cloud.quicksight.data_sources or cloud.quicksight.kbs)
+    assert state["knowledge_base_id"] is None and state["data_source_id"] is None
+    assert "ds" not in state["created_resources"] and "kb" not in state["created_resources"]
+    _assert_no_key_access_written(cloud)
+
+    # The console step, then run 2 creates the data source and the knowledge base.
+    cloud.authorize(key_arn)
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert "Setup complete." in out and "Next: kb-connector validate c" in out
+    assert "KB is ACTIVE" in out and "Latest sync: QUEUED" in out
+    assert list(cloud.quicksight.data_sources) == ["kb-connector-c-ds"]
+    assert list(cloud.quicksight.kbs) == ["kb-connector-c-kb"]
+    # The first call is run 1's, refused while the key was unauthorized.
+    ds_call = cloud.quicksight.creates("create_data_source")[-1]
+    assert ds_call["Type"] == "SHAREPOINT"
+    sp = ds_call["DataSourceParameters"]["SharePointParameters"]
+    assert sp["SharePointDomain"] == "x.sharepoint.com"
+    assert sp["TenantId"] == _TENANT and sp["ClientId"] == state["client_app_id"]
+    assert ds_call["Credentials"]["SharePointClientCredentials"] == {
+        "KmsKeyArn": key_arn, "CertThumbprint": thumbprint,
+    }
+    assert ds_call["Permissions"][0]["Principal"] == _QUICK_USER_ARN
+    (kb_call,) = cloud.quicksight.creates("create_knowledge_base")
+    assert kb_call["KnowledgeBaseConfiguration"] == {
+        "templateConfiguration": {"template": templates.knowledge_base_template(_resolved())},
+    }
+    assert kb_call["AccessControlConfiguration"] == {"isACLEnabled": True}
+    assert kb_call["PrimaryOwnerArn"] == _QUICK_USER_ARN
+    assert kb_call["DataSourceArn"] == cloud.quicksight.data_sources["kb-connector-c-ds"]["Arn"]
+    for call in (ds_call, kb_call):
+        tags = {t["Key"]: t["Value"] for t in call["Tags"]}
+        assert tags["ManagedBy"] == "kb-connector" and tags["KbConnectorName"] == "c"
+    state = _state()
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["knowledge_base_id"] == "kb-connector-c-kb"
+    assert state["created_resources"]["ds"] == "tool"
+    assert state["created_resources"]["kb"] == "tool"
+    assert len(cloud.kms.keys) == 1
+    assert state["signing_key_arn"] == key_arn
+    assert state["cert_thumbprint_b64url"] == thumbprint
+    _assert_no_key_access_written(cloud)
+
+    # Run 3 finds both in state and creates nothing.
+    calls = len(cloud.quicksight.calls)
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert len(cloud.quicksight.calls) == calls
+    assert "Using Quick data source kb-connector-c-ds (recorded in state)" in out
+    assert "Select keys" not in out
+    assert _state()["created_resources"] == state["created_resources"]
+
+    # Teardown removes the knowledge base, the data source and the app; the key stays.
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert [kind for kind, _ in cloud.deletions] == ["kb", "ds", "app"]
+    assert f"schedule-key-deletion --key-id {key_arn}" in out
+    assert key_arn in cloud.kms.keys
+    assert _state() is None
+
+
+def test_quick_onedrive_setup_creates_a_onedrive_data_source(cloud, capsys):
+    _quick_config("onedrive", 'inclusion_user_emails = ["a@example.com"]\n')
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    err = capsys.readouterr().err
+    assert "WARNING: inclusion_user_emails has no effect" in err
+
+    cloud.authorize(_state()["signing_key_arn"])
+    assert _cli("setup", "c") == 0
+    ds = cloud.quicksight.data_sources["kb-connector-c-ds"]
+    assert ds["Type"] == "ONE_DRIVE"
+    ds_call = cloud.quicksight.creates("create_data_source")[-1]
+    assert set(ds_call["Credentials"]) == {"OneDriveClientCredentials"}
+    assert ds_call["DataSourceParameters"]["OneDriveParameters"]["AuthType"] == "TWO_LEGGED_OAUTH"
+    (kb_call,) = cloud.quicksight.creates("create_knowledge_base")
+    template = kb_call["KnowledgeBaseConfiguration"]["templateConfiguration"]["template"]
+    assert template["type"] == "ONEDRIVEV3"
+    assert kb_call["AccessControlConfiguration"] == {"isACLEnabled": True}
+
+
+def test_quick_setup_on_a_terminal_retries_after_the_console_step(cloud, capsys, monkeypatch):
+    _quick_config()
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    prompts: list = []
+
+    def operator(prompt=""):
+        prompts.append(prompt)
+        cloud.authorize(next(iter(cloud.kms.keys)))
+        return ""
+
+    monkeypatch.setattr("builtins.input", operator)
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert len(prompts) == 1 and "Press Enter" in prompts[0]
+    assert "Setup complete." in out
+    assert "kb-connector-c-ds" in cloud.quicksight.data_sources
+    assert "kb-connector-c-kb" in cloud.quicksight.kbs
+
+
+def test_quick_setup_on_a_terminal_stops_on_q(cloud, capsys, monkeypatch):
+    _quick_config()
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "q")
+    assert _cli("setup", "c") == 0
+    assert "Setup is not finished" in capsys.readouterr().out
+    assert not cloud.quicksight.data_sources
+
+
+def test_quick_setup_records_a_console_made_data_source_and_kb_as_external(cloud, capsys):
+    """State as 1.4 left it (app, key, certificate) plus a DS and KB made in the console."""
+    _quick_config()
+    _setup_unauthorized(cloud, capsys)
+    state = _state()
+    key_arn = state["signing_key_arn"]
+    cloud.authorize(key_arn)
+    qs = cloud.quicksight
+    ds_arn = qs.create_data_source(
+        AwsAccountId=_ACCOUNT, DataSourceId="xxxxxxxx-console-ds", Name="console",
+        Type="SHAREPOINT", Credentials={"SharePointClientCredentials": {
+            "KmsKeyArn": key_arn, "CertThumbprint": state["cert_thumbprint_b64url"]}},
+        DataSourceParameters={"SharePointParameters": {
+            "SharePointDomain": "x.sharepoint.com", "ClientId": state["client_app_id"]}},
+    )["Arn"]
+    qs.create_knowledge_base(
+        AwsAccountId=_ACCOUNT, KnowledgeBaseId="xxxxxxxx-console-kb", Name="console",
+        DataSourceArn=ds_arn,
+        KnowledgeBaseConfiguration={"templateConfiguration": {"template": {}}},
+        AccessControlConfiguration={"isACLEnabled": True},
+    )
+    qs.calls.clear()
+
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert qs.calls == []
+    assert "made outside this tool" in out
+    state = _state()
+    assert state["data_source_id"] == "xxxxxxxx-console-ds"
+    assert state["knowledge_base_id"] == "xxxxxxxx-console-kb"
+    assert state["created_resources"]["ds"] == "external"
+    assert state["created_resources"]["kb"] == "external"
+
+    assert _cli("teardown", "c", "--yes") == 0
+    assert [kind for kind, _ in cloud.deletions] == ["app"]
+    assert "xxxxxxxx-console-ds" in qs.data_sources and "xxxxxxxx-console-kb" in qs.kbs
+
+
+def test_quick_setup_prints_the_statement_for_a_customer_managed_role(cloud, capsys):
+    role = f"arn:aws:iam::{_ACCOUNT}:role/team-quick-service-role"
+    cloud.quicksight.role_type = "CUSTOMER_MANAGED"
+    cloud.quicksight.customer_role_arn = role
+    _quick_config()
+    out = _setup_unauthorized(cloud, capsys)
+    assert "customer-managed Quick service role" in out
+    statement = out[out.index('"Sid": "QuickSignEntraAssertionStatement"'):]
+    assert f'"AWS": "{role}"' in statement
+    assert _state()["signing_key_arn"] in statement
+    assert "aws-quicksight-kms-role-v0" not in out
+    _assert_no_key_access_written(cloud)
+
+
+def test_quick_owner_arn_is_used_as_given(cloud, capsys):
+    owner = f"arn:aws:quicksight:{_QUICK_REGION}:{_ACCOUNT}:group/default/kb-owners"
+    cloud.quicksight.users = {}  # DescribeUser would fail if setup asked it
+    _quick_config(extra=f'quick_owner_arn = "{owner}"\n')
+    _setup_unauthorized(cloud, capsys)
+    cloud.authorize(_state()["signing_key_arn"])
+    assert _cli("setup", "c") == 0
+    ds_call = cloud.quicksight.creates("create_data_source")[-1]
+    assert ds_call["Permissions"][0]["Principal"] == owner
+    (kb_call,) = cloud.quicksight.creates("create_knowledge_base")
+    assert kb_call["PrimaryOwnerArn"] == owner
+
+
+def test_quick_setup_without_a_quick_user_stops_before_creating(cloud, capsys):
+    from kb_connector.core.errors import ConfigError
+
+    cloud.quicksight.users = {}
+    _quick_config()
+    with pytest.raises(ConfigError, match="quick_owner_arn"):
+        _cli("setup", "c")
+    assert cloud.quicksight.creates("create_data_source") == []
+    assert not cloud.quicksight.data_sources
+
+
+def test_quick_setup_falls_back_to_untagged_when_tagging_is_denied(cloud, capsys):
+    _quick_config()
+    _setup_unauthorized(cloud, capsys)
+    cloud.authorize(_state()["signing_key_arn"])
+    cloud.quicksight.deny_tagging = True
+    assert _cli("setup", "c") == 0
+    err = capsys.readouterr().err
+    assert "without tags (quicksight:TagResource denied)" in err
+    state = _state()
+    assert state["created_resources"]["ds"] == "tool-untagged"
+    assert state["created_resources"]["kb"] == "tool-untagged"
+    assert cloud.quicksight.tags == {}
+
+
+def _quick_authorized(cloud, capsys) -> dict:
+    """Credentials made and the key authorized; no data source or KB yet. Returns state."""
+    _quick_config()
+    _setup_unauthorized(cloud, capsys)
+    state = _state()
+    cloud.authorize(state["signing_key_arn"])
+    return state
+
+
+def _console_data_source(cloud, state: dict, ds_id: str, *, client_id: str | None = None,
+                         **fields) -> str:
+    """A data source made outside this tool, for this app unless `client_id` says another."""
+    arn = cloud.quicksight.create_data_source(
+        AwsAccountId=_ACCOUNT, DataSourceId=ds_id, Name=ds_id, Type="SHAREPOINT",
+        Credentials={"SharePointClientCredentials": {
+            "KmsKeyArn": state["signing_key_arn"],
+            "CertThumbprint": state["cert_thumbprint_b64url"]}},
+        DataSourceParameters={"SharePointParameters": {
+            "SharePointDomain": "x.sharepoint.com",
+            "ClientId": client_id or state["client_app_id"]}},
+    )["Arn"]
+    cloud.quicksight.data_sources[ds_id].update(fields)
+    return arn
+
+
+def _console_knowledge_base(cloud, kb_id: str, ds_arn: str, **fields) -> None:
+    cloud.quicksight.create_knowledge_base(
+        AwsAccountId=_ACCOUNT, KnowledgeBaseId=kb_id, Name=kb_id, DataSourceArn=ds_arn,
+        KnowledgeBaseConfiguration={"templateConfiguration": {"template": {}}},
+        AccessControlConfiguration={"isACLEnabled": True},
+    )
+    cloud.quicksight.kbs[kb_id].update(fields)
+
+
+def test_quick_setup_kb_flag_records_the_named_kb_and_its_data_source(cloud, capsys):
+    state = _quick_authorized(cloud, capsys)
+    ds_arn = _console_data_source(cloud, state, "xxxxxxxx-console-ds")
+    _console_knowledge_base(cloud, "xxxxxxxx-console-kb", ds_arn)
+    cloud.quicksight.calls.clear()
+    capsys.readouterr()
+    assert _cli("setup", "c", "--kb", "xxxxxxxx-console-kb") == 0
+    out = capsys.readouterr().out
+    assert cloud.quicksight.calls == []
+    assert "Setup complete." in out and "KB is ACTIVE" in out
+    state = _state()
+    assert state["knowledge_base_id"] == "xxxxxxxx-console-kb"
+    assert state["data_source_id"] == "xxxxxxxx-console-ds"
+    assert state["created_resources"]["kb"] == "external"
+    assert state["created_resources"]["ds"] == "external"
+
+
+def test_quick_setup_kb_flag_refuses_a_kb_on_another_apps_data_source(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    state = _quick_authorized(cloud, capsys)
+    ds_arn = _console_data_source(cloud, state, "xxxxxxxx-other-ds", client_id="app-other")
+    _console_knowledge_base(cloud, "xxxxxxxx-other-kb", ds_arn)
+    cloud.quicksight.calls.clear()
+    with pytest.raises(AwsError, match="does not use this connector's Entra app"):
+        _cli("setup", "c", "--kb", "xxxxxxxx-other-kb")
+    assert cloud.quicksight.calls == []
+    assert _state()["knowledge_base_id"] is None
+
+
+def test_quick_setup_kb_flag_keeps_a_tool_made_data_source_as_the_tools(cloud, capsys):
+    state = _quick_authorized(cloud, capsys)
+    assert _cli("setup", "c") == 0
+    ds_arn = cloud.quicksight.data_sources["kb-connector-c-ds"]["Arn"]
+    _console_knowledge_base(cloud, "xxxxxxxx-console-kb", ds_arn)
+    capsys.readouterr()
+    assert _cli("setup", "c", "--kb", "xxxxxxxx-console-kb") == 0
+    err = capsys.readouterr().err
+    assert (
+        "WARNING: state records Quick knowledge base kb-connector-c-kb as created "
+        "by this tool." in err
+    )
+    assert "kb-connector-c-kb is no longer tracked" in err
+    state = _state()
+    assert state["knowledge_base_id"] == "xxxxxxxx-console-kb"
+    assert state["created_resources"]["kb"] == "external"
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["created_resources"]["ds"] == "tool"
+
+
+def test_quick_setup_with_several_data_sources_for_the_app_is_not_finished(cloud, capsys):
+    state = _quick_authorized(cloud, capsys)
+    for ds_id in ("xxxxxxxx-console-ds1", "xxxxxxxx-console-ds2"):
+        _console_data_source(cloud, state, ds_id)
+    cloud.quicksight.calls.clear()
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert "xxxxxxxx-console-ds1" in out and "xxxxxxxx-console-ds2" in out
+    assert "Setup is not finished: several Quick data sources" in out
+    assert "--kb" in out and "Setup complete." not in out
+    assert cloud.quicksight.calls == []
+    state = _state()
+    assert state["data_source_id"] is None and state["knowledge_base_id"] is None
+
+
+def test_quick_setup_with_several_kbs_on_the_data_source_is_not_finished(cloud, capsys):
+    state = _quick_authorized(cloud, capsys)
+    ds_arn = _console_data_source(cloud, state, "xxxxxxxx-console-ds")
+    for kb_id in ("xxxxxxxx-console-kb1", "xxxxxxxx-console-kb2"):
+        _console_knowledge_base(cloud, kb_id, ds_arn)
+    cloud.quicksight.calls.clear()
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    out = capsys.readouterr().out
+    assert "xxxxxxxx-console-kb1" in out and "xxxxxxxx-console-kb2" in out
+    assert "Setup is not finished: several Quick knowledge bases" in out
+    assert "Setup complete." not in out
+    assert cloud.quicksight.calls == []
+    assert _state()["knowledge_base_id"] is None
+
+
+def test_quick_setup_refuses_an_untagged_data_source_under_the_derived_id(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    state = _quick_authorized(cloud, capsys)
+    _console_data_source(cloud, state, "kb-connector-c-ds")
+    cloud.quicksight.calls.clear()
+    with pytest.raises(AwsError, match="Quick data source 'kb-connector-c-ds' already exists"):
+        _cli("setup", "c")
+    assert cloud.quicksight.calls == []
+    assert _state()["data_source_id"] is None
+
+    assert _cli("setup", "c", "--adopt-existing-resources") == 0
+    state = _state()
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["created_resources"]["ds"] == "external"
+    assert state["created_resources"]["kb"] == "tool"
+
+
+def test_quick_setup_refuses_an_untagged_kb_under_the_derived_id(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    state = _quick_authorized(cloud, capsys)
+    ds_arn = _console_data_source(cloud, state, "xxxxxxxx-console-ds")
+    _console_knowledge_base(cloud, "kb-connector-c-kb", ds_arn)
+    with pytest.raises(AwsError, match="Quick knowledge base 'kb-connector-c-kb' already exists"):
+        _cli("setup", "c")
+    assert _state()["knowledge_base_id"] is None
+
+
+def test_quick_setup_refuses_a_state_data_source_for_another_app(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    _quick_authorized(cloud, capsys)
+    assert _cli("setup", "c") == 0
+    params = cloud.quicksight.data_sources["kb-connector-c-ds"]["DataSourceParameters"]
+    params["SharePointParameters"]["ClientId"] = "app-other"
+    with pytest.raises(AwsError, match="recorded in state uses Entra app app-other"):
+        _cli("setup", "c")
+
+
+def test_quick_setup_stops_on_a_failed_data_source(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    state = _quick_authorized(cloud, capsys)
+    _console_data_source(cloud, state, "xxxxxxxx-console-ds", Status="CREATION_FAILED",
+                         ErrorInfo={"Type": "ACCESS_DENIED", "Message": "Tenant refused."})
+    cloud.quicksight.calls.clear()
+    capsys.readouterr()
+    with pytest.raises(AwsError, match=r"failed to create \(ACCESS_DENIED\): Tenant refused"):
+        _cli("setup", "c")
+    out = capsys.readouterr().out
+    assert "Setup complete." not in out and "Setup did not complete." in out
+    assert cloud.quicksight.creates("create_knowledge_base") == []
+
+
+def test_quick_setup_stops_on_a_failed_knowledge_base(cloud, capsys):
+    from kb_connector.core.errors import AwsError
+
+    state = _quick_authorized(cloud, capsys)
+    ds_arn = _console_data_source(cloud, state, "xxxxxxxx-console-ds")
+    _console_knowledge_base(cloud, "xxxxxxxx-console-kb", ds_arn, Status="FAILED")
+    capsys.readouterr()
+    with pytest.raises(AwsError, match="xxxxxxxx-console-kb failed to create"):
+        _cli("setup", "c")
+    out = capsys.readouterr().out
+    assert "Setup complete." not in out and "KB is ACTIVE" not in out
+
+
+def test_quick_setup_uses_an_updated_data_source(cloud, capsys):
+    state = _quick_authorized(cloud, capsys)
+    _console_data_source(cloud, state, "xxxxxxxx-console-ds", Status="UPDATE_SUCCESSFUL")
+    assert _cli("setup", "c") == 0
+    (kb_call,) = cloud.quicksight.creates("create_knowledge_base")
+    assert kb_call["DataSourceArn"].endswith("/xxxxxxxx-console-ds")
+
+
+def test_quick_rotate_cert_warns_that_the_data_source_keeps_the_old_one(cloud, capsys):
+    _quick_authorized(cloud, capsys)
+    assert _cli("setup", "c") == 0
+    old = _state()["cert_thumbprint_b64url"]
+    capsys.readouterr()
+    assert _cli("setup", "c", "--rotate-cert") == 0
+    err = capsys.readouterr().err
+    new = _state()["cert_thumbprint_b64url"]
+    assert new != old
+    assert "WARNING: Quick data source kb-connector-c-ds keeps the certificate" in err
+    assert "kb-connector teardown c --only kb" in err
+    assert "kb-connector teardown c --only ds" in err
+
+    # The recovery the warning gives: a new data source carries the new thumbprint.
+    assert _cli("teardown", "c", "--only", "kb", "--yes") == 0
+    assert _cli("teardown", "c", "--only", "ds", "--yes") == 0
+    capsys.readouterr()
+    assert _cli("setup", "c") == 0
+    assert "WARNING" not in capsys.readouterr().err
+    ds_call = cloud.quicksight.creates("create_data_source")[-1]
+    assert ds_call["Credentials"]["SharePointClientCredentials"]["CertThumbprint"] == new
+    assert set(cloud.quicksight.kbs) == {"kb-connector-c-kb"}
 
 
 def test_a_reserved_data_source_name_gets_the_wait_message():

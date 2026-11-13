@@ -365,13 +365,14 @@ def make_signer(*, session: Any, key_id: str) -> Callable[[bytes], bytes]:
 
 
 def build_sign_grant_statement(*, signing_key_arn: str, principal_arn: str) -> dict:
-    """Policy statement letting the Quick service role sign with this key.
+    """Policy statement letting a customer-managed Quick service role sign with this key.
 
-    Two ways exist to give Quick access to the key. The documented default is
-    the Quick admin console (Manage account -> AWS resources -> AWS Key
-    Management Service), which this tool cannot drive. The alternative, for
-    organizations that manage their own Quick IAM service role, is to grant
-    `kms:Sign` on the key ARN, which is what this statement expresses.
+    Quick is given use of the key in the Quick admin console (Manage account ->
+    AWS resources -> AWS Key Management Service -> Select keys), which has no
+    API. An account whose Quick service role is customer-managed
+    (DescribeResourcePermissions RoleType CUSTOMER_MANAGED) also needs that
+    role granted `kms:Sign` on the key ARN, which is what this statement
+    expresses. Setup prints it for that role only and never writes it.
 
     `kms:GetPublicKey` is included alongside Sign because a signer that cannot
     read the public key cannot confirm which certificate its signature will be
