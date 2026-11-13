@@ -571,6 +571,61 @@ def _event_time(event: dict) -> str:
     return str(value or "")
 
 
+def _event_body(event: dict) -> dict | None:
+    try:
+        body = json.loads(event.get("CloudTrailEvent") or "{}")
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _names_key(event: dict, body: dict, key_arn: str) -> bool:
+    """Whether an event names `key_arn` as its resource or its keyId."""
+    for resource in event.get("Resources") or []:
+        if isinstance(resource, dict) and resource.get("ResourceName") == key_arn:
+            return True
+    for resource in body.get("resources") or []:
+        if isinstance(resource, dict) and resource.get("ARN") == key_arn:
+            return True
+    params = body.get("requestParameters")
+    return isinstance(params, dict) and params.get("keyId") == key_arn
+
+
+def _as_datetime(value: str) -> _dt.datetime | None:
+    try:
+        parsed = _dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed
+
+
+def _latest(found: list[dict]) -> _dt.datetime | None:
+    times = [t for t in (_as_datetime(d["time"]) for d in found) if t is not None]
+    return max(times) if times else None
+
+
+def sign_successes(events: list[dict], key_arn: str, role_name: str) -> list[dict]:
+    """kms:Sign calls on `key_arn` by the Quick role that succeeded.
+
+    A successful Sign event names the key in `resources` or in
+    `requestParameters.keyId`. Only the Quick role's calls count, so the
+    certificate signing that setup does as the operator is not mistaken for
+    Quick signing. Returns event ids and times only.
+    """
+    marker = f"assumed-role/{role_name}/"
+    found: list[dict] = []
+    for event in events:
+        body = _event_body(event)
+        if body is None or body.get("errorCode"):
+            continue
+        caller = str((body.get("userIdentity") or {}).get("arn") or "")
+        if marker in caller and _names_key(event, body, key_arn):
+            found.append({"event_id": event.get("EventId"), "time": _event_time(event)})
+    return found
+
+
 def sign_denials(events: list[dict], key_arn: str, role_name: str | None) -> list[dict]:
     """Denied kms:Sign events on `key_arn`, by the Quick role when it is known.
 
@@ -579,11 +634,8 @@ def sign_denials(events: list[dict], key_arn: str, role_name: str | None) -> lis
     """
     found: list[dict] = []
     for event in events:
-        try:
-            body = json.loads(event.get("CloudTrailEvent") or "{}")
-        except ValueError:
-            continue
-        if not isinstance(body, dict):
+        body = _event_body(event)
+        if body is None:
             continue
         if "AccessDenied" not in str(body.get("errorCode") or ""):
             continue
@@ -602,7 +654,11 @@ def sign_denials(events: list[dict], key_arn: str, role_name: str | None) -> lis
 def check_sign_denied(
     cloudtrail: Any, *, key_arn: str, signer: Any, lookback_minutes: int = 60,
 ) -> CheckResult:
-    """CloudTrail kms:Sign calls on the key that were denied in the lookback window."""
+    """CloudTrail kms:Sign calls on the key that were denied in the lookback window.
+
+    Denials followed by a successful kms:Sign by the Quick role on the same key
+    pass: the key was authorized after them.
+    """
     name = "kms_sign_denied"
     now = _dt.datetime.now(_dt.timezone.utc)
     kwargs: dict[str, Any] = {
@@ -627,9 +683,23 @@ def check_sign_denied(
             data={"error_code": _error_code(exc)},
         )
     role_arn = getattr(signer, "role_arn", None)
-    denials = sign_denials(events, key_arn, _role_name(role_arn) if role_arn else None)
+    role_name = _role_name(role_arn) if role_arn else None
+    denials = sign_denials(events, key_arn, role_name)
     if denials:
         latest = max(d["time"] for d in denials)
+        successes = sign_successes(events, key_arn, role_name) if role_name else []
+        denied_at, signed_at = _latest(denials), _latest(successes)
+        if denied_at and signed_at and signed_at > denied_at:
+            return CheckResult(
+                name=name, passed=True, side="aws",
+                details=(
+                    f"{len(denials)} denied kms:Sign call(s) on KMS key {key_arn} in "
+                    f"the last {lookback_minutes}m (latest {latest}), followed by a "
+                    f"successful kms:Sign by {role_name} at {signed_at.isoformat()}. "
+                    f"Quick can sign with the key."
+                ),
+                data={"events": denials, "signed_at": signed_at.isoformat()},
+            )
         return CheckResult(
             name=name, passed=False, side="aws",
             details=(

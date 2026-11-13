@@ -125,3 +125,65 @@ def test_sign_denials_match_the_key_in_error_message_without_resources():
     found = checks.sign_denials(events, _KEY, "aws-quicksight-kms-role-v0")
     assert found == [{"event_id": "e1", "time": "2026-01-02T03:04:05+00:00"}]
     assert [d["event_id"] for d in checks.sign_denials(events, _KEY, None)] == ["e1", "e4"]
+
+
+_QUICK_CALLER = "arn:aws:sts::123456789012:assumed-role/aws-quicksight-kms-role-v0/quick"
+
+
+def _sign(event_id: str, minute: int, *, denied: bool, caller: str = _QUICK_CALLER,
+          by_key_id: bool = False) -> dict:
+    body: dict = {"eventName": "Sign", "userIdentity": {"arn": caller}}
+    event: dict = {
+        "EventId": event_id,
+        "EventTime": _dt.datetime(2026, 1, 2, 3, minute, tzinfo=_dt.timezone.utc),
+    }
+    if denied:
+        body["errorCode"] = "AccessDenied"
+        body["errorMessage"] = f"User: {caller} is not authorized to perform: kms:Sign on resource: {_KEY}"
+    elif by_key_id:
+        body["requestParameters"] = {"keyId": _KEY}
+    else:
+        event["Resources"] = [{"ResourceType": "AWS::KMS::Key", "ResourceName": _KEY}]
+    event["CloudTrailEvent"] = json.dumps(body)
+    return event
+
+
+def test_sign_successes_count_only_the_quick_role_on_the_key():
+    operator = "arn:aws:sts::123456789012:assumed-role/Admin/tester"
+    events = [
+        _sign("ok-resources", 10, denied=False),
+        _sign("ok-key-id", 11, denied=False, by_key_id=True),
+        _sign("denied", 5, denied=True),
+        _sign("operator", 12, denied=False, caller=operator),
+    ]
+    found = checks.sign_successes(events, _KEY, "aws-quicksight-kms-role-v0")
+    assert [d["event_id"] for d in found] == ["ok-resources", "ok-key-id"]
+    assert checks.sign_successes(events, "key/other", "aws-quicksight-kms-role-v0") == []
+
+
+class _Trail:
+    def __init__(self, events: list[dict]) -> None:
+        self.events = events
+
+    def lookup_events(self, **_kw):
+        return {"Events": list(self.events)}
+
+
+class _Signer:
+    role_arn = _ROLE
+
+
+@pytest.mark.parametrize("success_minute, passed", [(10, True), (1, False)])
+def test_sign_denied_passes_once_quick_signed_after_the_denial(success_minute, passed):
+    trail = _Trail([_sign("denied", 5, denied=True),
+                    _sign("ok", success_minute, denied=False)])
+    result = checks.check_sign_denied(trail, key_arn=_KEY, signer=_Signer())
+    assert result.passed is passed
+    assert "1 denied kms:Sign call(s)" in result.details
+    assert ("followed by a successful kms:Sign" in result.details) is passed
+
+
+def test_sign_denied_with_an_unknown_role_ignores_successes():
+    trail = _Trail([_sign("denied", 5, denied=True), _sign("ok", 10, denied=False)])
+    result = checks.check_sign_denied(trail, key_arn=_KEY, signer=None)
+    assert not result.passed

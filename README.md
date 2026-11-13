@@ -717,7 +717,9 @@ checks instead:
 | `quick_kb_latest_sync` | The latest sync is `COMPLETED` or in progress. For `INCOMPLETE`, `FAILED`, `TIMEOUT` and `CANCELLED` the API gives no reason: the knowledge base's [sync report](https://docs.aws.amazon.com/quick/latest/userguide/sync-reports-observability.html) in the Quick console does |
 
 `diagnose` runs the same checks plus certificate expiry and a CloudTrail scan
-for denied `kms:Sign` calls on the key (`kms_sign_denied`). It does not run the
+for denied `kms:Sign` calls on the key (`kms_sign_denied`). Denials followed by
+a successful `kms:Sign` by the Quick role on the same key pass, because the key
+was authorized after them. `diagnose` does not run the
 secret, log (`--logs`) or account-wide CloudTrail checks, which apply to Bedrock.
 Over MCP, both run without the Entra checks. `validate` reports the skipped
 checks in its notes; `diagnose` skips them without a note.
