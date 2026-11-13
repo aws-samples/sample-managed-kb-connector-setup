@@ -741,16 +741,20 @@ known vulnerability in a code path the tool exercises — for `cryptography`, th
 
 **Status: Mitigated.** Floors are set to the first release clear of known
 advisories rather than the oldest compatible one: `cryptography>=50.0.0`,
-`requests>=2.33.0`, `pytest>=9.0.3`, and `mcp>=1.28.1` (five HIGH-severity
-transport advisories). `pyproject.toml` records which advisory forces each
+`requests>=2.33.0`, `pytest>=9.0.3`, and `mcp>=1.30.0` (five HIGH-severity
+transport advisories fixed in 1.28.1 and four advisories fixed in 1.30.0).
+`pyproject.toml` records which advisory forces each
 number, and CI runs `pip-audit` against both the resolved tree and the declared
 floors, so a new advisory against a floor becomes visible rather than dormant.
 
-`boto3>=1.43.32` is the exception: that floor is a capability requirement, not
-an advisory one. It is the first release whose service model contains the
-managed-connector data-source envelope, knowledge-base encryption, and the
-top-level `userContext` on Retrieve, so an older botocore fails parameter
-validation rather than admitting a vulnerability.
+`boto3>=1.43.125` is the exception: that floor is a capability requirement, not
+an advisory one. 1.43.32 is the first release whose bedrock-agent model contains
+the managed-connector data-source envelope, knowledge-base encryption, and the
+top-level `userContext` on Retrieve; 1.43.117 adds the SharePoint and OneDrive
+client credentials (`KmsKeyArn`, `CertThumbprint`) on the Amazon Quick
+`CreateDataSource`; 1.43.125 adds `quicksight:DescribeResourcePermissions`. An
+older botocore fails parameter validation rather than admitting a
+vulnerability.
 
 Of the `cryptography` advisories below the current floor, only the statically
 linked OpenSSL ones sit on a path this tool uses. The floor is raised anyway:
@@ -775,8 +779,10 @@ shared certificate bucket.
 
 Two KMS key ARNs are supplied rather than derived, and both reach a policy
 `Resource`: `kms_key_arn` in the knowledge base role's inline policy, and
-`signing_key_arn` in the `kms:Sign` grant for a self-managed Quick service role.
-`key/*` in either place grants the principal every key in the account.
+`signing_key_arn` in the `kms:Sign` key policy statement setup prints for a
+customer-managed Quick service role (printed for a key administrator; setup does
+not write it). `key/*` in either place grants the principal every key in the
+account.
 
 **Status: Mitigated.** `identifiers.validate_name_component` and
 `validate_s3_key_prefix` constrain the derived-name inputs to a charset that is
@@ -911,7 +917,8 @@ Security-relevant behaviors that this model depends on:
   `classify_ownership`; skipping that conversion makes a key this tool created
   classify as `UNMANAGED`. The module deliberately has no delete function: KMS
   supports only scheduled deletion, and one signing key can back several Quick
-  knowledge bases, so `teardown` reports the key rather than removing it.
+  knowledge bases, so `teardown` reports the key and prints the
+  `schedule-key-deletion` command rather than removing it.
 - `certs._verify_kms_backed_cert` — checks the generated certificate carries the
   KMS public key *and* that its self-signature verifies, before it is uploaded to
   Entra. The second check is the same verification Entra performs on a client

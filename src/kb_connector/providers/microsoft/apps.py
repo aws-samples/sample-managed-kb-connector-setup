@@ -75,6 +75,32 @@ def ensure_service_principal(graph: GraphClient, app_id: str) -> dict:
     )
 
 
+def get_application(graph: GraphClient, object_id: str) -> dict | None:
+    """Return the application with this directory object id, or None if absent."""
+    try:
+        resp = graph.get(f"/applications/{object_id}", **{"$select": "id,appId"})
+    except GraphError as exc:
+        if getattr(exc, "status", None) == 404:
+            return None
+        raise
+    return require_mapping(resp, field="applications")
+
+
+def find_service_principal(graph: GraphClient, app_id: str) -> dict | None:
+    """Return the service principal for an app id, or None. Creates nothing."""
+    resp = graph.get("/servicePrincipals", **{"$filter": f"appId eq '{app_id}'"})
+    existing = (resp or {}).get("value", [])
+    if not existing:
+        return None
+    return require_mapping(existing[0], field="servicePrincipals[0]")
+
+
+def list_app_role_assignments(graph: GraphClient, sp_id: str) -> list[dict]:
+    """The application permissions assigned to a service principal."""
+    resp = graph.get(f"/servicePrincipals/{sp_id}/appRoleAssignments")
+    return [a for a in (resp or {}).get("value", []) if isinstance(a, dict)]
+
+
 def create_application(graph: GraphClient, display_name: str) -> AppRegistration:
     """Create a single-tenant application + its service principal."""
     app = graph.post(

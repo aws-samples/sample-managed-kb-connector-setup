@@ -44,7 +44,7 @@ from kb_connector.core.monitor import (
     poll_job,
     start_and_poll,
 )
-from kb_connector.core.state import StateFile, load_state
+from kb_connector.core.state import RESOURCE_SIGNING_KEY, StateFile, load_state
 
 
 # --- Result types added by the service layer ---------------------------------
@@ -187,6 +187,11 @@ def diagnose(
     Reuses the existing core check functions (secret/cert/CloudTrail) — this
     function just wires them up with the right session and connector context.
 
+    For target = "quick" it runs certificate expiry, the Quick checks from
+    `kb_connector.quick.checks` and a CloudTrail scan for denied kms:Sign calls
+    on the signing key, and no secret, account-wide CloudTrail or log check.
+    `include_logs` / `log_group_name` raise ConfigError there.
+
     `include_logs` adds per-document ingestion log analysis. It is off by
     default because it needs vended log delivery configured on the knowledge
     base plus logs:FilterLogEvents, so for most callers it would just add a
@@ -216,6 +221,22 @@ def diagnose(
         checks.append(check)
         if on_check is not None:
             on_check(check)
+
+    if ctx.target_name == "quick":
+        if include_logs or log_group_name:
+            raise ConfigError(
+                "Log analysis (--logs, --log-group) applies to Bedrock knowledge "
+                "bases only. Amazon Quick delivers no per-document logs; the "
+                "knowledge base's sync report in the Quick console lists what "
+                "each sync skipped."
+            )
+        _diagnose_quick(
+            ctx, session=session, region=region, kb_id=kb_id,
+            lookback_minutes=lookback_minutes, check_directory=check_directory,
+            graph_auth_method=graph_auth_method, device_client_id=device_client_id,
+            add=_add,
+        )
+        return build_diagnose_result(name, checks)
 
     secret_arn = cs.secret_arn if cs else None
     if secret_arn:
@@ -270,6 +291,42 @@ def diagnose(
         ))
 
     return build_diagnose_result(name, checks)
+
+
+def _diagnose_quick(
+    ctx: Any, *, session: Any, region: str, kb_id: str | None,
+    lookback_minutes: int, check_directory: bool, graph_auth_method: str,
+    device_client_id: str | None, add: Callable[[CheckResult], None],
+) -> None:
+    """The Quick diagnosis: certificate expiry, the Quick checks, kms:Sign denials.
+
+    No secret check (Quick keeps the private key in KMS, there is no secret)
+    and no account-wide CloudTrail scan (it looks for the Bedrock KB role).
+    """
+    from kb_connector.core.state import ConnectorState
+    from kb_connector.quick import checks as quick_checks
+    from kb_connector.quick.client import caller_account
+
+    cs = ctx.cs or ConnectorState()
+    add(check_cert_expiry(cert_not_after=cs.cert_not_after))
+    directory = None
+    if check_directory:
+        directory = quick_checks.read_directory(
+            cs, quick_checks.consent_plan(ctx.cfg, cs),
+            method=graph_auth_method, device_client_id=device_client_id,
+        )
+        if directory is None and cs.client_app_object_id:
+            # As for Bedrock: no Graph access reports the certificate as unverified.
+            add(check_certificate_installed(
+                recorded_thumbprint=cs.cert_thumbprint_b64url, installed_thumbprints=None,
+            ))
+    results, _notes = quick_checks.run_quick_checks(
+        session=session, region=region, account_id=caller_account(session),
+        cfg=ctx.cfg, cs=cs, kb_id=kb_id, directory=directory,
+        directory_checked=check_directory, sign_denied_lookback=lookback_minutes,
+    )
+    for check in results:
+        add(check)
 
 
 def _read_installed_thumbprints(
@@ -332,6 +389,12 @@ def monitor(
         direct_ok=bool(kb_id and ds_id),
         session_factory=session_factory, target_factory=target_factory,
     )
+    if ctx.target_name == "quick":
+        raise ConfigError(
+            f"monitor does not apply to {ctx.name!r} (target = \"quick\"). Amazon "
+            f"Quick has no knowledge-base sync API: it syncs the knowledge base "
+            f"itself. Run `kb-connector validate {ctx.name}` to see the latest sync."
+        )
     ctx.require_region()
     cs = ctx.cs
 
@@ -390,6 +453,9 @@ def validate(
     authorized_user: str | None = None,
     unauthorized_user: str | None = None,
     skip_retrieve: bool = False,
+    check_directory: bool = False,
+    graph_auth_method: str = "az",
+    device_client_id: str | None = None,
     config_path: str | None = None,
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
@@ -409,6 +475,13 @@ def validate(
 
     Test query and users come from the connector's [validation] config
     block by default; CLI/programmatic args override.
+
+    For target = "quick" there is no query API, so it runs the checks in
+    `kb_connector.quick.checks` instead (signing key, Quick's authorization
+    to sign, the knowledge base's status, ACL, documents and latest sync) and
+    notes the query gap. `check_directory` adds the Entra app, certificate and
+    consent checks through Microsoft Graph (`graph_auth_method`,
+    `device_client_id`); without it they are reported as notes.
     """
     ctx = resolve_context(
         connector_name, region=region, profile=profile,
@@ -420,6 +493,20 @@ def validate(
     # Pull validation config from the connector. The block is optional — set it
     # once and `validate` becomes self-contained.
     val_cfg = (cfg.get("validation") if cfg else None) or {}
+
+    if ctx.target_name == "quick":
+        ignored = [
+            label for label, value in (
+                ("query", query or val_cfg.get("query")),
+                ("authorized_user", authorized_user or val_cfg.get("authorized_user")),
+                ("unauthorized_user", unauthorized_user or val_cfg.get("unauthorized_user")),
+            ) if value
+        ]
+        return _validate_quick(
+            ctx, kb_id=kb_id, ignored=ignored, check_directory=check_directory,
+            graph_auth_method=graph_auth_method, device_client_id=device_client_id,
+        )
+
     query = query or val_cfg.get("query", "test")
     authorized_user = authorized_user or val_cfg.get("authorized_user")
     unauthorized_user = unauthorized_user or val_cfg.get("unauthorized_user")
@@ -491,6 +578,42 @@ def validate(
     return ValidateResult(
         connector=name,
         healthy=healthy,
+        checks=checks,
+        notes=notes,
+    )
+
+
+def _validate_quick(
+    ctx: Any, *, kb_id: str | None, ignored: list[str], check_directory: bool,
+    graph_auth_method: str, device_client_id: str | None,
+) -> ValidateResult:
+    """validate for target = "quick". The Bedrock Target is never built."""
+    from kb_connector.core.state import ConnectorState
+    from kb_connector.quick import checks as quick_checks
+    from kb_connector.quick.client import caller_account
+
+    region = ctx.require_region()
+    cs = ctx.cs or ConnectorState()
+    session = ctx.session()
+    directory = None
+    if check_directory:
+        directory = quick_checks.read_directory(
+            cs, quick_checks.consent_plan(ctx.cfg, cs),
+            method=graph_auth_method, device_client_id=device_client_id,
+        )
+    checks, notes = quick_checks.run_quick_checks(
+        session=session, region=region, account_id=caller_account(session),
+        cfg=ctx.cfg, cs=cs, kb_id=kb_id, directory=directory,
+        directory_checked=check_directory,
+    )
+    notes.append(quick_checks.QUERY_GAP_NOTE)
+    if ignored:
+        notes.append(
+            f"Ignored for target = \"quick\": {', '.join(ignored)} (no query API)."
+        )
+    return ValidateResult(
+        connector=ctx.name,
+        healthy=bool(checks) and all(c.passed for c in checks),
         checks=checks,
         notes=notes,
     )
@@ -611,11 +734,19 @@ class TeardownItem:
     identifier: str
     description: str
     adopted: bool      # recorded as external rather than created by this tool
+    # Set on a Quick data source this tool created that is kept because the
+    # external knowledge base with this id uses it.
+    used_by_kb: str | None = None
 
 
 @dataclass
 class TeardownPlan:
-    """What teardown would delete and keep. Computing it makes no AWS call."""
+    """What teardown would delete and keep.
+
+    Computing it makes no AWS call, except one read-only DescribeKnowledgeBase
+    for a Quick connector whose kept external knowledge base would keep a data
+    source this tool created.
+    """
 
     connector: str
     connector_type: str | None
@@ -624,6 +755,16 @@ class TeardownPlan:
     keep: list[TeardownItem] = field(default_factory=list)
     scoped: bool = False   # limited to one kind with `only`
     ctx: Any = field(default=None, repr=False)
+    # The Quick KMS signing key. Teardown never deletes it; it is reported so
+    # the operator can schedule its deletion.
+    signing_key_arn: str | None = None
+    signing_key_external: bool = False
+    # An external Quick knowledge base recorded in state that Quick reports as
+    # not found. execute_teardown removes it from state.
+    gone_kb: str | None = None
+    # Why the external Quick knowledge base could not be checked (an error
+    # code). Its data source and the Entra app are kept.
+    kb_check_error: str | None = None
 
     @property
     def tracked(self) -> bool:
@@ -636,7 +777,7 @@ class TeardownEvent:
 
     kind: Literal[
         "job_check_failed", "job_stopping", "job_stopped", "job_still_stopping",
-        "job_stop_failed", "deleted", "failed", "skipped",
+        "job_stop_failed", "deleted", "failed", "skipped", "forgotten",
     ]
     item: TeardownItem | None = None
     detail: str | None = None
@@ -675,7 +816,9 @@ def plan_teardown(
 ) -> TeardownPlan:
     """List what teardown would delete and keep, from state.
 
-    Resources recorded as adopted are kept unless `include_adopted`. A config
+    Resources recorded as adopted are kept unless `include_adopted`. A Quick
+    data source this tool created is kept while a kept external knowledge base
+    uses it; see `_check_kept_quick_kb`. A config
     entry that fails to resolve does not block the plan, since state is what
     teardown acts on. Raises ConfigError if anything AWS-side would be deleted
     and no region is known: a guessed region sends every delete to a region
@@ -702,9 +845,14 @@ def plan_teardown(
     if cs is None:
         return plan
 
+    plan.signing_key_arn = cs.signing_key_arn
+    plan.signing_key_external = not cs.is_tool_owned(RESOURCE_SIGNING_KEY)
+    quick = cs.target == "quick"
     candidates: list[tuple[str, str | None, str]] = [
-        ("ds", cs.data_source_id, f"Data source {cs.data_source_id}"),
-        ("kb", cs.knowledge_base_id, f"Knowledge base {cs.knowledge_base_id}"),
+        ("ds", cs.data_source_id,
+         f"{'Quick data source' if quick else 'Data source'} {cs.data_source_id}"),
+        ("kb", cs.knowledge_base_id,
+         f"{'Quick knowledge base' if quick else 'Knowledge base'} {cs.knowledge_base_id}"),
         ("secret", cs.secret_arn, f"Secret {cs.secret_arn}"),
         ("role", cs.kb_role_arn, f"IAM role {cs.kb_role_arn}"),
         (
@@ -715,11 +863,40 @@ def plan_teardown(
         ),
         ("app", cs.client_app_id, f"Entra app {cs.client_app_id}"),
     ]
+    # A Quick knowledge base references its data source, so a data source under
+    # a kept external knowledge base is kept too.
+    kept_quick_kb = (
+        cs.knowledge_base_id
+        if quick and cs.knowledge_base_id and not include_adopted
+        and not cs.is_tool_owned("kb")
+        else None
+    )
+    if (
+        kept_quick_kb and cs.data_source_id and only in (None, "ds")
+        and cs.is_tool_owned("ds")
+    ):
+        _check_kept_quick_kb(ctx, plan, kept_quick_kb)
+        if plan.gone_kb:
+            kept_quick_kb = None
     for kind, identifier, description in candidates:
         if not identifier or (only and kind != only):
             continue
+        if kind == "kb" and plan.gone_kb:
+            continue
         adopted = not cs.is_tool_owned(kind)
         item = TeardownItem(kind, identifier, description, adopted)
+        held = kind == "ds" or (kind == "app" and plan.kb_check_error is not None)
+        if kept_quick_kb and held and not adopted:
+            if kind == "ds":
+                # Built from the state fields, not the loop values: `candidates`
+                # also holds the secret ARN.
+                item.description = (
+                    f"Quick data source {cs.data_source_id} (used by external "
+                    f"Quick knowledge base {kept_quick_kb})"
+                )
+            item.used_by_kb = kept_quick_kb
+            plan.keep.append(item)
+            continue
         (plan.keep if adopted and not include_adopted else plan.delete).append(item)
 
     if any(item.kind in _AWS_KINDS for item in plan.delete):
@@ -741,8 +918,8 @@ def execute_teardown(
 ) -> TeardownResult:
     """Delete what the plan lists, then update or clear the state entry.
 
-    Refuses while an ingestion job is running on the data source unless
-    `force`, which stops the job first. The data source and knowledge base are
+    For Bedrock, refuses while an ingestion job is running on the data source
+    unless `force`, which stops the job first. The data source and knowledge base are
     deleted before the credentials; if either fails, the credentials are kept
     so a later run can retry. The state entry is removed only after an unscoped
     teardown that deleted everything and kept nothing.
@@ -760,7 +937,15 @@ def execute_teardown(
     if not plan.delete:
         return result
 
-    if cs.knowledge_base_id and cs.data_source_id:
+    if plan.gone_kb and cs.knowledge_base_id == plan.gone_kb:
+        cs.knowledge_base_id = None
+        cs.created_resources.pop("kb", None)
+        _emit(TeardownEvent("forgotten", detail=plan.gone_kb))
+
+    # Quick has no ingestion-job API, and its knowledge base deletes while a
+    # sync is running, so there is no job to check or stop.
+    is_quick = ctx.target_name == "quick"
+    if not is_quick and cs.knowledge_base_id and cs.data_source_id:
         target = ctx.target()
         try:
             active = td.find_active_ingestion_job(
@@ -785,17 +970,27 @@ def execute_teardown(
                     "job_stopped" if status else "job_still_stopping", detail=status,
                 ))
 
+    # Bedrock deletes the data source first (it lives inside the knowledge
+    # base). A Quick knowledge base references its data source, so it goes first.
+    control_order = ("kb", "ds") if is_quick else _CONTROL_PLANE_KINDS
     ordered = sorted(
-        plan.delete, key=lambda i: 0 if i.kind in _CONTROL_PLANE_KINDS else 1
+        plan.delete,
+        key=lambda i: control_order.index(i.kind) if i.kind in control_order
+        else len(control_order),
     )
+    quick = _quick_client(ctx) if is_quick and any(
+        i.kind in _CONTROL_PLANE_KINDS for i in ordered
+    ) else None
+    # After a failed delete the credentials are kept. For Quick the data source
+    # is kept as well, because the knowledge base still references it.
     control_plane_failed = False
     for item in ordered:
-        if control_plane_failed and item.kind not in _CONTROL_PLANE_KINDS:
+        if control_plane_failed and (is_quick or item.kind not in _CONTROL_PLANE_KINDS):
             result.skipped.append(item)
             _emit(TeardownEvent("skipped", item))
             continue
         try:
-            _delete_item(ctx, cs, item, auth_method, device_client_id)
+            _delete_item(ctx, cs, item, auth_method, device_client_id, quick=quick)
         except Exception as exc:  # noqa: BLE001 - reported per resource
             result.failed.append(item)
             _emit(TeardownEvent("failed", item, str(exc)))
@@ -817,14 +1012,54 @@ def execute_teardown(
     return result
 
 
+def _quick_client(ctx: Any) -> Any:
+    """One QuickClient for a Quick teardown, in the connector's account."""
+    from kb_connector.quick.client import QuickClient, caller_account
+
+    session = ctx.session()
+    return QuickClient(
+        session=session, region=ctx.region, account_id=caller_account(session)
+    )
+
+
+def _check_kept_quick_kb(ctx: Any, plan: TeardownPlan, kb_id: str) -> None:
+    """Whether the kept external Quick knowledge base still exists in Quick.
+
+    One read-only DescribeKnowledgeBase. Only "not found" sets `plan.gone_kb`,
+    which lets teardown delete the data source under it. Any other failure sets
+    `plan.kb_check_error` to the error code, and the data source and the Entra
+    app are kept.
+    """
+    if not ctx.region:
+        plan.kb_check_error = "no region known"
+        return
+    try:
+        found = _quick_client(ctx).describe_knowledge_base(kb_id)
+    except Exception as exc:  # noqa: BLE001 - reported, and everything is kept
+        plan.kb_check_error = getattr(exc, "code", None) or type(exc).__name__
+        return
+    if found is None:
+        plan.gone_kb = kb_id
+
+
 def _delete_item(
     ctx: Any, cs: Any, item: TeardownItem, auth_method: str,
-    device_client_id: str | None,
+    device_client_id: str | None, *, quick: Any = None,
 ) -> None:
-    """Delete one resource and clear its identifiers from state."""
+    """Delete one resource and clear its identifiers from state.
+
+    `quick` is the QuickClient for a Quick connector, and routes the data
+    source and knowledge base deletes to Amazon Quick.
+    """
     from kb_connector.core import teardown as td
 
-    if item.kind == "ds":
+    if quick is not None and item.kind == "kb":
+        quick.delete_knowledge_base(item.identifier, wait=True)
+        cs.knowledge_base_id = None
+    elif quick is not None and item.kind == "ds":
+        quick.delete_data_source(item.identifier)
+        cs.data_source_id = None
+    elif item.kind == "ds":
         if not cs.knowledge_base_id:
             raise StateError(
                 "The data source cannot be deleted without its knowledge base "

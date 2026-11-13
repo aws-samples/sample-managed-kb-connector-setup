@@ -116,13 +116,10 @@ def _describe_key(kms: Any, key_id: str) -> dict | None:
     return metadata
 
 
-def _verify_key_shape(meta: dict, *, identifier: str) -> None:
-    """Refuse a key that cannot sign Entra assertions.
+def key_shape_problems(meta: dict) -> list[str]:
+    """Why a key (DescribeKey or GetPublicKey metadata) cannot sign Entra assertions.
 
-    Raised as a hard error rather than a warning: a key of the wrong spec still
-    yields a public key and a certificate that Entra accepts on upload, and the
-    mismatch only surfaces later as a failed sync with no indication that the
-    key was the cause.
+    Empty when the key has the shape Quick requires.
     """
     spec = meta.get("KeySpec") or meta.get("CustomerMasterKeySpec")
     usage = meta.get("KeyUsage")
@@ -137,6 +134,18 @@ def _verify_key_shape(meta: dict, *, identifier: str) -> None:
         problems.append(f"it is not enabled (state: {meta.get('KeyState')!r})")
     if meta.get("KeyState") == "PendingDeletion":
         problems.append("it is pending deletion")
+    return problems
+
+
+def _verify_key_shape(meta: dict, *, identifier: str) -> None:
+    """Refuse a key that cannot sign Entra assertions.
+
+    Raised as a hard error rather than a warning: a key of the wrong spec still
+    yields a public key and a certificate that Entra accepts on upload, and the
+    mismatch only surfaces later as a failed sync with no indication that the
+    key was the cause.
+    """
+    problems = key_shape_problems(meta)
     if problems:
         raise AwsError(
             f"KMS key {identifier!r} cannot be used to sign Entra assertions: "
@@ -365,13 +374,14 @@ def make_signer(*, session: Any, key_id: str) -> Callable[[bytes], bytes]:
 
 
 def build_sign_grant_statement(*, signing_key_arn: str, principal_arn: str) -> dict:
-    """Policy statement letting the Quick service role sign with this key.
+    """Policy statement letting a customer-managed Quick service role sign with this key.
 
-    Two ways exist to give Quick access to the key. The documented default is
-    the Quick admin console (Manage account -> AWS resources -> AWS Key
-    Management Service), which this tool cannot drive. The alternative, for
-    organizations that manage their own Quick IAM service role, is to grant
-    `kms:Sign` on the key ARN, which is what this statement expresses.
+    Quick is given use of the key in the Quick admin console (Manage account ->
+    AWS resources -> AWS Key Management Service -> Select keys), which has no
+    API. An account whose Quick service role is customer-managed
+    (DescribeResourcePermissions RoleType CUSTOMER_MANAGED) also needs that
+    role granted `kms:Sign` on the key ARN, which is what this statement
+    expresses. Setup prints it for that role only and never writes it.
 
     `kms:GetPublicKey` is included alongside Sign because a signer that cannot
     read the public key cannot confirm which certificate its signature will be

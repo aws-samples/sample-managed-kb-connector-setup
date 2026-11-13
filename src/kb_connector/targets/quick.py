@@ -1,12 +1,9 @@
-"""Quick KB API target (future — stub).
+"""Placeholder Target for Amazon Quick.
 
-Quick KB shares the same connector config + source-side setup as the Bedrock
-managed KB target; only the control-plane API differs. This stub declares the
-interface so the rest of the tool can target Quick once the APIs land.
-
-All methods raise NotImplementedError until the Quick control-plane API is
-available. The structure mirrors BmkbTarget so the implementation is a
-matter of swapping the API calls, not redesigning.
+This class does not implement the Target interface: every method raises
+NotImplementedError. The Amazon Quick flow (data source, knowledge base,
+validate and diagnose checks) lives in `kb_connector.quick`, and setup,
+validate, diagnose and teardown route to it when `target = "quick"`.
 """
 
 from __future__ import annotations
@@ -18,8 +15,9 @@ from typing import Any
 from kb_connector.targets.base import Target
 
 _NOT_AVAILABLE = (
-    "The Quick KB target is not yet available. Quick control-plane APIs have "
-    "not launched. Use the bmkb target (the default) for now."
+    "QuickTarget does not implement the Target interface. The Amazon Quick "
+    "flow lives in kb_connector.quick: run setup, validate, diagnose or "
+    "teardown on a connector with target = \"quick\"."
 )
 
 

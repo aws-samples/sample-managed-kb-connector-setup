@@ -3,6 +3,12 @@
 Runs diagnostics: ingestion log analysis, CloudTrail permission check,
 secret validation, cert expiry check. Attributes failures to source-side
 or AWS-side.
+
+For target = "quick" it runs cert expiry, the Quick checks that validate runs
+(signing key, Quick's authorization to sign, Entra app, certificate and
+consent, knowledge base status, ACL, documents and latest sync) and a
+CloudTrail scan for denied kms:Sign calls on the signing key, instead of the
+secret, log and account-wide CloudTrail checks.
 """
 
 from __future__ import annotations
@@ -26,7 +32,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         description=(
             "Run diagnostics: ingestion log analysis, CloudTrail permission check, "
             "secret validation, cert expiry and directory checks. "
-            "Attributes failures to source-side or AWS-side."
+            "Attributes failures to source-side or AWS-side. For target = "
+            "'quick', runs cert expiry, the Quick checks that validate runs and "
+            "a CloudTrail scan for denied kms:Sign calls on the signing key, "
+            "instead of the secret, log and account-wide CloudTrail checks."
         ),
     )
     parser.add_argument("connector", nargs="?", help="Connector name from config")
@@ -41,7 +50,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--auth-method", choices=["az", "device_code"], default="az",
         help=(
-            "Graph token acquisition for the certificate check (default: az). "
+            "Graph token acquisition for the directory checks (default: az). "
             "Without Graph access that one check reports as unverified and the "
             "rest of the diagnosis still runs."
         ),
@@ -53,9 +62,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--logs", action="store_true",
         help=(
-            "Analyze per-document ingestion events from CloudWatch Logs to "
-            "explain the scanned-vs-indexed gap. Requires vended log delivery "
-            "on the knowledge base and logs:FilterLogEvents on the log group."
+            "Bedrock only. Analyze per-document ingestion events from "
+            "CloudWatch Logs to explain the scanned-vs-indexed gap. Requires "
+            "vended log delivery on the knowledge base and logs:FilterLogEvents "
+            "on the log group."
         ),
     )
     parser.add_argument(

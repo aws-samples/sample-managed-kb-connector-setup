@@ -235,7 +235,9 @@ class SharePointConnector(ConnectorSpec):
         Field("sharepoint_host", str, "Tenant host, for example contoso.sharepoint.com.",
               in_params=False, ask=True),
         Field("sharepoint_domain", str,
-              "Quick target: tenant root URL the Quick console asks for.", in_params=False),
+              "Quick target: SharePoint host for the Quick data source; scheme and "
+              "path are stripped. Defaults to sharepoint_host, else the host of "
+              "site_urls[0].", in_params=False),
         Field("crawl_files", bool, "Crawl files.", default=True),
         Field("crawl_pages", bool, "Crawl pages.", default=True),
         Field("inclusion_item_paths", list,

@@ -566,7 +566,8 @@ def build_diagnose_result(
     # Determine severity
     critical_failures = [c for c in failed_checks if c.name in (
         "cloudtrail_permissions", "secret_validation", "cert_expiry",
-        "ingestion_logs",
+        "ingestion_logs", "signing_key_usable", "quick_key_authorized",
+        "kms_sign_denied", "quick_kb_active", "entra_app", "entra_consent",
     )]
     status: Literal["healthy", "degraded", "failing"] = "failing" if critical_failures else "degraded"
 
@@ -599,6 +600,42 @@ def _suggest_fix(check: CheckResult) -> str | None:
         if days < 0:
             return "Certificate has expired. Run `kb-connector setup` to generate a new one."
         return "Certificate is expiring soon. Plan a rotation."
+    if check.name == "signing_key_usable":
+        return (
+            "Use a new signing key. The Quick data source keeps the key and "
+            "certificate it was created with, so recreate it and its knowledge "
+            "base: run `kb-connector teardown <connector> --only kb` and "
+            "`kb-connector teardown <connector> --only ds` (a data source or "
+            "knowledge base recorded as external is deleted in the Quick console "
+            "instead), set `signing_key_alias` to a new alias, and re-run "
+            "`kb-connector setup <connector> --rotate-cert`. Setup issues the "
+            "certificate from the new key, prints the Quick console step for it, "
+            "and creates a new data source and knowledge base."
+        )
+    if check.name in ("quick_key_authorized", "kms_sign_denied"):
+        return (
+            "A Quick administrator (Admin Pro) adds the key in the Quick console: "
+            "Manage account -> Permissions -> AWS resources -> AWS Key Management "
+            "Service -> Select keys, then Save. A customer-managed Quick service "
+            "role also needs kms:Sign on the key."
+        )
+    if check.name == "quick_kb_active":
+        return (
+            "Run `kb-connector setup <connector>` to create the Quick knowledge "
+            "base, or pass --kb with the one to check."
+        )
+    if check.name == "entra_app":
+        return "Re-run `kb-connector setup <connector>` to create the Entra app again."
+    if check.name == "entra_consent":
+        return (
+            "Re-run `kb-connector setup <connector>` to grant the missing "
+            "permissions, or grant admin consent for them in Microsoft Entra."
+        )
+    if check.name == "quick_kb_latest_sync":
+        return (
+            "Open the knowledge base's sync report in the Quick console; the "
+            "Quick API does not say why a sync did not complete."
+        )
     if check.name == "ingestion_logs":
         issues = check.data.get("actionable_issues") or []
         joined = " ".join(issues).lower()

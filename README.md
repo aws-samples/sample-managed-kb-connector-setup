@@ -64,7 +64,7 @@ people).
 | Target | What it does | Status |
 |--------|--------------|--------|
 | `bmkb` (default) | Amazon Bedrock managed Knowledge Bases. Full setup through to an ingestion job | Complete |
-| `quick` | Amazon Quick. Service credentials for SharePoint and OneDrive | Partial, see [Amazon Quick target](#amazon-quick-target) |
+| `quick` | Amazon Quick, SharePoint and OneDrive. Creates the KMS signing key, certificate, Entra app, Quick data source and knowledge base; one console step authorizes the key | Complete, see [Amazon Quick target](#amazon-quick-target) |
 
 Everything below assumes the default `bmkb` target unless it says otherwise.
 
@@ -585,9 +585,9 @@ other's credentials.
 ## Amazon Quick target
 
 Everything above targets Amazon Bedrock managed Knowledge Bases. Setting
-`target = "quick"` on a SharePoint or OneDrive connector points the same
-source-side setup at Amazon Quick instead, following Quick's admin-managed
-pattern where the credential is an AWS KMS key rather than a stored private key.
+`target = "quick"` on a SharePoint or OneDrive connector creates an Amazon Quick
+knowledge base instead, following Quick's admin-managed pattern where the
+credential is an AWS KMS key rather than a stored private key.
 
 ```toml
 [connectors.engineering-quick]
@@ -600,46 +600,155 @@ sharepoint_domain = "https://contoso.sharepoint.com"   # SharePoint only
 site_urls = ["https://contoso.sharepoint.com/sites/engineering"]
 ```
 
-Setup creates the KMS asymmetric signing key, builds an X.509 certificate over
-that key's public half, registers the Entra app with the documented permissions
-and admin consent, then prints the values the Quick console asks for: five for
-SharePoint, four for OneDrive, which has no domain field.
+Setup creates, in order:
+
+1. The Entra app with the documented permissions and admin consent.
+2. The KMS asymmetric signing key (`RSA_2048`, `SIGN_VERIFY`, single-Region).
+3. An X.509 certificate over that key's public half, signed by the same key and
+   uploaded to the Entra app.
+4. The Quick data source (`CreateDataSource`, type `SHAREPOINT` or `ONE_DRIVE`),
+   which carries the tenant, the app's client id, the key ARN and the
+   certificate thumbprint.
+5. The Quick knowledge base (`CreateKnowledgeBase`) on that data source. Setup
+   waits for it to be `ACTIVE`.
 
 The private key is generated inside KMS and never exported, so unlike the Bedrock
 path there is no PKCS#12 in S3, no secret in Secrets Manager, and no knowledge
-base service role. Quick signs the Entra client assertion through `kms:Sign` at
-crawl time. The certificate is signed by that same KMS key, so its signature
-verifies against its own embedded public key, which the OpenSSL `-force_pubkey`
-recipe in the AWS setup guide does not produce.
+base service role. Quick signs the Entra client assertion through `kms:Sign`. The
+certificate's signature verifies against its own embedded public key, which the
+OpenSSL `-force_pubkey` recipe in the AWS setup guide does not produce.
 
-### Where it stops, and the two manual steps
+### The one console step
 
-Setup finishes at the credentials and does not create the knowledge base, because
-the Quick API cannot express this connection yet: `CreateDataSource` has no field
-for a KMS signing key or a certificate thumbprint. See KNOWN-LIMITATIONS.md for
-the evidence. Two steps remain in the Quick console, needing different Quick
-roles, so they are often done by different people:
+No Quick API authorizes a KMS key; the documented route is a step in the Quick
+console. A Quick administrator (**Admin Pro**) does it once per key:
 
-| Step | Who | What |
-|---|---|---|
-| 1 | Quick administrator (**Admin Pro**) | Authorize the signing key: Manage account, Permissions, AWS resources, AWS Key Management Service, then add the printed KMS key ARN. Until this is done the knowledge base can be created but every sync fails to authenticate. |
-| 2 | Knowledge base owner (**Author Pro or Admin Pro**) | Create the KB: Knowledge, the connector, "Connect with service credentials", then paste the printed values. |
+Manage account, Permissions, AWS resources, AWS Key Management Service, Select
+keys, add the key ARN setup printed, Finish, then Save at the bottom of the page.
 
-Setup prints both steps with the values filled in and a link to the matching AWS
-docs page, so its output is the handoff. Re-run it any time to reprint them,
-since it reuses the key, app and certificate rather than reissuing. Quick starts
-the first sync itself once the knowledge base exists, so `monitor` and `--sync`
-do not apply to this target.
+Setup prints this step with the key ARN and a link to the AWS docs page before it
+creates the data source. When the account's Quick service role is
+customer-managed (`DescribeResourcePermissions` returns `CUSTOMER_MANAGED`),
+that role also needs `kms:Sign` on the key: setup prints the key policy
+statement naming the role for a key administrator to add. Setup never writes a
+key policy statement, a grant or an IAM policy.
+
+Until the step is done, `CreateDataSource` fails with "Failed to generate JWT
+assertion". Setup reports that Quick is not yet authorized to sign with the key,
+prints `Setup is not finished`, creates no data source or knowledge base, and
+exits 0. Run `kb-connector setup <connector>` again after the console step: it
+reuses the key, certificate and Entra app and creates the data source and
+knowledge base. On a terminal, setup instead asks you to press Enter after
+saving the key in the console, then retries `CreateDataSource` up to 4 times,
+15 seconds apart; `q` stops.
+
+### What feeds the knowledge base
+
+The knowledge base template has the shape the Quick console writes
+(`SHAREPOINTV3` or `ONEDRIVEV3`), filled from keys the connector already has:
+
+| Quick field | Config key |
+|---|---|
+| SharePoint domain (a bare host) | `sharepoint_domain` (scheme and path stripped), else `sharepoint_host`, else the host of the first `site_urls` entry |
+| SharePoint sites, `crawlFiles`, `crawlPages` | `site_urls`, `crawl_files`, `crawl_pages` |
+| SharePoint `filterConfiguration` | the SharePoint filter keys (`inclusion_item_paths`, `exclusion_file_name_patterns`, ...); `inclusionItemPaths` defaults to `site_urls`, as in the console |
+| OneDrive `crawlPersonalDrives`, `crawlSharedWithMe` | `crawl_personal_drives`, `crawl_shared_with_me` |
+| ACL (`isACLEnabled`, `crawlAcl`, `crawlIdentities`) | `acl` for SharePoint; always on for OneDrive |
+| Data source and knowledge base names | `--ds-name`, `--kb-name` (defaults `<connector>-ds`, `kb-connector-<connector>`) |
+| Tags | the ownership tags, unless `--no-tags` |
+
+The data source id and knowledge base id are derived from the connector name
+(`kb-connector-<connector>-ds`, `kb-connector-<connector>-kb`, with
+`resource_prefix` applied), so a re-run finds them. The maximum file size is
+500 MB, as in the console. `inclusion_user_emails` has no Quick counterpart, and
+setup warns that it has no effect on OneDrive.
+
+`quick_owner_arn` sets the Quick user or group that owns the data source and
+knowledge base:
+
+```toml
+quick_owner_arn = "arn:aws:quicksight:us-east-1:123456789012:user/default/kb-admin"
+```
+
+Without it, the owner is the Quick user of the identity running setup (for an
+assumed role, `<role>/<session>` in the `default` namespace). When that user
+does not exist and no `quick_owner_arn` is set, setup stops before it creates the
+data source.
+
+### Re-running setup
+
+Setup modifies nothing it finds. With `--kb ID`, it records that knowledge base
+and its data source as external (unless state already records them as created
+by this tool) and creates nothing; the data source must carry this app's client
+id. Otherwise it looks for the data source, then the knowledge base:
+
+1. The ids in state.
+2. The derived ids. A resource there that carries this connector's ownership
+   tags is reused; one that does not is refused, unless
+   `--adopt-existing-resources`, which records it as external.
+3. A data source with this app's client id, made outside this tool (for example
+   in the console). Exactly one is recorded as external, with its single
+   knowledge base, or setup creates a knowledge base on it when it has none.
+   With several, setup prints their ids, records nothing and prints
+   `Setup is not finished` (exit 0); pass `--kb` to `setup`, `validate` and
+   `diagnose`.
+
+Setup waits for a data source or knowledge base it finds to become usable. One
+that failed (a data source in `CREATION_FAILED` or `UPDATE_FAILED`, a knowledge
+base in `FAILED`) stops setup with exit 1 and the service's error message.
+
+ACL is fixed when a knowledge base is created. A reused knowledge base whose ACL
+differs from the config gets a warning, and `validate` fails on it.
+
+### Validate, diagnose, monitor and teardown
+
+`validate` has no test query, because Amazon Quick has no API to query a
+knowledge base, so the authorized/denied/no-user retrieve checks do not run. It
+checks instead:
+
+| Check | What it confirms |
+|---|---|
+| `signing_key_usable` | The key exists, is enabled, `RSA_2048` `SIGN_VERIFY`, single-Region, in the connector's Region |
+| `quick_key_authorized` | The role Quick signs with may call `kms:Sign` on the key, through its identity policy (IAM policy simulator), a key policy statement or a grant |
+| `entra_app`, `certificate_installed`, `entra_consent` | The app exists, carries the certificate, and has admin consent for every permission setup grants (through Microsoft Graph; `--auth-method device_code` when `az login` is not available) |
+| `quick_kb_active` | The knowledge base exists and is `ACTIVE` |
+| `quick_kb_acl` | Its ACL setting matches the config |
+| `quick_kb_documents` | It holds at least one document |
+| `quick_kb_latest_sync` | The latest sync is `COMPLETED` or in progress. For `INCOMPLETE`, `FAILED`, `TIMEOUT` and `CANCELLED` the API gives no reason: the knowledge base's [sync report](https://docs.aws.amazon.com/quick/latest/userguide/sync-reports-observability.html) in the Quick console does |
+
+`diagnose` runs the same checks plus certificate expiry and a CloudTrail scan
+for denied `kms:Sign` calls on the key (`kms_sign_denied`). Denials followed by
+a successful `kms:Sign` by the Quick role on the same key pass, because the key
+was authorized after them. `diagnose` does not run the
+secret, log (`--logs`) or account-wide CloudTrail checks, which apply to Bedrock.
+Over MCP, both run without the Entra checks. `validate` reports the skipped
+checks in its notes; `diagnose` skips them without a note.
+
+Quick starts the first sync itself once the knowledge base exists and has no
+sync API, so `monitor` refuses a Quick connector and `setup --sync` has no
+effect.
+
+`teardown` deletes the knowledge base, then the data source, then the Entra app,
+when this tool created them. A data source or knowledge base recorded as
+external is kept. A data source this tool created is also kept while an external
+knowledge base uses it: delete that knowledge base in the Amazon Quick console,
+then re-run `kb-connector teardown <connector>` to remove the data source and the
+rest. Teardown checks that knowledge base with one read-only
+`DescribeKnowledgeBase` call. If the check fails for any reason other than "not
+found", it keeps the data source and the Entra app and prints the error code. A
+kept data source cannot sync once teardown deletes the Entra app it
+authenticates with. The signing key is never deleted automatically (see below);
+`teardown` prints its ARN and the command to schedule its deletion.
 
 ### SharePoint and OneDrive differ
 
 The tool requests the documented permission set for each, and they are not the
-same. OneDrive needs `Group.Read.All`, which the Bedrock connector never asks
-for, and needs no SharePoint REST permission at all. It always enforces
-document-level access control, so `acl = false` is reported and overridden. There
-is no `Sites.Selected` equivalent for OneDrive either, so its app necessarily
-holds tenant-wide read across every user's drive; `sites_selected` warns and has
-no effect. SharePoint supports `Sites.Selected` exactly as it does for `bmkb`.
+same. OneDrive needs `Group.Read.All`, which the Bedrock connector does not ask
+for, and no SharePoint REST permission. Quick always enforces document-level
+access control for OneDrive, so `acl = false` is reported and overridden. There
+is no `Sites.Selected` equivalent for OneDrive, so its app holds tenant-wide
+read across every user's drive; `sites_selected` warns and has no effect.
+SharePoint supports `Sites.Selected` as it does for `bmkb`.
 
 ### Signing key options
 
@@ -658,9 +767,25 @@ Quick knowledge bases. `teardown` prints the ARN and the command to schedule it.
 
 `cert_valid_days` sets the certificate lifetime, defaulting to 365. Reissuing
 with `--rotate-cert` uses the same KMS key, so only the Entra upload and the
-thumbprint change, not the key ARN.
+thumbprint change, not the key ARN. The Quick data source records the
+certificate thumbprint when it is created, and setup does not update a data
+source it finds, so after `--rotate-cert` the data source still uses the
+thumbprint of a certificate the Entra app no longer has, and its syncs fail to
+authenticate. Setup prints a warning when this happens.
+To recover, recreate the knowledge base and the data source:
 
-Full step detail lives in the AWS docs rather than here, so it cannot drift:
+```bash
+kb-connector teardown <connector> --only kb
+kb-connector teardown <connector> --only ds
+kb-connector setup <connector>      # new data source with the new thumbprint
+```
+
+Teardown deletes only what this tool created; delete a knowledge base or data
+source recorded as external in the Quick console first. The same applies to a
+new signing key (`signing_key_alias` set to a new alias), because the data
+source also keeps the key ARN it was created with.
+
+Full step detail lives in the AWS docs:
 [SharePoint](https://docs.aws.amazon.com/quick/latest/userguide/sharepoint-kb-admin-config.html)
 and
 [OneDrive](https://docs.aws.amazon.com/quick/latest/userguide/onedrive-kb-admin-config.html).

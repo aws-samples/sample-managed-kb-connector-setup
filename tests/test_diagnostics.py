@@ -80,6 +80,16 @@ def test_diagnose_result_mixed_attribution():
     assert result.attribution == "unknown"  # mixed sides
 
 
+def test_unusable_signing_key_fix_recreates_the_quick_data_source():
+    """The data source keeps its key and certificate, so a new key needs a new one."""
+    checks = [CheckResult(name="signing_key_usable", passed=False,
+                          details="Key is disabled", side="aws")]
+    fix = build_diagnose_result("c", checks).suggested_fix or ""
+    assert "teardown <connector> --only kb" in fix
+    assert "teardown <connector> --only ds" in fix
+    assert "--rotate-cert" in fix
+
+
 # --- Log analysis ------------------------------------------------------------
 
 

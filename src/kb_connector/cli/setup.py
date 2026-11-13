@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from kb_connector.providers.microsoft.apps import AppRegistration
     from kb_connector.providers.microsoft.client import GraphClient
     from kb_connector.providers.microsoft.sites_selected import AdminAppCredentials
+    from kb_connector.quick.client import QuickClient
     from kb_connector.targets.base import Target
 
 
@@ -54,8 +55,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Set up a connector (source-side identity + AWS resources)",
         description=(
             "Run the full setup flow for a connector: Stage 1 (source-side identity "
-            "provider) and Stage 2 (AWS resources). Resumable — re-running skips "
-            "completed steps."
+            "provider) and Stage 2 (AWS resources; with target = 'quick', the "
+            "Amazon Quick data source and knowledge base). Resumable — re-running "
+            "skips completed steps."
         ),
     )
     parser.add_argument("connector", nargs="?", help="Connector name from config")
@@ -91,14 +93,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                         help="Use Sites.Selected (SharePoint least-privilege)")
     # AWS-side options
     parser.add_argument("--knowledge-base-id", "--kb", metavar="KB_ID",
-                        help="Reuse an existing KB (skip KB creation)")
-    parser.add_argument("--kb-name", help="Name for new KB (default: auto)")
+                        help=(
+                            "Reuse an existing KB (skip KB creation). With "
+                            "target = 'quick', a Quick knowledge base whose data "
+                            "source uses this connector's Entra app; both are "
+                            "recorded and nothing is created."
+                        ))
+    parser.add_argument("--kb-name",
+                        help="Name for a new Bedrock or Quick KB (default: auto)")
     parser.add_argument("--kb-role-name", help="IAM role name for the KB")
     parser.add_argument("--kb-role-arn", help="Use an existing IAM role ARN")
     parser.add_argument("--secret-name", help="Secrets Manager secret name")
     parser.add_argument("--cert-s3-bucket", help="S3 bucket for certificate")
     parser.add_argument("--cert-s3-key", help="S3 key for certificate")
-    parser.add_argument("--ds-name", help="Data source name (default: auto)")
+    parser.add_argument("--ds-name",
+                        help="Name for a new Bedrock or Quick data source (default: auto)")
     parser.add_argument("--no-create-kb-role", action="store_true",
                         help="Don't create a KB service role (requires --kb-role-arn)")
     # Ownership + protection options
@@ -141,8 +150,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--target", choices=sorted(_target_choices()),
         help=(
             "Which control plane creates the knowledge base: 'bmkb' (Bedrock "
-            "managed KB, the default) or 'quick' (Amazon Quick). Overrides the "
-            "target set in config."
+            "managed KB, the default) or 'quick' (Amazon Quick: creates the "
+            "Quick data source and knowledge base). Overrides the target set in "
+            "config."
         ),
     )
     parser.add_argument(
@@ -470,9 +480,10 @@ def _run_setup(args: argparse.Namespace) -> int:
     # (and therefore cleanable by `teardown`). Setup is resumable: re-running
     # reads this state and skips completed steps.
     failed = False
+    unfinished: str | None = None
     try:
         if cfg.type in ("sharepoint", "onedrive"):
-            _setup_microsoft(args, cfg, cs, connector_name, stage)
+            unfinished = _setup_microsoft(args, cfg, cs, connector_name, stage)
         elif cfg.type == "s3":
             _setup_s3(args, cfg, cs, connector_name, stage)
         elif cfg.type == "web":
@@ -514,18 +525,25 @@ def _run_setup(args: argparse.Namespace) -> int:
         else:
             print(f"\nState saved to {path}")
 
+    if unfinished:
+        # Exit 0: the first Quick run always stops here, because the console
+        # step needs the key ARN this run created, and scripts written for
+        # credential-only Quick setup expect 0.
+        print(f"Setup is not finished: {unfinished}")
+        return 0
+
     print("Setup complete.")
 
     if cfg.target == "quick":
-        # No ingestion to start: the knowledge base does not exist yet, and Quick
-        # triggers its own initial sync once it is created in the console.
+        # No ingestion to start: Quick has no sync API.
         if args.sync:
             print(
                 "\n  NOTE: --sync has no effect with target = 'quick'. Quick "
-                "starts the first sync itself once the knowledge base is "
-                "created.",
+                "starts the first sync itself after it creates the knowledge "
+                "base.",
                 file=sys.stderr,
             )
+        print(f"  Next: kb-connector validate {connector_name}")
         return 0
 
     if args.sync:
@@ -873,8 +891,13 @@ def _setup_microsoft(
     cs: ConnectorState,
     connector_name: str,
     stage: str,
-) -> None:
-    """Full SP/OD setup: Stage 1 (Entra) + Stage 2 (AWS)."""
+) -> str | None:
+    """Full SP/OD setup: Stage 1 (Entra) + Stage 2 (AWS).
+
+    Returns why setup is not finished, or None when it is. Only target = 'quick'
+    returns a reason: Quick is not yet authorized to sign with the KMS key, or
+    several Quick data sources or knowledge bases match and none is recorded.
+    """
     from kb_connector.connectors.sharepoint import (
         build_secret_body as sp_secret,
     )
@@ -956,6 +979,17 @@ def _setup_microsoft(
                     "  WARNING: sites_selected has no effect for OneDrive. "
                     "There is no per-site grant for OneDrive, so the app holds "
                     "tenant-wide read across every user's drive.",
+                    file=sys.stderr,
+                )
+            from kb_connector.quick import templates as quick_templates
+
+            for key in quick_templates.ignored_keys(cfg):
+                # The Quick OneDrive knowledge base template has no per-user
+                # filter, so the setting cannot narrow the crawl.
+                print(
+                    f"  WARNING: {key} has no effect for OneDrive with "
+                    f"target = 'quick'. The Quick OneDrive knowledge base has "
+                    f"no field for it, so Quick crawls every user's drive.",
                     file=sys.stderr,
                 )
         # The KMS key is created during Stage 1, before the certificate that
@@ -1158,12 +1192,9 @@ def _setup_microsoft(
 
     # --- Stage 2: AWS-side ---------------------------------------------------
     if stage in ("2", "both") and uses_kms_signing:
-        # Quick's AWS-side work finished in Stage 1: the signing key and the
-        # certificate are the whole credential. What remains is granting Quick
-        # use of the key and creating the knowledge base, neither of which this
-        # tool can do yet, so report the values the console asks for.
-        _report_quick_credentials(args, cfg, cs, connector_name)
-        return
+        # Stage 1 made the signing key and the certificate, which are the whole
+        # credential. Stage 2 creates the Quick data source and knowledge base.
+        return _setup_quick_resources(args, cfg, cs, connector_name)
 
     if stage in ("2", "both"):
         print("\n── Stage 2: AWS-side ──")
@@ -1329,6 +1360,7 @@ def _setup_microsoft(
         )
 
         print("  Stage 2 complete")
+    return None
 
 
 def _cert_valid_days(args: argparse.Namespace, cfg: ConnectorConfig) -> int:
@@ -1471,154 +1503,668 @@ def _ensure_kms_backed_certificate(
         f"  Generated + uploaded certificate over the KMS public key "
         f"(expires {cert.not_after})"
     )
+    if cs.data_source_id:
+        _warn_quick_data_source_keeps_old_certificate(cs, connector_name)
     return cert.thumbprint_b64url, cert.not_after
 
 
-def _report_quick_credentials(
+def _warn_quick_data_source_keeps_old_certificate(
+    cs: ConnectorState, connector_name: str
+) -> None:
+    """A new certificate leaves the recorded Quick data source on the old one.
+
+    The data source holds the key ARN and certificate thumbprint it was created
+    with, and setup does not modify a data source it finds. After the upload the
+    Entra app has only the new certificate, so the data source's syncs
+    cannot authenticate until it is recreated.
+    """
+    print(
+        f"  WARNING: Quick data source {cs.data_source_id} keeps the certificate "
+        f"thumbprint it was created with, and setup does not update it. After this "
+        f"upload the Entra app has only the new certificate, so syncs of this "
+        f"data source will fail to authenticate.\n"
+        f"  To recover, delete and recreate the knowledge base and the data source:\n"
+        f"    kb-connector teardown {connector_name} --only kb\n"
+        f"    kb-connector teardown {connector_name} --only ds\n"
+        f"    kb-connector setup {connector_name}\n"
+        f"  Teardown deletes only what this tool created. A knowledge base or data "
+        f"source recorded as external is kept: delete it in the Quick console "
+        f"first.",
+        file=sys.stderr,
+    )
+
+
+_QUICK_DOCS = "https://docs.aws.amazon.com/quick/latest/userguide"
+
+# Retries after the operator says the key is saved in the Quick console. The
+# authorization took 20-30 s to reach CreateDataSource in live runs.
+_QUICK_AUTH_RETRIES = 4
+_QUICK_AUTH_RETRY_SECONDS = 15
+
+
+def _setup_quick_resources(
     args: argparse.Namespace,
     cfg: ConnectorConfig,
     cs: ConnectorState,
     connector_name: str,
-) -> None:
-    """Print the service credentials Quick's console wizard asks for.
+) -> str | None:
+    """Stage 2 for target = 'quick': the Quick data source and knowledge base.
 
-    This is where the automated path stops. Two steps remain and neither has a
-    public API today:
+    Finds what already exists before creating anything, in this order: the ids
+    in state, the derived ids, then anything else made for this Entra app (a
+    data source by ClientId, a knowledge base by data source ARN). Nothing found
+    is modified. `--kb` names a knowledge base outright. A data source or
+    knowledge base that is found is waited on until it is usable, and one that
+    failed stops setup with the service's error.
 
-      * Granting Quick use of the signing key. The documented route is the Quick
-        admin console (Manage account -> AWS resources -> AWS Key Management
-        Service). The only API-shaped alternative applies when an organization
-        manages its own Quick service role, which needs kms:Sign on the key.
-      * Creating the knowledge base. `quicksight:CreateDataSource` has no field
-        for a KMS signing key or a certificate thumbprint. SharePointParameters
-        carries only domain, tenant, client id and auth type, so the connection
-        cannot be expressed through the API yet.
-
-    Printing the exact five values, labeled as the console labels them, is
-    therefore the useful end state rather than a placeholder.
+    Returns why setup is not finished, or None when it is. Not finished means
+    Quick is not yet authorized to sign with the KMS key, or several data
+    sources or knowledge bases match and none is recorded. The authorization is
+    a Quick console step ("Select keys"), so the first run always stops there:
+    the step needs the key ARN this run has just created. Setup never writes a
+    key policy, a grant or an IAM policy.
     """
     from kb_connector.core import kms_signing
+    from kb_connector.quick import templates
+    from kb_connector.quick.client import QuickClient
 
-    is_sharepoint = cfg.type == "sharepoint"
-    sharepoint_domain = None
-    if is_sharepoint:
-        # OneDrive's console form has no domain field. The tenant id identifies
-        # the tenant and the drives are enumerated from it.
-        sharepoint_domain = (
-            cfg.get("sharepoint_domain")
-            or cfg.get("sharepoint_host")
-            or _domain_from_site_urls(cfg.get("site_urls", []))
-        )
-
-    print("\n── Service credentials (for the Amazon Quick console) ──")
-    rows = []
-    if is_sharepoint:
-        rows.append(("SharePoint domain", sharepoint_domain))
-    rows += [
-        ("Tenant ID", cs.tenant_id),
-        ("Client ID", cs.client_app_id),
-        ("KMS key ARN", cs.signing_key_arn),
-        ("Certificate Thumbprint", cs.cert_thumbprint_b64url),
+    missing = [
+        label for label, value in (
+            ("signing_key_arn", cs.signing_key_arn),
+            ("cert_thumbprint_b64url", cs.cert_thumbprint_b64url),
+            ("client_app_id", cs.client_app_id),
+            ("tenant_id", cs.tenant_id),
+        ) if not value
     ]
-    width = max(len(label) for label, _ in rows)
-    for label, value in rows:
-        shown = value if value else "(unavailable, see above)"
-        print(f"  {label.ljust(width)}  {shown}")
-    if cs.cert_not_after:
-        print(f"\n  Certificate expires {cs.cert_not_after}. Re-run with "
-              f"--rotate-cert to reissue it from the same KMS key.")
-    if is_sharepoint and not sharepoint_domain:
+    if missing:
+        raise StateError(
+            f"State has no {', '.join(missing)} for connector {connector_name!r}, "
+            f"so the Quick data source cannot be created. Run "
+            f"`kb-connector setup {connector_name} --stage both`."
+        )
+    key_arn = str(cs.signing_key_arn)
+    client_id = str(cs.client_app_id)
+
+    print("\n── Stage 2: Amazon Quick ──")
+    session, account_id = _aws_session_and_account(cfg)
+    quick = QuickClient(session=session, region=cfg.region, account_id=account_id)
+
+    # Built before any write, so a config problem (no SharePoint domain, no
+    # site_urls) stops the run with nothing created.
+    ds_type, ds_params = templates.data_source_request(
+        cfg, tenant_id=str(cs.tenant_id), client_id=client_id
+    )
+    kb_template = templates.knowledge_base_template(cfg)
+    acl = templates.quick_acl(cfg)
+    tags = _quick_tags(args, cfg, connector_name)
+    adopt = getattr(args, "adopt_existing_resources", False)
+    owner = _QuickOwner(cfg, quick, session)
+
+    if args.knowledge_base_id:
+        _print_quick_kb_status(_record_quick_kb_from_flag(
+            quick, cs, args.knowledge_base_id, client_id=client_id
+        ))
+        _print_quick_finish(cs, kms_signing)
+        return None
+
+    ds = _find_quick_data_source(
+        quick, cs, cfg, connector_name, client_id=client_id, adopt=adopt
+    )
+    if ds is _SEVERAL:
+        return (
+            f"several Quick data sources use this Entra app (listed above), so "
+            f"setup recorded none and created no knowledge base. Pick the "
+            f"knowledge base to use and pass --kb: "
+            f"`kb-connector setup {connector_name} --kb <id>`."
+        )
+    if ds is None:
+        ds_id = _derived_name(cfg, f"kb-connector-{connector_name}-ds")
+        owner_arn = owner.arn()
+        _print_quick_key_step(cfg, quick, key_arn, kms_signing)
+
+        def create_ds(with_tags: list[dict[str, str]] | None) -> str:
+            return quick.create_data_source(
+                ds_id=ds_id,
+                name=args.ds_name or f"{connector_name}-ds",
+                ds_type=ds_type,
+                parameters=ds_params,
+                key_arn=key_arn,
+                thumbprint=str(cs.cert_thumbprint_b64url),
+                owner_arn=owner_arn,
+                tags=with_tags,
+            )
+
+        created = _create_quick_data_source_when_authorized(
+            create_ds, tags, connector_name=connector_name, key_arn=key_arn
+        )
+        if created is None:
+            return (
+                f"Amazon Quick is not yet authorized to sign with the KMS key. "
+                f"Save the key in the Quick console (Select keys, above), then "
+                f"re-run `kb-connector setup {connector_name}`."
+            )
+        ds_arn, marker = created
+        # Recorded before the wait, so a failed wait leaves the data source
+        # tracked for teardown and for the next run.
+        cs.data_source_id = ds_id
+        cs.record_ownership(state_mod.RESOURCE_DS, marker)
+        print(f"  Created Quick data source: {ds_id}")
+        quick.wait_for_data_source(ds_id)
+        print("  Quick data source is ready")
+    else:
+        ds_arn = str(ds.get("Arn"))
+        _ready_quick_data_source(quick, ds)
+
+    kb = _find_quick_knowledge_base(
+        quick, cs, cfg, connector_name, ds_arn=ds_arn, adopt=adopt
+    )
+    if kb is _SEVERAL:
+        return (
+            f"several Quick knowledge bases use this data source (listed above), "
+            f"so setup recorded none. Pass --kb <id> to validate and diagnose, or "
+            f"record one: `kb-connector setup {connector_name} --kb <id>`."
+        )
+    if kb is None:
+        kb_id = _derived_name(cfg, f"kb-connector-{connector_name}-kb")
+        owner_arn = owner.arn()
+
+        def create_kb(with_tags: list[dict[str, str]] | None) -> str:
+            return quick.create_knowledge_base(
+                kb_id=kb_id,
+                name=args.kb_name or f"kb-connector-{connector_name}",
+                description=f"Managed by kb-connector for connector {connector_name}.",
+                ds_arn=ds_arn,
+                template=kb_template,
+                acl=acl,
+                owner_arn=owner_arn,
+                tags=with_tags,
+            )
+
+        _kb_arn, marker = _create_quick_tagged(create_kb, tags, what="knowledge base")
+        # Recorded before the wait, as the data source is above.
+        cs.knowledge_base_id = kb_id
+        cs.record_ownership(state_mod.RESOURCE_KB, marker)
+        print(f"  Created Quick knowledge base: {kb_id}")
+        print("  Waiting for the knowledge base to become ACTIVE...")
+        kb = quick.wait_until_kb_active(kb_id)
+    else:
+        kb_acl = (kb.get("AccessControlConfiguration") or {}).get("isACLEnabled")
+        if kb_acl is not None and bool(kb_acl) != acl:
+            print(
+                f"  WARNING: Quick knowledge base {cs.knowledge_base_id} has "
+                f"isACLEnabled = {str(bool(kb_acl)).lower()}, but this connector's "
+                f"config asks for {str(acl).lower()}. ACL cannot be changed on an "
+                f"existing knowledge base, and validate reports the mismatch.",
+                file=sys.stderr,
+            )
+        kb = _ready_quick_knowledge_base(quick, kb)
+
+    _print_quick_kb_status(kb)
+    print("  Quick starts the first sync itself; there is no sync API.")
+    _print_quick_finish(cs, kms_signing)
+    return None
+
+
+# Returned by the find helpers when several candidates match and none is picked.
+_SEVERAL: dict = {}
+
+
+def _ready_quick_data_source(quick: QuickClient, ds: dict) -> dict:
+    """A found data source, once usable; raises with ErrorInfo when it failed."""
+    from kb_connector.quick.client import DATA_SOURCE_READY
+
+    if ds.get("Status") in DATA_SOURCE_READY:
+        return ds
+    print(
+        f"  Quick data source {ds.get('DataSourceId')} is {ds.get('Status')}; "
+        f"waiting for it..."
+    )
+    return quick.wait_for_data_source(str(ds.get("DataSourceId")))
+
+
+def _ready_quick_knowledge_base(quick: QuickClient, kb: dict) -> dict:
+    """A found knowledge base, once ACTIVE; raises when it failed."""
+    if kb.get("Status") == "ACTIVE":
+        return kb
+    print(
+        f"  Quick knowledge base {kb.get('KnowledgeBaseId')} is {kb.get('Status')}; "
+        f"waiting for it to become ACTIVE..."
+    )
+    return quick.wait_until_kb_active(str(kb.get("KnowledgeBaseId")))
+
+
+def _print_quick_kb_status(kb: dict) -> None:
+    print("  KB is ACTIVE")
+    ingestion = (kb.get("LatestIngestionSummary") or {}).get("IngestionStatus")
+    if ingestion:
+        print(f"  Latest sync: {ingestion}")
+
+
+class _QuickOwner:
+    """The Quick user or group that owns the data source and knowledge base.
+
+    `quick_owner_arn` wins. Otherwise the Quick user of the identity running
+    setup, found with DescribeUser. CreateKnowledgeBase never makes the caller
+    the owner, and a knowledge base with no owner cannot be managed in the
+    console. Resolved once, before the first create.
+    """
+
+    def __init__(self, cfg: ConnectorConfig, quick: QuickClient, session: Any) -> None:
+        self._cfg = cfg
+        self._quick = quick
+        self._session = session
+        self._arn: str | None = None
+
+    def arn(self) -> str:
+        if self._arn:
+            return self._arn
+        if self._cfg.quick_owner_arn:
+            self._arn = str(self._cfg.quick_owner_arn)
+            return self._arn
+        from kb_connector.quick.client import quick_user_name
+
+        caller = str(self._session.client("sts").get_caller_identity()["Arn"])
+        user_name = quick_user_name(caller)
+        found: str | None = None
+        detail = "it has no Quick user name"
+        if user_name:
+            detail = f"there is no Quick user {user_name!r} in namespace default"
+            try:
+                found = self._quick.user_arn(user_name)
+            except AwsError as exc:
+                detail = f"DescribeUser failed ({exc.code or exc})"
+        if not found:
+            raise ConfigError(
+                f"Cannot tell which Quick user should own the data source and "
+                f"knowledge base: the caller {caller} is not usable because "
+                f"{detail}. Set quick_owner_arn on connector {self._cfg.name!r} "
+                f"to a Quick user or group ARN (for example "
+                f"\"arn:aws:quicksight:us-east-1:123456789012:user/default/"
+                f"jane\"). Nothing was created in Quick."
+            )
+        print(f"  Quick owner: {found}")
+        self._arn = found
+        return found
+
+
+def _quick_tags(
+    args: argparse.Namespace, cfg: ConnectorConfig, connector_name: str
+) -> list[dict[str, str]] | None:
+    """Ownership and operator tags for the Quick resources, or None for --no-tags."""
+    from kb_connector.core.tagging import build_tag_list, validate_extra_tags
+
+    if getattr(args, "no_tags", False):
+        return None
+    try:
+        extra = validate_extra_tags(cfg.tags)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid [tags] entry for this connector: {exc}") from exc
+    return build_tag_list(connector_name, extra)
+
+
+def _create_quick_tagged(
+    create: Any, tags: list[dict[str, str]] | None, *, what: str
+) -> tuple[str, str]:
+    """Create with tags, retrying untagged when tagging is denied.
+
+    Returns (ARN, ownership marker). A resource created without tags is still
+    ours, so it is recorded `tool-untagged`.
+    """
+    from kb_connector.core.tagging import is_tagging_access_error
+
+    try:
+        arn = create(tags)
+    except AwsError as exc:
+        if tags is None or not is_tagging_access_error(exc):
+            raise
         print(
-            "\n  NOTE: no SharePoint domain in config. Set `sharepoint_domain` "
-            "on the connector (for example "
-            '"https://contoso.sharepoint.com"). The console asks for it.',
+            f"  WARNING: created the Quick {what} without tags "
+            f"(quicksight:TagResource denied): {exc}",
             file=sys.stderr,
         )
+        return create(None), state_mod.OWNER_TOOL_UNTAGGED
+    return arn, (state_mod.OWNER_TOOL if tags is not None else state_mod.OWNER_TOOL_UNTAGGED)
 
-    slug = "sharepoint" if is_sharepoint else "onedrive"
-    source_label = (
-        "Microsoft SharePoint Online" if is_sharepoint else "Microsoft OneDrive"
-    )
-    docs = "https://docs.aws.amazon.com/quick/latest/userguide"
 
-    print("\n── Next: two steps in the Amazon Quick console ──")
+def _create_quick_data_source_when_authorized(
+    create: Any,
+    tags: list[dict[str, str]] | None,
+    *,
+    connector_name: str,
+    key_arn: str,
+) -> tuple[str, str] | None:
+    """Create the data source, or explain how to finish while the key is unauthorized.
+
+    Returns (ARN, marker), or None when Quick still cannot sign with the key.
+    On a terminal the operator can authorize the key and press Enter to retry;
+    without one setup never prompts.
+    """
+    from kb_connector.quick.client import KeyNotAuthorized
+
+    try:
+        return _create_quick_tagged(create, tags, what="data source")
+    except KeyNotAuthorized:
+        pass
     print(
-        "  Neither has an API yet, so both are manual. They need different Quick\n"
-        "  roles and are often done by different people. Hand the values above to\n"
-        "  whoever holds each role."
+        f"\n  Amazon Quick is not yet authorized to sign with KMS key {key_arn}.\n"
+        f"  CreateDataSource answered \"Failed to generate JWT assertion\": Quick\n"
+        f"  cannot sign the Entra assertion until the key is saved in the Quick\n"
+        f"  console (the \"Select keys\" step above)."
     )
+    print(
+        f"  To finish, do that step and re-run `kb-connector setup "
+        f"{connector_name}`.\n"
+        f"  The re-run reuses the KMS key, the certificate and the Entra app."
+    )
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    while True:
+        try:
+            answer = input(
+                "  Press Enter after saving the key in the Quick console to "
+                "retry, or q to stop: "
+            )
+        except EOFError:
+            return None
+        if answer.strip().lower() == "q":
+            return None
+        for attempt in range(_QUICK_AUTH_RETRIES):
+            if attempt:
+                time.sleep(_QUICK_AUTH_RETRY_SECONDS)
+            try:
+                return _create_quick_tagged(create, tags, what="data source")
+            except KeyNotAuthorized:
+                print(
+                    f"  Still not authorized (attempt {attempt + 1} of "
+                    f"{_QUICK_AUTH_RETRIES})."
+                )
 
-    print("\n  Step 1. Quick administrator (Admin Pro): authorize the signing key")
+
+def _print_quick_key_step(
+    cfg: ConnectorConfig, quick: QuickClient, key_arn: str, kms_signing: Any
+) -> None:
+    """Print the console step that lets Quick sign with the key.
+
+    For an account whose Quick service role is customer-managed, also print the
+    kms:Sign statement for that role. Printed only; setup writes no policy.
+    """
+    slug = "sharepoint" if cfg.type == "sharepoint" else "onedrive"
+    print(
+        "\n  Quick must be allowed to sign with the KMS key. A Quick administrator\n"
+        "  (Admin Pro) does this once in the Quick console:"
+    )
     print("    Manage account -> Permissions -> AWS resources")
     print("      -> AWS Key Management Service -> Select keys -> Add:")
-    print(f"        {cs.signing_key_arn or '(signing key unavailable)'}")
+    print(f"        {key_arn}")
     print("    Then Finish, and Save at the bottom of the page.")
-    print(f"    Docs: {docs}/{slug}-kb-admin-config.html")
-    print(
-        "    Until this is done, the knowledge base can be created but every sync\n"
-        "    fails to authenticate: Quick cannot sign the Entra assertion."
-    )
-
-    print(
-        "\n  Step 2. Knowledge base owner (Author Pro or Admin Pro): create the KB"
-    )
-    print(f"    Knowledge -> Set up new knowledge base -> {source_label} -> Add")
-    print("      -> 'Have admin access? Connect with service credentials'")
-    print("      -> + Add account, then paste the values above.")
-    print(f"    Docs: {docs}/{slug}-kb-admin-connection.html")
-    if is_sharepoint:
+    print(f"    Docs: {_QUICK_DOCS}/{slug}-kb-admin-config.html")
+    partition = key_arn.split(":")[1] if key_arn.count(":") >= 5 else "aws"
+    signer = quick.signer_role(partition=partition, account_id=quick.account_id)
+    if signer.role_type == "CUSTOMER_MANAGED" and signer.role_arn:
         print(
-            "    Enter site URLs as /sites/<name> paths, not the tenant root.\n"
-            "    ACL management is IMMUTABLE after creation. Decide before you "
-            "create it."
+            f"\n  This account uses a customer-managed Quick service role\n"
+            f"  ({signer.role_arn}). That role also needs kms:Sign on the key.\n"
+            f"  A key administrator adds this statement to the key policy:"
         )
-    else:
+        grant = kms_signing.build_sign_grant_statement(
+            signing_key_arn=key_arn, principal_arn=signer.role_arn
+        )
+        for line in json.dumps(grant, indent=2).splitlines():
+            print(f"      {line}")
+    elif signer.role_type is None and signer.detail:
         print(
-            "    Document-level access control is always enforced for "
-            "admin-managed OneDrive."
+            f"  NOTE: could not read which role Quick signs with "
+            f"(DescribeResourcePermissions: {signer.detail})."
         )
-    print(
-        "    Quick starts the first sync itself once the knowledge base exists;\n"
-        "    there is nothing to trigger from here."
-    )
 
-    print(
-        "\n  If your organization manages its own Quick IAM service role, Step 1\n"
-        "  may not apply. Grant that role kms:Sign on the key instead:"
-    )
-    grant = kms_signing.build_sign_grant_statement(
-        signing_key_arn=cs.signing_key_arn or "<signing-key-arn>",
-        principal_arn="<your-quick-service-role-arn>",
-    )
-    for line in json.dumps(grant, indent=2).splitlines():
-        print(f"      {line}")
 
-    print(
-        f"\n  Re-run `kb-connector setup {connector_name}` at any time to reprint "
-        f"these\n  values; it reuses the key, app and certificate rather than "
-        f"reissuing them."
-    )
-
+def _print_quick_finish(cs: ConnectorState, kms_signing: Any) -> None:
+    if cs.cert_not_after:
+        print(
+            f"\n  Certificate expires {cs.cert_not_after}. Re-run with "
+            f"--rotate-cert to reissue it from the same KMS key."
+        )
     print(f"\n  {kms_signing.describe_orphan_risk(cs.signing_key_arn or '(none)')}")
 
 
-def _domain_from_site_urls(site_urls: Any) -> str | None:
-    """Derive the SharePoint domain from the first configured site URL.
+def _quick_client_id(ds: dict) -> str | None:
+    params = ds.get("DataSourceParameters") or {}
+    for key in ("SharePointParameters", "OneDriveParameters"):
+        client_id = (params.get(key) or {}).get("ClientId")
+        if client_id:
+            return str(client_id)
+    return None
 
-    A convenience only: the console wants the tenant root
-    (`https://contoso.sharepoint.com`) while connectors are configured with site
-    URLs beneath it. Returns None rather than guessing if the value is not a
-    parseable https URL, since a wrong domain in the console fails in a way that
-    does not point back here.
+
+def _classify_found_quick_resource(
+    quick: QuickClient,
+    cs: ConnectorState,
+    connector_name: str,
+    *,
+    resource: str,
+    kind: str,
+    found_id: str,
+    arn: str,
+    adopt: bool,
+) -> None:
+    """Record a resource found under its derived id, or refuse it.
+
+    Ours by tag: recorded `tool`. Anything else is refused unless
+    --adopt-existing-resources, which records it `external`.
     """
-    if not isinstance(site_urls, list) or not site_urls:
-        return None
-    from urllib.parse import urlparse
+    from kb_connector.core.tagging import Ownership, classify_ownership, describe_conflict
 
-    parsed = urlparse(str(site_urls[0]))
-    if parsed.scheme != "https" or not parsed.netloc:
-        return None
-    return f"https://{parsed.netloc}"
+    raw_tags, readable = quick.tags(arn)
+    ownership = classify_ownership(raw_tags, connector_name, verifiable=readable)
+    if ownership is Ownership.OURS:
+        cs.record_owned(resource)
+        print(f"  Using Quick {kind} {found_id} (tagged as this connector's)")
+        return
+    if adopt:
+        cs.record_external(resource)
+        print(
+            f"  Adopting Quick {kind} {found_id} (external — teardown will not "
+            f"delete it)"
+        )
+        return
+    raise AwsError(describe_conflict(
+        resource_kind=f"Quick {kind}",
+        identifier=found_id,
+        ownership=ownership,
+        connector_name=connector_name,
+    ))
+
+
+def _find_quick_data_source(
+    quick: QuickClient,
+    cs: ConnectorState,
+    cfg: ConnectorConfig,
+    connector_name: str,
+    *,
+    client_id: str,
+    adopt: bool,
+) -> dict | None:
+    """The data source to use, recorded in state; None to create; _SEVERAL to stop."""
+    if cs.data_source_id:
+        found = quick.describe_data_source(cs.data_source_id)
+        if found is not None:
+            if _quick_client_id(found) != client_id:
+                raise AwsError(
+                    f"Quick data source {cs.data_source_id} recorded in state "
+                    f"uses Entra app {_quick_client_id(found)}, not this "
+                    f"connector's app {client_id}. Refusing to use it. Check "
+                    f"the state file, or tear the connector down and set it up "
+                    f"again."
+                )
+            print(f"  Using Quick data source {cs.data_source_id} (recorded in state)")
+            return found
+        print(
+            f"  Quick data source {cs.data_source_id} recorded in state no "
+            f"longer exists; looking for another."
+        )
+        cs.data_source_id = None
+        cs.created_resources.pop(state_mod.RESOURCE_DS, None)
+
+    derived = _derived_name(cfg, f"kb-connector-{connector_name}-ds")
+    found = quick.describe_data_source(derived)
+    if found is not None:
+        if _quick_client_id(found) != client_id:
+            raise AwsError(
+                f"Quick data source {derived!r} already exists for another Entra "
+                f"app ({_quick_client_id(found)}). Set resource_prefix for "
+                f"connector {connector_name!r} in config so its derived ids do "
+                f"not collide."
+            )
+        _classify_found_quick_resource(
+            quick, cs, connector_name, resource=state_mod.RESOURCE_DS,
+            kind="data source", found_id=derived, arn=str(found.get("Arn")),
+            adopt=adopt,
+        )
+        cs.data_source_id = derived
+        return found
+
+    others = quick.data_sources_for_app(client_id)
+    if len(others) == 1:
+        (found,) = others
+        cs.data_source_id = str(found.get("DataSourceId"))
+        cs.record_external(state_mod.RESOURCE_DS)
+        print(
+            f"  Found Quick data source {cs.data_source_id} for this Entra app, "
+            f"made outside this tool. Using it (external — teardown will not "
+            f"delete it)."
+        )
+        return dict(found)
+    if len(others) > 1:
+        print(
+            "  Several Quick data sources use this Entra app, so setup picks none "
+            "and creates nothing:"
+        )
+        for other in others:
+            print(f"    • {other.get('DataSourceId')} ({other.get('Name')})")
+        return _SEVERAL
+    return None
+
+
+def _find_quick_knowledge_base(
+    quick: QuickClient,
+    cs: ConnectorState,
+    cfg: ConnectorConfig,
+    connector_name: str,
+    *,
+    ds_arn: str,
+    adopt: bool,
+) -> dict | None:
+    """The knowledge base to use, recorded in state; None to create; _SEVERAL to stop."""
+    if cs.knowledge_base_id:
+        found = quick.describe_knowledge_base(cs.knowledge_base_id)
+        if found is not None:
+            if found.get("DataSourceArn") != ds_arn:
+                raise AwsError(
+                    f"Quick knowledge base {cs.knowledge_base_id} recorded in "
+                    f"state uses data source {found.get('DataSourceArn')}, not "
+                    f"{ds_arn}. Refusing to use it. Check the state file, or "
+                    f"tear the connector down and set it up again."
+                )
+            print(f"  Using Quick knowledge base {cs.knowledge_base_id} (recorded in state)")
+            return found
+        print(
+            f"  Quick knowledge base {cs.knowledge_base_id} recorded in state no "
+            f"longer exists; looking for another."
+        )
+        cs.knowledge_base_id = None
+        cs.created_resources.pop(state_mod.RESOURCE_KB, None)
+
+    derived = _derived_name(cfg, f"kb-connector-{connector_name}-kb")
+    found = quick.describe_knowledge_base(derived)
+    if found is not None:
+        if found.get("DataSourceArn") != ds_arn:
+            raise AwsError(
+                f"Quick knowledge base {derived!r} already exists on another data "
+                f"source ({found.get('DataSourceArn')}). Set resource_prefix for "
+                f"connector {connector_name!r} in config so its derived ids do "
+                f"not collide."
+            )
+        _classify_found_quick_resource(
+            quick, cs, connector_name, resource=state_mod.RESOURCE_KB,
+            kind="knowledge base", found_id=derived,
+            arn=str(found.get("KnowledgeBaseArn")), adopt=adopt,
+        )
+        cs.knowledge_base_id = derived
+        return found
+
+    others = quick.knowledge_bases_for_data_source(ds_arn)
+    if len(others) == 1:
+        kb_id = str(others[0].get("KnowledgeBaseId"))
+        found = quick.describe_knowledge_base(kb_id) or dict(others[0])
+        cs.knowledge_base_id = kb_id
+        cs.record_external(state_mod.RESOURCE_KB)
+        print(
+            f"  Found Quick knowledge base {kb_id} on this data source, made "
+            f"outside this tool. Using it (external — teardown will not delete it)."
+        )
+        return found
+    if len(others) > 1:
+        print(
+            "  Several Quick knowledge bases use this data source, so setup "
+            "records none and creates none:"
+        )
+        for other in others:
+            print(f"    • {other.get('KnowledgeBaseId')} ({other.get('Name')})")
+        return _SEVERAL
+    return None
+
+
+def _record_quick_kb_from_flag(
+    quick: QuickClient, cs: ConnectorState, kb_id: str, *, client_id: str
+) -> dict:
+    """--kb with target = 'quick': record the named knowledge base and its data source.
+
+    Both must already exist and the data source must use this connector's
+    Entra app. Nothing is created. Unless state already records them as this
+    tool's, both are recorded external. Returns the knowledge base once both
+    are usable; raises when either failed.
+    """
+    kb = quick.describe_knowledge_base(kb_id)
+    if kb is None:
+        raise AwsError(f"Quick knowledge base {kb_id!r} (from --kb) does not exist.")
+    ds_arn = str(kb.get("DataSourceArn") or "")
+    ds_id = ds_arn.rsplit("/", 1)[-1]
+    ds = quick.describe_data_source(ds_id) if ds_id else None
+    if ds is None or _quick_client_id(ds) != client_id:
+        raise AwsError(
+            f"Quick knowledge base {kb_id!r} (from --kb) is on data source "
+            f"{ds_arn or '(none)'}, which does not use this connector's Entra app "
+            f"{client_id}. Pick a knowledge base whose data source uses this app."
+        )
+    owned_ds = (
+        cs.data_source_id == ds_id
+        and state_mod.RESOURCE_DS in cs.created_resources
+        and cs.is_tool_owned(state_mod.RESOURCE_DS)
+    )
+    replaced_kb = cs.knowledge_base_id
+    if (
+        replaced_kb and replaced_kb != kb_id
+        and state_mod.RESOURCE_KB in cs.created_resources
+        and cs.is_tool_owned(state_mod.RESOURCE_KB)
+    ):
+        print(
+            f"  WARNING: state records Quick knowledge base {replaced_kb} as created "
+            f"by this tool. --kb replaces it with {kb_id}, so {replaced_kb} is no "
+            f"longer tracked and teardown will not delete it. Delete it in the "
+            f"Amazon Quick console if it is no longer needed.",
+            file=sys.stderr,
+        )
+    if not _record_reused_resource(cs, state_mod.RESOURCE_KB, kb_id):
+        print(f"  Using Quick knowledge base {kb_id} (external — teardown will not delete it)")
+    else:
+        print(f"  Using Quick knowledge base {kb_id}")
+    cs.knowledge_base_id = kb_id
+    if not owned_ds:
+        cs.record_external(state_mod.RESOURCE_DS)
+    cs.data_source_id = ds_id
+    print(f"  Using Quick data source {ds_id}")
+    _ready_quick_data_source(quick, ds)
+    return _ready_quick_knowledge_base(quick, kb)
 
 
 def _should_reuse_certificate(
