@@ -80,6 +80,11 @@ class ConnectorConfig:
     signing_key_arn: str | None = None
     signing_key_alias: str | None = None
 
+    # Quick user or group that owns the Quick data source and knowledge base.
+    # CreateKnowledgeBase never makes the caller an owner, so unset means setup
+    # resolves the Quick user of the identity running it.
+    quick_owner_arn: str | None = None
+
     # Certificate lifetime in days. None means the CLI default. Lives in config
     # because it is a standing policy choice rather than a per-run one.
     cert_valid_days: int | None = None
@@ -184,6 +189,7 @@ class ToolConfig:
             kms_key_arn=pick("kms_key_arn"),
             signing_key_arn=pick("signing_key_arn"),
             signing_key_alias=pick("signing_key_alias"),
+            quick_owner_arn=_validate_quick_owner_arn(pick("quick_owner_arn")),
             cert_valid_days=_validate_cert_valid_days(
                 pick("cert_valid_days", from_microsoft=True)
             ),
@@ -306,6 +312,35 @@ def _validate_cert_valid_days(raw: Any) -> int | None:
             f"cert_valid_days must be at least 1, got {raw}."
         )
     return raw
+
+
+def _validate_quick_owner_arn(raw: Any) -> str | None:
+    """Require a Quick user or group ARN naming one principal.
+
+    It becomes the owner of the Quick data source and knowledge base, so a
+    wildcard or an ARN for another service fails here, before any create.
+    """
+    if raw is None:
+        return None
+    from kb_connector.core.errors import ConfigError, ConnectorError
+    from kb_connector.core.identifiers import validate_arn
+
+    try:
+        checked = validate_arn(raw, field="quick_owner_arn", service="quicksight")
+    except ConnectorError as exc:
+        raise ConfigError(str(exc)) from exc
+    resource = checked.split(":", 5)[5]
+    if not resource.startswith(("user/", "group/")):
+        raise ConfigError(
+            f"quick_owner_arn {raw!r} must name a Quick user (user/...) or "
+            f"group (group/...)."
+        )
+    if "*" in checked or "?" in checked:
+        raise ConfigError(
+            f"quick_owner_arn {raw!r} contains a wildcard. Give the ARN of the "
+            f"single Quick user or group that owns the knowledge base."
+        )
+    return checked
 
 
 def _validate_target(raw: Any) -> str:

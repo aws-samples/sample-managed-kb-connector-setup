@@ -33,6 +33,7 @@ Keys go under `[connectors.<name>]`. A key the tool does not read, or a value of
 | `cert_valid_days` | int | `365` | Certificate lifetime in days. |
 | `signing_key_arn` | str |  | Quick target: existing KMS signing key to use. |
 | `signing_key_alias` | str |  | Quick target: alias for the KMS signing key. |
+| `quick_owner_arn` | str |  | Quick target: Quick user or group ARN that owns the data source and knowledge base. Defaults to the Quick user of the identity running setup. |
 | `sites_selected` | bool | `false` | Grant per-site access with Sites.Selected instead of tenant-wide read. SharePoint only. |
 
 ## `type = "sharepoint"`
@@ -43,7 +44,7 @@ Keys go under `[connectors.<name>]`. A key the tool does not read, or a value of
 | `acl` | bool | `false` | Document-level access control. Cannot be changed later. |
 | `site_urls` | list |  | **Required.** Sites to crawl, as /sites/<name> URLs. |
 | `sharepoint_host` | str |  | Tenant host, for example contoso.sharepoint.com. |
-| `sharepoint_domain` | str |  | Quick target: tenant root URL the Quick console asks for. |
+| `sharepoint_domain` | str |  | Quick target: SharePoint host for the Quick data source; scheme and path are stripped. Defaults to sharepoint_host, else the host of site_urls[0]. |
 | `crawl_files` | bool | `true` | Crawl files. |
 | `crawl_pages` | bool | `true` | Crawl pages. |
 | `inclusion_item_paths` | list |  | Paths to crawl. Replaces the site_urls crawl rather than narrowing it. |

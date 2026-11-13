@@ -504,6 +504,29 @@ def test_signing_key_arn_must_be_a_kms_arn():
         ).resolve_connector("sp")
 
 
+@pytest.mark.parametrize("arn", [
+    "arn:aws:quicksight:us-east-1:123456789012:user/default/Admin/tester",
+    "arn:aws:quicksight:us-east-1:123456789012:group/default/kb-owners",
+])
+def test_quick_owner_arn_accepts_a_user_or_group(arn):
+    assert _tool_config(quick_owner_arn=arn).resolve_connector("sp").quick_owner_arn == arn
+
+
+def test_quick_owner_arn_defaults_to_none():
+    assert _tool_config().resolve_connector("sp").quick_owner_arn is None
+
+
+@pytest.mark.parametrize("arn", [
+    "arn:aws:iam::123456789012:role/Admin",
+    "arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "arn:aws:quicksight:us-east-1:123456789012:user/*",
+    "arn:aws:quicksight:us-east-1:123456789012:dashboard/d1",
+])
+def test_quick_owner_arn_refuses_other_arns(arn):
+    with pytest.raises(ConfigError, match="quick_owner_arn"):
+        _tool_config(quick_owner_arn=arn).resolve_connector("sp")
+
+
 def test_signing_key_arn_wildcard_is_refused():
     """It reaches a policy Resource, where key/* grants every key in the account."""
     with pytest.raises(ConfigError, match="wildcard"):

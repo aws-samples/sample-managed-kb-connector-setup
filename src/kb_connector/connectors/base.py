@@ -101,6 +101,10 @@ MICROSOFT_FIELDS: tuple[Field, ...] = (
           in_params=False),
     Field("signing_key_alias", str, "Quick target: alias for the KMS signing key.",
           in_params=False),
+    Field("quick_owner_arn", str,
+          "Quick target: Quick user or group ARN that owns the data source and "
+          "knowledge base. Defaults to the Quick user of the identity running setup.",
+          in_params=False),
     Field("sites_selected", bool,
           "Grant per-site access with Sites.Selected instead of tenant-wide read. "
           "SharePoint only.",
