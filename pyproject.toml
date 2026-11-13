@@ -35,13 +35,18 @@ dependencies = [
     # admin-managed flow. `cryptography` cannot do this: its CertificateBuilder
     # signs with a local private key, and the KMS key never leaves KMS.
     "asn1crypto>=1.5.1",
-    # 1.43.32 is the first release whose bedrock-agent model carries everything
-    # this tool calls: the MANAGED_KNOWLEDGE_BASE_CONNECTOR data-source type and
-    # its envelope, serverSideEncryptionConfiguration on the managed knowledge
-    # base, and the top-level userContext on Retrieve. 1.43.31 has none of them,
-    # so this floor is a hard requirement rather than a preference — an older
-    # botocore rejects the calls during parameter validation.
-    "boto3>=1.43.32",
+    # This floor is a capability requirement rather than a preference: an older
+    # botocore rejects the calls below during parameter validation.
+    # - 1.43.32 is the first release whose bedrock-agent model carries the
+    #   MANAGED_KNOWLEDGE_BASE_CONNECTOR data-source type and its envelope,
+    #   serverSideEncryptionConfiguration on the managed knowledge base, and the
+    #   top-level userContext on Retrieve.
+    # - 1.43.117 adds DataSourceCredentials.SharePointClientCredentials and
+    #   OneDriveClientCredentials (KmsKeyArn, CertThumbprint) to the quicksight
+    #   model, which `target = "quick"` sends on CreateDataSource.
+    # - 1.43.125 adds quicksight:DescribeResourcePermissions, which validate uses
+    #   to find the role Amazon Quick signs with.
+    "boto3>=1.43.125",
     # Floors are set to the first release without a known CVE, not to the
     # oldest version whose API we happen to use. A `>=` floor is a statement
     # about what a resolver is allowed to install, and a fresh install with a
@@ -71,7 +76,7 @@ dev = [
     "mypy>=1.8",
     # bedrock-agent-runtime is a separate service from bedrock-agent, and the
     # retrieve path lives in it, so its stubs are needed too.
-    "boto3-stubs[bedrock-agent,bedrock-agent-runtime,secretsmanager,iam,s3,sts,logs,cloudtrail]>=1.43.32",
+    "boto3-stubs[bedrock-agent,bedrock-agent-runtime,secretsmanager,iam,s3,sts,logs,cloudtrail,quicksight,kms]>=1.43.125",
 ]
 mcp = [
     # Lower bound is the first release clear of five HIGH-severity transport

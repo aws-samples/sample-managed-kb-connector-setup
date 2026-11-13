@@ -746,11 +746,14 @@ transport advisories). `pyproject.toml` records which advisory forces each
 number, and CI runs `pip-audit` against both the resolved tree and the declared
 floors, so a new advisory against a floor becomes visible rather than dormant.
 
-`boto3>=1.43.32` is the exception: that floor is a capability requirement, not
-an advisory one. It is the first release whose service model contains the
-managed-connector data-source envelope, knowledge-base encryption, and the
-top-level `userContext` on Retrieve, so an older botocore fails parameter
-validation rather than admitting a vulnerability.
+`boto3>=1.43.125` is the exception: that floor is a capability requirement, not
+an advisory one. 1.43.32 is the first release whose bedrock-agent model contains
+the managed-connector data-source envelope, knowledge-base encryption, and the
+top-level `userContext` on Retrieve; 1.43.117 adds the SharePoint and OneDrive
+client credentials (`KmsKeyArn`, `CertThumbprint`) on the Amazon Quick
+`CreateDataSource`; 1.43.125 adds `quicksight:DescribeResourcePermissions`. An
+older botocore fails parameter validation rather than admitting a
+vulnerability.
 
 Of the `cryptography` advisories below the current floor, only the statically
 linked OpenSSL ones sit on a path this tool uses. The floor is raised anyway:

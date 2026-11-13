@@ -107,7 +107,7 @@ wired into config. Highlights:
 | Max file size (default 500 MB) | per-connector field on `dataEntityConfiguration` or filter | exposed for S3 and Web; missing for SharePoint, OneDrive, Confluence, Google Drive |
 | Bulk-deletion safeguard during sync | `managedKnowledgeBaseConnectorConfiguration.deletionProtectionConfiguration` | through `overrides.create_data_source` |
 | Keep indexed content when the data source is deleted | `dataDeletionPolicy` (RETAIN vs DELETE) | through `overrides.create_data_source` |
-| Scheduled sync | `managedKnowledgeBaseConnectorConfiguration.syncSchedule` | not in botocore 1.43.32; needs a boto3 upgrade |
+| Scheduled sync | `managedKnowledgeBaseConnectorConfiguration.syncSchedule` | in the botocore model from 1.43.117; not verified against the service; through `overrides.create_data_source` |
 
 Other gaps worth knowing about:
 
