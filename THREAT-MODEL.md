@@ -741,8 +741,9 @@ known vulnerability in a code path the tool exercises — for `cryptography`, th
 
 **Status: Mitigated.** Floors are set to the first release clear of known
 advisories rather than the oldest compatible one: `cryptography>=50.0.0`,
-`requests>=2.33.0`, `pytest>=9.0.3`, and `mcp>=1.28.1` (five HIGH-severity
-transport advisories). `pyproject.toml` records which advisory forces each
+`requests>=2.33.0`, `pytest>=9.0.3`, and `mcp>=1.30.0` (five HIGH-severity
+transport advisories fixed in 1.28.1 and four advisories fixed in 1.30.0).
+`pyproject.toml` records which advisory forces each
 number, and CI runs `pip-audit` against both the resolved tree and the declared
 floors, so a new advisory against a floor becomes visible rather than dormant.
 

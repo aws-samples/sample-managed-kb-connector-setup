@@ -79,16 +79,19 @@ dev = [
     "boto3-stubs[bedrock-agent,bedrock-agent-runtime,secretsmanager,iam,s3,sts,logs,cloudtrail,quicksight,kms]>=1.43.125",
 ]
 mcp = [
-    # Lower bound is the first release clear of five HIGH-severity transport
-    # advisories, including CVE-2026-52869 (HTTP transports serving session
-    # requests without verifying the authenticated principal) and
-    # CVE-2025-66416 (DNS-rebinding protection off by default).
+    # Lower bound is the first release clear of the five HIGH-severity
+    # transport advisories fixed in 1.28.1, including CVE-2026-52869 (HTTP
+    # transports serving session requests without verifying the authenticated
+    # principal) and CVE-2025-66416 (DNS-rebinding protection off by default),
+    # and the four advisories fixed in 1.30.0, including CVE-2026-59951
+    # (Streamable HTTP sessions never reclaimed) and CVE-2026-116684 (bearer
+    # authentication not checking the token audience).
     #
     # Upper bound is a hard API constraint, not caution: mcp 2.x renames
     # FastMCP to MCPServer and reshapes the surrounding APIs, so
     # mcp_server/server.py does not import under 2.x. Lift it as part of that
     # migration, not ahead of it.
-    "mcp>=1.28.1,<2",
+    "mcp>=1.30.0,<2",
 ]
 
 [project.scripts]
