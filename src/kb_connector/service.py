@@ -888,9 +888,11 @@ def plan_teardown(
         held = kind == "ds" or (kind == "app" and plan.kb_check_error is not None)
         if kept_quick_kb and held and not adopted:
             if kind == "ds":
+                # Built from the state fields, not the loop values: `candidates`
+                # also holds the secret ARN.
                 item.description = (
-                    f"{description} (used by external Quick knowledge base "
-                    f"{kept_quick_kb})"
+                    f"Quick data source {cs.data_source_id} (used by external "
+                    f"Quick knowledge base {kept_quick_kb})"
                 )
             item.used_by_kb = kept_quick_kb
             plan.keep.append(item)
