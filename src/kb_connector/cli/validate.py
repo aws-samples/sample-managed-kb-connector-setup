@@ -8,6 +8,11 @@ Wraps service.validate, which runs structured checks:
 
 Test query and users come from the connector's [validation] config block
 by default. CLI flags override.
+
+For target = "quick" it checks the signing key, Quick's authorization to sign
+with it, the Entra app, certificate and consent (through Microsoft Graph), and
+the knowledge base's status, ACL, documents and latest sync. Amazon Quick has
+no query API, so there is no test query.
 """
 
 from __future__ import annotations
@@ -26,7 +31,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         description=(
             "Run checks to verify the connector is healthy. For ACL-enabled "
             "connectors, runs an authorized/denied/no-user retrieve trio "
-            "using the [validation] block in your config."
+            "using the [validation] block in your config. For target = "
+            "'quick', checks the signing key, Quick's authorization to sign "
+            "with it, the Entra app, certificate and consent, and the "
+            "knowledge base's status, ACL, documents and latest sync, with no "
+            "test query (Amazon Quick has no query API)."
         ),
     )
     parser.add_argument("connector", nargs="?", help="Connector name from config")
@@ -50,6 +59,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--skip-retrieve", action="store_true",
         help="Skip the retrieve checks (only run informational checks)",
+    )
+    parser.add_argument(
+        "--auth-method", choices=["az", "device_code"], default="az",
+        help=(
+            "Graph token acquisition for the Entra app, certificate and consent "
+            "checks of a Quick connector (default: az). Without Graph access "
+            "they are reported as not checked."
+        ),
+    )
+    parser.add_argument(
+        "--device-client-id",
+        help="Public client app id for --auth-method device_code",
     )
     parser.set_defaults(func=run)
 
@@ -82,6 +103,9 @@ def _run_validate(args: argparse.Namespace) -> int:
             authorized_user=args.authorized_user,
             unauthorized_user=args.unauthorized_user,
             skip_retrieve=args.skip_retrieve,
+            check_directory=True,
+            graph_auth_method=args.auth_method,
+            device_client_id=args.device_client_id,
             config_path=config_path,
         )
         _render(result)

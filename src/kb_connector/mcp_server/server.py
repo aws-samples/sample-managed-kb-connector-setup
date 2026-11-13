@@ -107,7 +107,12 @@ def _build_server() -> Any:
             "delivery on the knowledge base). Returns a structured "
             "DiagnoseResult with status (healthy|degraded|failing) and "
             "attribution (source|aws|unknown). Document paths in log analysis "
-            "are redacted."
+            "are redacted. For a target = 'quick' connector it runs certificate "
+            "expiry, the Quick signing-key, authorization and knowledge base "
+            "checks and a CloudTrail scan for denied kms:Sign calls on the "
+            "signing key; include_logs does not apply, and Quick has no query "
+            "check. The Entra app, certificate and consent checks are not run "
+            "here."
         ),
     )
     def kb_connector_diagnose(
@@ -204,7 +209,11 @@ def _build_server() -> Any:
             "test retrieve against the knowledge base, or for ACL-enabled "
             "connectors the authorized / denied / no-user retrieve checks. "
             "The query and users default to the connector's [validation] "
-            "config block."
+            "config block. For a target = 'quick' connector there is no query "
+            "check (Amazon Quick has no query API): it checks the signing key, "
+            "Quick's authorization to sign with it, and the knowledge base's "
+            "status, ACL, documents and latest sync. The Entra app, certificate "
+            "and consent checks are not run here; they are reported as notes."
         ),
     )
     def kb_connector_validate(

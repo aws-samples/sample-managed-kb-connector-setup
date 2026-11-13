@@ -372,8 +372,13 @@ class _FakeCloud:
         self._install(monkeypatch)
 
     def authorize(self, key_arn: str) -> None:
-        """The Quick console "Select keys" step: Quick may sign with the key after it."""
+        """The Quick console "Select keys" step: Quick may sign with the key after it.
+
+        The console gives the Quick-managed role kms:Sign through its identity
+        policy, which the IAM simulator then reports as allowed.
+        """
         self.quicksight.authorized_keys.add(key_arn)
+        self.iam.identity_allowed_keys.add(key_arn)
 
     # --- data source payload helpers ---------------------------------------------
 
@@ -467,8 +472,27 @@ class _FakeCloud:
                 if key not in consent:
                     consent.append(key)
 
+        def by_sp(sp_id):
+            return next((a for a in self.apps.values()
+                         if sp_id in (f"sp-{a['id']}", f"sp-{a['appId']}")), None)
+
+        def get_application(g, object_id):
+            app = next((a for a in self.apps.values() if a["id"] == object_id), None)
+            return {"id": app["id"], "appId": app["appId"]} if app else None
+
+        def find_service_principal(g, app_id):
+            found = any(a["appId"] == app_id for a in self.apps.values())
+            return {"id": f"sp-{app_id}"} if found else None
+
+        def list_app_role_assignments(g, sp_id):
+            app = by_sp(sp_id) or {}
+            return [{"resourceId": r, "appRoleId": role} for r, role in app.get("consent", [])]
+
         mp.setattr(apps, "resolve_grants", resolve_grants)
         mp.setattr(apps, "grant_admin_consent", grant_admin_consent)
+        mp.setattr(apps, "get_application", get_application)
+        mp.setattr(apps, "find_service_principal", find_service_principal)
+        mp.setattr(apps, "list_app_role_assignments", list_app_role_assignments)
         mp.setattr(apps, "declare_required_resource_access", lambda *a: None)
         mp.setattr(apps, "list_certificate_thumbprints", lambda g, obj: list(by_object(obj)["certs"]))
         mp.setattr(apps, "upload_certificate",
@@ -1413,3 +1437,186 @@ def test_a_reserved_data_source_name_gets_the_wait_message():
     )
     with pytest.raises(AwsError, match="wait a minute"):
         _create_data_source_with_diagnostics(target=target, kb_id="KB", ds_name="c-ds", payload={})
+
+
+# --- Quick validate and diagnose ------------------------------------------------------
+
+_MANAGED_SIGNER = f"arn:aws:iam::{_ACCOUNT}:role/service-role/aws-quicksight-kms-role-v0"
+_QUICK_CHECKS = (
+    "signing_key_usable", "quick_key_authorized", "entra_app", "certificate_installed",
+    "entra_consent", "quick_kb_active", "quick_kb_acl", "quick_kb_documents",
+    "quick_kb_latest_sync",
+)
+
+
+def _quick_set_up(cloud, capsys, *, sync: str = "COMPLETED", documents: int = 33) -> None:
+    """A SharePoint Quick connector after the console step and a second setup run."""
+    _quick_config()
+    cloud.quicksight.kb_ingestion = sync
+    _setup_unauthorized(cloud, capsys)
+    cloud.authorize(_state()["signing_key_arn"])
+    assert _cli("setup", "c") == 0
+    cloud.quicksight.kbs["kb-connector-c-kb"]["DocumentCount"] = documents
+    capsys.readouterr()
+
+
+def _quick_check(name: str):
+    from kb_connector import service
+
+    result = service.validate(connector_name="c")
+    return next(c for c in result.checks if c.name == name)
+
+
+def test_quick_validate_passes_on_a_synced_knowledge_base(cloud, capsys):
+    from kb_connector.quick.checks import QUERY_GAP_NOTE
+
+    _quick_set_up(cloud, capsys)
+    assert _cli("validate", "c") == 0
+    out = capsys.readouterr().out
+    for name in _QUICK_CHECKS:
+        assert f"✓ {name}:" in out
+    assert "✗" not in out
+    assert QUERY_GAP_NOTE in out
+    assert "HEALTHY (9/9 checks passed)" in out
+
+
+def test_quick_validate_fails_on_an_incomplete_sync(cloud, capsys):
+    _quick_set_up(cloud, capsys, sync="INCOMPLETE")
+    assert _cli("validate", "c") == 1
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "quick_kb_latest_sync" in ln)
+    assert "✗" in line and "INCOMPLETE" in line and "sync report in the Quick console" in line
+
+
+def test_quick_key_authorized_fails_with_no_route(cloud):
+    _quick_config()
+    _seed_quick(cloud)
+    cloud.iam.identity_allowed_keys.clear()
+    check = _quick_check("quick_key_authorized")
+    assert not check.passed and "not yet authorized" in check.details
+    assert check.data["routes"] == [] and check.data["signer_role"] == _MANAGED_SIGNER
+
+
+@pytest.mark.parametrize("route", ["identity policy", "key policy", "grant"])
+def test_quick_key_authorized_passes_on_each_route_alone(cloud, route):
+    _quick_config()
+    entry = _seed_quick(cloud)
+    key_arn = entry["signing_key_arn"]
+    cloud.iam.identity_allowed_keys.clear()
+    if route == "identity policy":
+        cloud.iam.identity_allowed_keys.add(key_arn)
+    elif route == "key policy":
+        cloud.kms.extra_statements.append({
+            "Effect": "Allow", "Principal": {"AWS": _MANAGED_SIGNER},
+            "Action": ["kms:Sign", "kms:GetPublicKey"], "Resource": "*",
+        })
+    else:
+        cloud.kms.grants.append({"GranteePrincipal": _MANAGED_SIGNER, "Operations": ["Sign"]})
+    check = _quick_check("quick_key_authorized")
+    assert check.passed and check.data["routes"] == [route]
+    (simulation,) = cloud.iam.simulations
+    assert "ResourcePolicy" not in simulation
+    assert simulation["PolicySourceArn"] == _MANAGED_SIGNER
+    assert simulation["ResourceArns"] == [key_arn]
+
+
+def test_quick_key_authorized_says_the_console_step_is_missing(cloud):
+    _quick_config()
+    _seed_quick(cloud)
+    cloud.iam.roles_present = set()
+    check = _quick_check("quick_key_authorized")
+    assert not check.passed
+    assert "has not been done in this account" in check.details
+
+
+def test_quick_key_authorized_checks_a_customer_managed_role(cloud):
+    role = f"arn:aws:iam::{_ACCOUNT}:role/team-quick-service-role"
+    _quick_config()
+    _seed_quick(cloud)
+    cloud.quicksight.role_type = "CUSTOMER_MANAGED"
+    cloud.quicksight.customer_role_arn = role
+    cloud.iam.roles_present.add("team-quick-service-role")
+    check = _quick_check("quick_key_authorized")
+    assert check.data["signer_role"] == role
+    assert cloud.iam.simulations[-1]["PolicySourceArn"] == role
+
+
+def _denied_sign_event(key_arn: str) -> dict:
+    import datetime as dt
+
+    caller = f"arn:aws:sts::{_ACCOUNT}:assumed-role/aws-quicksight-kms-role-v0/quick"
+    return {
+        "EventId": "evt-1",
+        "EventTime": dt.datetime.now(dt.timezone.utc),
+        "CloudTrailEvent": json.dumps({
+            "eventName": "Sign", "errorCode": "AccessDenied",
+            "errorMessage": f"User: {caller} is not authorized to perform: kms:Sign on "
+                            f"resource: {key_arn} because no identity-based policy allows "
+                            f"the kms:Sign action",
+            "userIdentity": {"arn": caller},
+        }),
+    }
+
+
+def test_quick_diagnose_runs_the_quick_checks_and_finds_sign_denials(cloud, capsys):
+    _quick_config()
+    entry = _seed_quick(cloud)
+    cloud.cloudtrail.events = [_denied_sign_event(entry["signing_key_arn"])]
+    capsys.readouterr()
+    assert _cli("diagnose", "c") == 1
+    out = capsys.readouterr().out
+    for absent in ("secret_validation", "cloudtrail_permissions", "ingestion_logs"):
+        assert absent not in out
+    assert "✗ kms_sign_denied: 1 denied kms:Sign call(s)" in out
+    assert "✓ quick_key_authorized" in out and "✓ quick_kb_active" in out
+    (lookup,) = cloud.cloudtrail.lookups
+    assert lookup["LookupAttributes"] == [{"AttributeKey": "EventName", "AttributeValue": "Sign"}]
+
+
+def test_quick_diagnose_is_not_healthy_without_a_knowledge_base(cloud, capsys):
+    from kb_connector import service
+
+    _quick_config()
+    _seed_quick(cloud, kb=None)
+    result = service.diagnose(connector_name="c")
+    assert result.status != "healthy"
+    kb_check = next(c for c in result.checks if c.name == "quick_kb_active")
+    assert not kb_check.passed and "has 0 knowledge base(s)" in kb_check.details
+
+
+def test_quick_diagnose_refuses_log_analysis(cloud):
+    from kb_connector.core.errors import ConfigError
+
+    _quick_config()
+    _seed_quick(cloud)
+    with pytest.raises(ConfigError, match="Bedrock knowledge bases only"):
+        _cli("diagnose", "c", "--logs")
+
+
+def test_quick_validate_finds_a_console_made_kb_and_leaves_state_alone(cloud, capsys):
+    _quick_config()
+    _setup_unauthorized(cloud, capsys)
+    state = _state()
+    cloud.authorize(state["signing_key_arn"])
+    qs = cloud.quicksight
+    ds_arn = qs.create_data_source(
+        AwsAccountId=_ACCOUNT, DataSourceId="xxxxxxxx-console-ds", Name="console",
+        Type="SHAREPOINT", Credentials={"SharePointClientCredentials": {
+            "KmsKeyArn": state["signing_key_arn"],
+            "CertThumbprint": state["cert_thumbprint_b64url"]}},
+        DataSourceParameters={"SharePointParameters": {
+            "SharePointDomain": "x.sharepoint.com", "ClientId": state["client_app_id"]}},
+    )["Arn"]
+    qs.create_knowledge_base(
+        AwsAccountId=_ACCOUNT, KnowledgeBaseId="xxxxxxxx-console-kb", Name="console",
+        DataSourceArn=ds_arn,
+        KnowledgeBaseConfiguration={"templateConfiguration": {"template": {}}},
+        AccessControlConfiguration={"isACLEnabled": True},
+    )
+    before = Path("kb-connector.state.json").read_text()
+    capsys.readouterr()
+    _cli("validate", "c")
+    out = capsys.readouterr().out
+    assert "Checked Quick knowledge base xxxxxxxx-console-kb" in out
+    assert "✓ quick_kb_active" in out
+    assert Path("kb-connector.state.json").read_text() == before

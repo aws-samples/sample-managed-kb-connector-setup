@@ -187,6 +187,11 @@ def diagnose(
     Reuses the existing core check functions (secret/cert/CloudTrail) — this
     function just wires them up with the right session and connector context.
 
+    For target = "quick" it runs certificate expiry, the Quick checks from
+    `kb_connector.quick.checks` and a CloudTrail scan for denied kms:Sign calls
+    on the signing key, and no secret, account-wide CloudTrail or log check.
+    `include_logs` / `log_group_name` raise ConfigError there.
+
     `include_logs` adds per-document ingestion log analysis. It is off by
     default because it needs vended log delivery configured on the knowledge
     base plus logs:FilterLogEvents, so for most callers it would just add a
@@ -216,6 +221,22 @@ def diagnose(
         checks.append(check)
         if on_check is not None:
             on_check(check)
+
+    if ctx.target_name == "quick":
+        if include_logs or log_group_name:
+            raise ConfigError(
+                "Log analysis (--logs, --log-group) applies to Bedrock knowledge "
+                "bases only. Amazon Quick delivers no per-document logs; the "
+                "knowledge base's sync report in the Quick console lists what "
+                "each sync skipped."
+            )
+        _diagnose_quick(
+            ctx, session=session, region=region, kb_id=kb_id,
+            lookback_minutes=lookback_minutes, check_directory=check_directory,
+            graph_auth_method=graph_auth_method, device_client_id=device_client_id,
+            add=_add,
+        )
+        return build_diagnose_result(name, checks)
 
     secret_arn = cs.secret_arn if cs else None
     if secret_arn:
@@ -270,6 +291,42 @@ def diagnose(
         ))
 
     return build_diagnose_result(name, checks)
+
+
+def _diagnose_quick(
+    ctx: Any, *, session: Any, region: str, kb_id: str | None,
+    lookback_minutes: int, check_directory: bool, graph_auth_method: str,
+    device_client_id: str | None, add: Callable[[CheckResult], None],
+) -> None:
+    """The Quick diagnosis: certificate expiry, the Quick checks, kms:Sign denials.
+
+    No secret check (Quick keeps the private key in KMS, there is no secret)
+    and no account-wide CloudTrail scan (it looks for the Bedrock KB role).
+    """
+    from kb_connector.core.state import ConnectorState
+    from kb_connector.quick import checks as quick_checks
+    from kb_connector.quick.client import caller_account
+
+    cs = ctx.cs or ConnectorState()
+    add(check_cert_expiry(cert_not_after=cs.cert_not_after))
+    directory = None
+    if check_directory:
+        directory = quick_checks.read_directory(
+            cs, quick_checks.consent_plan(ctx.cfg, cs),
+            method=graph_auth_method, device_client_id=device_client_id,
+        )
+        if directory is None and cs.client_app_object_id:
+            # As for Bedrock: no Graph access reports the certificate as unverified.
+            add(check_certificate_installed(
+                recorded_thumbprint=cs.cert_thumbprint_b64url, installed_thumbprints=None,
+            ))
+    results, _notes = quick_checks.run_quick_checks(
+        session=session, region=region, account_id=caller_account(session),
+        cfg=ctx.cfg, cs=cs, kb_id=kb_id, directory=directory,
+        directory_checked=check_directory, sign_denied_lookback=lookback_minutes,
+    )
+    for check in results:
+        add(check)
 
 
 def _read_installed_thumbprints(
@@ -396,6 +453,9 @@ def validate(
     authorized_user: str | None = None,
     unauthorized_user: str | None = None,
     skip_retrieve: bool = False,
+    check_directory: bool = False,
+    graph_auth_method: str = "az",
+    device_client_id: str | None = None,
     config_path: str | None = None,
     state_path: str | None = None,
     session_factory: SessionFactory | None = None,
@@ -415,6 +475,13 @@ def validate(
 
     Test query and users come from the connector's [validation] config
     block by default; CLI/programmatic args override.
+
+    For target = "quick" there is no query API, so it runs the checks in
+    `kb_connector.quick.checks` instead (signing key, Quick's authorization
+    to sign, the knowledge base's status, ACL, documents and latest sync) and
+    notes the query gap. `check_directory` adds the Entra app, certificate and
+    consent checks through Microsoft Graph (`graph_auth_method`,
+    `device_client_id`); without it they are reported as notes.
     """
     ctx = resolve_context(
         connector_name, region=region, profile=profile,
@@ -426,6 +493,20 @@ def validate(
     # Pull validation config from the connector. The block is optional — set it
     # once and `validate` becomes self-contained.
     val_cfg = (cfg.get("validation") if cfg else None) or {}
+
+    if ctx.target_name == "quick":
+        ignored = [
+            label for label, value in (
+                ("query", query or val_cfg.get("query")),
+                ("authorized_user", authorized_user or val_cfg.get("authorized_user")),
+                ("unauthorized_user", unauthorized_user or val_cfg.get("unauthorized_user")),
+            ) if value
+        ]
+        return _validate_quick(
+            ctx, kb_id=kb_id, ignored=ignored, check_directory=check_directory,
+            graph_auth_method=graph_auth_method, device_client_id=device_client_id,
+        )
+
     query = query or val_cfg.get("query", "test")
     authorized_user = authorized_user or val_cfg.get("authorized_user")
     unauthorized_user = unauthorized_user or val_cfg.get("unauthorized_user")
@@ -497,6 +578,42 @@ def validate(
     return ValidateResult(
         connector=name,
         healthy=healthy,
+        checks=checks,
+        notes=notes,
+    )
+
+
+def _validate_quick(
+    ctx: Any, *, kb_id: str | None, ignored: list[str], check_directory: bool,
+    graph_auth_method: str, device_client_id: str | None,
+) -> ValidateResult:
+    """validate for target = "quick". The Bedrock Target is never built."""
+    from kb_connector.core.state import ConnectorState
+    from kb_connector.quick import checks as quick_checks
+    from kb_connector.quick.client import caller_account
+
+    region = ctx.require_region()
+    cs = ctx.cs or ConnectorState()
+    session = ctx.session()
+    directory = None
+    if check_directory:
+        directory = quick_checks.read_directory(
+            cs, quick_checks.consent_plan(ctx.cfg, cs),
+            method=graph_auth_method, device_client_id=device_client_id,
+        )
+    checks, notes = quick_checks.run_quick_checks(
+        session=session, region=region, account_id=caller_account(session),
+        cfg=ctx.cfg, cs=cs, kb_id=kb_id, directory=directory,
+        directory_checked=check_directory,
+    )
+    notes.append(quick_checks.QUERY_GAP_NOTE)
+    if ignored:
+        notes.append(
+            f"Ignored for target = \"quick\": {', '.join(ignored)} (no query API)."
+        )
+    return ValidateResult(
+        connector=ctx.name,
+        healthy=bool(checks) and all(c.passed for c in checks),
         checks=checks,
         notes=notes,
     )

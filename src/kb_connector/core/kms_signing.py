@@ -116,13 +116,10 @@ def _describe_key(kms: Any, key_id: str) -> dict | None:
     return metadata
 
 
-def _verify_key_shape(meta: dict, *, identifier: str) -> None:
-    """Refuse a key that cannot sign Entra assertions.
+def key_shape_problems(meta: dict) -> list[str]:
+    """Why a key (DescribeKey or GetPublicKey metadata) cannot sign Entra assertions.
 
-    Raised as a hard error rather than a warning: a key of the wrong spec still
-    yields a public key and a certificate that Entra accepts on upload, and the
-    mismatch only surfaces later as a failed sync with no indication that the
-    key was the cause.
+    Empty when the key has the shape Quick requires.
     """
     spec = meta.get("KeySpec") or meta.get("CustomerMasterKeySpec")
     usage = meta.get("KeyUsage")
@@ -137,6 +134,18 @@ def _verify_key_shape(meta: dict, *, identifier: str) -> None:
         problems.append(f"it is not enabled (state: {meta.get('KeyState')!r})")
     if meta.get("KeyState") == "PendingDeletion":
         problems.append("it is pending deletion")
+    return problems
+
+
+def _verify_key_shape(meta: dict, *, identifier: str) -> None:
+    """Refuse a key that cannot sign Entra assertions.
+
+    Raised as a hard error rather than a warning: a key of the wrong spec still
+    yields a public key and a certificate that Entra accepts on upload, and the
+    mismatch only surfaces later as a failed sync with no indication that the
+    key was the cause.
+    """
+    problems = key_shape_problems(meta)
     if problems:
         raise AwsError(
             f"KMS key {identifier!r} cannot be used to sign Entra assertions: "
