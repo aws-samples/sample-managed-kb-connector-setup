@@ -778,8 +778,10 @@ shared certificate bucket.
 
 Two KMS key ARNs are supplied rather than derived, and both reach a policy
 `Resource`: `kms_key_arn` in the knowledge base role's inline policy, and
-`signing_key_arn` in the `kms:Sign` grant for a self-managed Quick service role.
-`key/*` in either place grants the principal every key in the account.
+`signing_key_arn` in the `kms:Sign` key policy statement setup prints for a
+customer-managed Quick service role (printed for a key administrator; setup does
+not write it). `key/*` in either place grants the principal every key in the
+account.
 
 **Status: Mitigated.** `identifiers.validate_name_component` and
 `validate_s3_key_prefix` constrain the derived-name inputs to a charset that is
@@ -914,7 +916,8 @@ Security-relevant behaviors that this model depends on:
   `classify_ownership`; skipping that conversion makes a key this tool created
   classify as `UNMANAGED`. The module deliberately has no delete function: KMS
   supports only scheduled deletion, and one signing key can back several Quick
-  knowledge bases, so `teardown` reports the key rather than removing it.
+  knowledge bases, so `teardown` reports the key and prints the
+  `schedule-key-deletion` command rather than removing it.
 - `certs._verify_kms_backed_cert` — checks the generated certificate carries the
   KMS public key *and* that its self-signature verifies, before it is uploaded to
   Entra. The second check is the same verification Entra performs on a client

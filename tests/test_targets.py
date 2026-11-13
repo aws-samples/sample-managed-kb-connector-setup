@@ -93,7 +93,7 @@ def test_bmkb_is_target():
 
 def test_quick_raises_not_implemented():
     target = get_target("quick", session=_FakeSession(), region="us-west-2")
-    with pytest.raises(NotImplementedError, match="not yet available"):
+    with pytest.raises(NotImplementedError, match="does not implement the Target interface"):
         target.create_knowledge_base(name="test", role_arn="arn:test")
     with pytest.raises(NotImplementedError):
         target.get_knowledge_base("kb-1")

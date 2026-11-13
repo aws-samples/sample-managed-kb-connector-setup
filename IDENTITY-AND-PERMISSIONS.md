@@ -140,11 +140,14 @@ The permissions below are the full set across every subcommand. `diagnose`,
 | STS | `GetCallerIdentity` | all |
 | Bedrock Agent | `CreateKnowledgeBase`, `TagResource`, `GetKnowledgeBase`, `DeleteKnowledgeBase`, `CreateDataSource`, `GetDataSource`, `DeleteDataSource`, `StartIngestionJob`, `GetIngestionJob`, `ListIngestionJobs`, `StopIngestionJob`, `Retrieve` | setup, monitor, validate, teardown |
 | IAM | `GetRole`, `CreateRole`, `TagRole`, `ListRoleTags`, `UpdateAssumeRolePolicy`, `PutRolePolicy`, `GetRolePolicy`, `ListRolePolicies`, `ListAttachedRolePolicies`, `DeleteRolePolicy`, `DeleteRole`, `PassRole` | setup, teardown |
+| IAM (`target = "quick"`) | `GetRole`, `SimulatePrincipalPolicy` (the role Quick signs with) | validate, diagnose |
 | Secrets Manager | `CreateSecret`, `UpdateSecret`, `DescribeSecret`, `TagResource`, `GetSecretValue`, `DeleteSecret` | setup, diagnose, teardown |
 | S3 (cert mode) | `CreateBucket`, `ListBucket`, `GetBucketTagging`, `PutBucketTagging`, `PutBucketPublicAccessBlock`, `PutBucketEncryption`, `PutObject`, `PutObjectTagging`, `DeleteObject` | setup, teardown |
 | CloudTrail | `LookupEvents` | diagnose |
 | CloudWatch Logs | `FilterLogEvents` | `diagnose --logs` |
 | KMS (only with `--kms-key-arn`) | `GenerateDataKey`, `Decrypt`, `DescribeKey` | setup, diagnose |
+| KMS signing key (`target = "quick"`) | `CreateKey`, `CreateAlias`, `DescribeKey`, `GetPublicKey`, `Sign`, `ListResourceTags`, `TagResource`, `GetKeyPolicy`, `ListGrants` | setup (`Sign` signs the certificate), validate, diagnose |
+| Amazon Quick (`quicksight`, `target = "quick"`) | `CreateDataSource`, `DescribeDataSource`, `ListDataSources`, `DeleteDataSource`, `PassDataSource`, `CreateKnowledgeBase`, `DescribeKnowledgeBase`, `ListKnowledgeBases`, `DeleteKnowledgeBase`, `TagResource`, `ListTagsForResource`, `DescribeResourcePermissions`, `DescribeUser` | setup, validate, diagnose, teardown |
 
 Three of these are worth explaining, because a narrower policy fails in
 confusing ways:

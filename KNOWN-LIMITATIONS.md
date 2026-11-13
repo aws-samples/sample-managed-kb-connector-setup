@@ -256,49 +256,57 @@ check your tenant for an app named `<app-name>-granter` and delete it. The tool
 prints the object ID and an `az ad app delete` command if it can't remove the app
 itself.
 
-### Amazon Quick target stops at the service credentials
+### Amazon Quick target: key authorization is a console step, and there is no query API
 
-`target = "quick"` completes the credential half of the Amazon Quick
-admin-managed SharePoint setup and then stops. It does not create the
-Quick data source or knowledge base, because the API cannot express this
-connection yet.
+`target = "quick"` creates the KMS signing key, the certificate, the Entra app,
+the Quick data source and the knowledge base. These gaps in the Quick API
+remain:
 
-Verified against the published QuickSight model (`quicksight`
-`2018-04-01`, from botocore `develop`): the full transitive closure of
-`CreateDataSourceRequest` is 363 member paths, and none of them accept a
-KMS signing key or a certificate thumbprint. `SharePointParameters`
-carries exactly four fields (`SharePointDomain`, `TenantId`, `ClientId`,
-`AuthType`), and `DataSourceCredentials` has six arms, none holding a key
-ARN. The strings `thumbprint` and `signing key` do not appear anywhere in
-the model. The only KMS members in the whole service belong to
-`UpdateKeyRegistration` / `DescribeKeyRegistration` and are documented for
-"encryption and decryption use", meaning the symmetric QDataKey rather than
-the asymmetric `SIGN_VERIFY` key this flow needs.
+- **No Quick API authorizes a KMS key.** The documented route is the console
+  step: a Quick administrator (Admin Pro) adds the key in the Quick console (Manage account → Permissions → AWS
+  resources → AWS Key Management Service → Select keys). Until then
+  `CreateDataSource` fails with "Failed to generate JWT assertion", and setup
+  stops with `Setup is not finished` and exits 0. When the account's Quick
+  service role is customer-managed, that role also needs `kms:Sign` on the key;
+  setup prints the statement and does not write it.
+- **The role Quick signs with is not documented.** With the Quick-managed service
+  role, Quick calls `kms:Sign` as `service-role/aws-quicksight-kms-role-v0`, a
+  role the console's first "Select keys" creates. `validate` finds the role
+  through `DescribeResourcePermissions` and reports that the console step has
+  not been done when the role does not exist.
+- **`DescribeDataSource` returns no `CredentialStatus`**, so the data source does
+  not say whether Quick can sign. `validate` checks the role's identity policy
+  with the IAM policy simulator, the key policy and the key's grants instead,
+  and `diagnose` looks for denied `kms:Sign` calls in CloudTrail.
+- **A sync can end `INCOMPLETE` with no reason in the API.** The first sync of an
+  API-made SharePoint knowledge base can end this way. `DescribeKnowledgeBase`
+  gives the status and the document count only; the knowledge base's sync
+  report in the Quick console lists what was skipped and why.
+- **No query or ACL-check API.** `validate` cannot run a test query or the
+  authorized/denied/no-user ACL checks for a Quick knowledge base. It reports
+  them as not checked.
+- **No knowledge-base sync API.** Quick starts the first sync itself once the
+  knowledge base exists. `monitor` refuses a Quick connector, and `setup
+  --sync` has no effect.
+- **`ListKnowledgeBases` accepts at most 25 results per page**, although the
+  model allows 100. The tool pages 25 at a time.
 
-So two steps remain manual, and setup prints both with the values filled
-in:
+**ACL is immutable after the knowledge base is created.** Changing it means
+creating a new knowledge base, so set `acl` before the first successful setup
+run.
 
-1. **Granting Quick use of the signing key.** The documented route is the
-   Quick console (Manage account → AWS resources → AWS Key Management
-   Service). If your organization manages its own Quick IAM service role,
-   the alternative is granting that role `kms:Sign` on the key; setup
-   prints the policy statement.
-2. **Creating the knowledge base**, in the Quick console, pasting the five
-   printed values.
-
-Two consequences worth planning around. **ACL management is immutable
-after the knowledge base is created**. Changing it means creating a new
-one, so decide before you click Create. And there is no knowledge-base
-sync API to drive: the only ingestion operations are dataset-scoped
-(`/data-sets/{DataSetId}/ingestions/{IngestionId}`). That costs nothing
-here, because Quick triggers the first sync itself once the knowledge base
-exists. It does mean `monitor` and `--sync` do not apply to this target,
-and `--sync` warns and no-ops.
-
-This area of the API is moving: `SharePointParameters` itself, along with
-`CreateKnowledgeBase` and `UpdateKnowledgeBase`, landed between botocore
-`1.43.32` and `develop`. If a credential field appears, the work is
-confined to `targets/quick.py` and the Stage 2 branch in `cli/setup.py`.
+**`--rotate-cert` does not update the Quick data source.** The data source
+records the certificate thumbprint when it is created, and setup does not
+modify a data source it finds, so after a rotation the data source still uses
+the thumbprint of a certificate the Entra app no longer has, and its syncs fail
+to authenticate. `validate` does not see this: it compares the thumbprint in state
+with the app, and no Quick API returns the data source's credential. Setup
+prints a warning when it issues a certificate for a connector whose state
+records a Quick data source. To recover, run `teardown <connector> --only kb`,
+`teardown <connector> --only ds` and `setup <connector>`, which creates a data
+source with the new thumbprint (a data source or knowledge base recorded as
+external is deleted in the Quick console instead). A new signing key has the
+same effect, because the data source also keeps the key ARN.
 
 `target = "quick"` supports `type = "sharepoint"` and `type = "onedrive"`,
 both requiring `credential = "cert"`. The credential is a KMS-held key
@@ -307,7 +315,7 @@ Bedrock OneDrive path no client secret is created.
 
 The two sources need different Entra permissions, and the tool requests
 the documented set for each rather than sharing one. OneDrive needs
-`Group.Read.All`, which the Bedrock connector never asks for. Without it,
+`Group.Read.All`, which the Bedrock connector does not ask for. Without it,
 group-based access control resolves to nothing and documents shared with a
 group are silently missed. It needs no SharePoint REST permission, so the
 Bedrock path's `Sites.FullControl.All` (tenant-wide full control) is not

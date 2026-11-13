@@ -108,13 +108,15 @@ crawl_depth = 2
 
 # Example: OneDrive knowledge base in Amazon Quick (admin-managed)
 #
-# Same KMS + Entra process as the SharePoint example below, with three
-# differences the tool handles for you:
-#   • no `sharepoint_domain`. The console form has no domain field, so this
-#     prints four values rather than five
+# Same process as the SharePoint example below, with three differences the
+# tool handles for you:
+#   • no `sharepoint_domain`. A OneDrive data source has no domain field
 #   • different Entra permissions: OneDrive needs Group.Read.All and needs no
 #     SharePoint REST permission at all
 #   • ACL is always enforced. `acl = false` is reported and overridden.
+#
+# `crawl_personal_drives` and `crawl_shared_with_me` feed the knowledge base
+# template. `inclusion_user_emails` has no Quick counterpart and warns.
 #
 # There is no Sites.Selected equivalent for OneDrive, so the app holds
 # tenant-wide read across every user's drive. `sites_selected` warns and is
@@ -143,10 +145,13 @@ crawl_depth = 2
 # Quick path holds no private key: it is generated inside AWS KMS and never
 # exported, so there is no PKCS#12 in S3 and no secret in Secrets Manager.
 #
-# Setup completes the service credentials and then stops, printing the five
-# values the Quick console asks for. Creating the knowledge base is still manual,
-# because the Quick API has no field for a signing key or a certificate
-# thumbprint yet. See KNOWN-LIMITATIONS.md.
+# Setup creates the KMS signing key, the certificate, the Entra app, the Quick
+# data source and the knowledge base. One step is in the Quick console: a Quick
+# administrator (Admin Pro) adds the signing key under Manage account ->
+# Permissions -> AWS resources -> AWS Key Management Service -> Select keys.
+# Until then setup prints the step, says it is not finished and exits 0;
+# re-run it afterwards. See the README's "Amazon Quick target" section and
+# KNOWN-LIMITATIONS.md.
 #
 # [connectors.engineering-quick]
 # type = "sharepoint"             # sharepoint or onedrive with target = "quick"
@@ -157,15 +162,23 @@ crawl_depth = 2
 #                                 # since Quick needs the key in that Region.
 # acl = true                      # immutable once the KB is created in Quick
 # sharepoint_domain = "https://contoso.sharepoint.com"   # tenant root, not a
-#                                 # site URL, which is what the console wants
+#                                 # site URL. Defaults to the host of site_urls[0]
 # site_urls = [
 #     "https://contoso.sharepoint.com/sites/engineering",
 # ]
+# crawl_pages, crawl_files and the SharePoint filter keys (for example
+# inclusion_item_paths, which defaults to site_urls) feed the knowledge base
+# template as they do for Bedrock.
+#
+# The Quick user or group that owns the data source and knowledge base.
+# Defaults to the Quick user of the identity running setup:
+# quick_owner_arn = "arn:aws:quicksight:us-east-1:123456789012:user/default/kb-admin"
 #
 # Certificate lifetime. Defaults to 365 days. Longer is fine, and the AWS guide
 # uses 730, because the certificate is only a public wrapper around a key that
-# outlives it: reissuing costs one Entra upload and changes neither the KMS key
-# ARN nor Quick's configuration. Re-run with --rotate-cert to reissue.
+# outlives it: reissuing keeps the KMS key ARN. Re-run with --rotate-cert to
+# reissue. The Quick data source records the certificate thumbprint when it is
+# created, and setup does not update a data source it finds.
 # cert_valid_days = 365
 #
 # By default the tool creates the KMS asymmetric signing key and names it
