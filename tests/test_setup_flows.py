@@ -12,11 +12,289 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 
 from kb_connector.core.tagging import Ownership, ProvisionedResource
 
 _ACCOUNT = "111122223333"
 _TENANT = "11111111-2222-3333-4444-555555555555"
+_QUICK_REGION = "us-east-1"
+_CALLER_ARN = f"arn:aws:sts::{_ACCOUNT}:assumed-role/Admin/tester"
+_QUICK_USER_ARN = f"arn:aws:quicksight:{_QUICK_REGION}:{_ACCOUNT}:user/default/Admin/tester"
+
+
+def _client_error(code: str, message: str, operation: str, status: int = 400) -> ClientError:
+    return ClientError(
+        {"Error": {"Code": code, "Message": message},
+         "ResponseMetadata": {"HTTPStatusCode": status}},
+        operation,
+    )
+
+
+# --- Quick, KMS, IAM, CloudTrail and STS fakes ----------------------------------------
+#
+# Reached through _FakeSession.client(), which setup gets from
+# _aws_session_and_account and every other command from default_session_factory.
+
+
+class _FakeQuickSight:
+    """In-memory Amazon Quick data sources, knowledge bases, users and tags."""
+
+    def __init__(self, deletions: list):
+        self.data_sources: dict = {}     # id -> DataSource dict
+        self.kbs: dict = {}              # id -> KnowledgeBase dict
+        self.tags: dict = {}             # ARN -> [{"Key", "Value"}]
+        self.users: dict = {"Admin/tester": _QUICK_USER_ARN}
+        self.role_type = "QUICKSIGHT_MANAGED"
+        self.customer_role_arn: str | None = None
+        self.authorized_keys: set = set()
+        self.kb_ingestion = "QUEUED"
+        self.calls: list = []            # (operation, kwargs) for every create
+        self.deletions = deletions       # shared with _FakeCloud, in order
+
+    def _arn(self, kind: str, rid: str) -> str:
+        return f"arn:aws:quicksight:{_QUICK_REGION}:{_ACCOUNT}:{kind}/{rid}"
+
+    def create_data_source(self, **kw):
+        self.calls.append(("create_data_source", kw))
+        ds_id = kw["DataSourceId"]
+        auth = next(iter(kw.get("Credentials", {}).values()), {})
+        if auth.get("KmsKeyArn") not in self.authorized_keys:
+            raise _client_error(
+                "InvalidParameterValueException",
+                "Failed to validate credentials: Failed to generate JWT assertion",
+                "CreateDataSource",
+            )
+        if ds_id in self.data_sources:
+            raise _client_error("ResourceExistsException", f"{ds_id} exists",
+                                "CreateDataSource", 409)
+        arn = self._arn("datasource", ds_id)
+        self.data_sources[ds_id] = {
+            "Arn": arn, "DataSourceId": ds_id, "Name": kw["Name"], "Type": kw["Type"],
+            "Status": "CREATION_SUCCESSFUL",
+            "DataSourceParameters": kw.get("DataSourceParameters", {}),
+        }
+        if kw.get("Tags"):
+            self.tags[arn] = list(kw["Tags"])
+        return {"Arn": arn, "DataSourceId": ds_id, "CreationStatus": "CREATION_IN_PROGRESS"}
+
+    def describe_data_source(self, *, AwsAccountId, DataSourceId):
+        if DataSourceId not in self.data_sources:
+            raise _client_error("ResourceNotFoundException", "no data source",
+                                "DescribeDataSource", 404)
+        return {"DataSource": dict(self.data_sources[DataSourceId])}
+
+    def list_data_sources(self, *, AwsAccountId, NextToken=None):
+        return {"DataSources": [dict(ds) for ds in self.data_sources.values()]}
+
+    def delete_data_source(self, *, AwsAccountId, DataSourceId):
+        if DataSourceId not in self.data_sources:
+            raise _client_error("ResourceNotFoundException", "no data source",
+                                "DeleteDataSource", 404)
+        self.deletions.append(("ds", DataSourceId))
+        del self.data_sources[DataSourceId]
+        return {"DataSourceId": DataSourceId}
+
+    def create_knowledge_base(self, **kw):
+        self.calls.append(("create_knowledge_base", kw))
+        kb_id = kw["KnowledgeBaseId"]
+        if kb_id in self.kbs:
+            raise _client_error("ResourceExistsException", f"{kb_id} exists",
+                                "CreateKnowledgeBase", 409)
+        arn = self._arn("knowledgebase", kb_id)
+        self.kbs[kb_id] = {
+            "KnowledgeBaseArn": arn, "KnowledgeBaseId": kb_id, "Name": kw["Name"],
+            "Status": "ACTIVE", "DataSourceArn": kw["DataSourceArn"],
+            "KnowledgeBaseConfiguration": kw["KnowledgeBaseConfiguration"],
+            "AccessControlConfiguration": kw.get("AccessControlConfiguration", {}),
+            "PrimaryOwnerArn": kw.get("PrimaryOwnerArn"),
+            "DocumentCount": 0,
+            "LatestIngestionSummary": {"IngestionId": "ing-1",
+                                       "IngestionStatus": self.kb_ingestion},
+        }
+        if kw.get("Tags"):
+            self.tags[arn] = list(kw["Tags"])
+        return {"KnowledgeBaseArn": arn, "KnowledgeBaseId": kb_id, "CreationStatus": "CREATING"}
+
+    def describe_knowledge_base(self, *, AwsAccountId, KnowledgeBaseId):
+        if KnowledgeBaseId not in self.kbs:
+            raise _client_error("ResourceNotFoundException", "no knowledge base",
+                                "DescribeKnowledgeBase", 404)
+        return {"KnowledgeBase": dict(self.kbs[KnowledgeBaseId])}
+
+    def list_knowledge_bases(self, *, AwsAccountId, MaxResults=None, NextToken=None):
+        if MaxResults is not None and MaxResults > 25:
+            raise _client_error("InvalidParameterValueException",
+                                "MaxResults must be at most 25", "ListKnowledgeBases")
+        keys = ("KnowledgeBaseArn", "KnowledgeBaseId", "Name", "Status", "DataSourceArn")
+        return {"KnowledgeBaseSummaries": [
+            {k: kb[k] for k in keys} for kb in self.kbs.values()
+        ]}
+
+    def delete_knowledge_base(self, *, AwsAccountId, KnowledgeBaseId):
+        if KnowledgeBaseId not in self.kbs:
+            raise _client_error("ResourceNotFoundException", "no knowledge base",
+                                "DeleteKnowledgeBase", 404)
+        self.deletions.append(("kb", KnowledgeBaseId))
+        kb = self.kbs.pop(KnowledgeBaseId)
+        return {"KnowledgeBaseArn": kb["KnowledgeBaseArn"], "KnowledgeBaseId": KnowledgeBaseId}
+
+    def describe_resource_permissions(self, *, AwsAccountId):
+        resp: dict = {"RoleType": self.role_type}
+        if self.customer_role_arn:
+            resp["CustomerManagedRoleArn"] = self.customer_role_arn
+        return resp
+
+    def describe_user(self, *, AwsAccountId, Namespace, UserName):
+        if UserName not in self.users:
+            raise _client_error("ResourceNotFoundException", "no user", "DescribeUser", 404)
+        return {"User": {"Arn": self.users[UserName], "UserName": UserName}}
+
+    def list_tags_for_resource(self, *, ResourceArn):
+        return {"Tags": list(self.tags.get(ResourceArn, []))}
+
+
+_KMS_PRIVATE_KEY = None
+
+
+def _kms_private_key():
+    """One RSA-2048 key for the whole module; generating one per test is slow."""
+    global _KMS_PRIVATE_KEY
+    if _KMS_PRIVATE_KEY is None:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        _KMS_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return _KMS_PRIVATE_KEY
+
+
+class _FakeKms:
+    """Asymmetric signing keys with a real RSA key behind GetPublicKey and Sign."""
+
+    class exceptions:  # noqa: N801 - mirrors the boto3 client attribute
+        class NotFoundException(Exception):
+            pass
+
+    def __init__(self):
+        self.keys: dict = {}             # ARN -> KeyMetadata
+        self.aliases: dict = {}          # alias -> ARN
+        self.key_tags: dict = {}         # ARN -> [{"TagKey", "TagValue"}]
+        self.extra_statements: list = []  # key-policy statements beyond the root one
+        self.grants: list = []
+
+    def _resolve(self, key_id: str) -> str:
+        arn = self.aliases.get(key_id, key_id)
+        if arn not in self.keys:
+            raise self.exceptions.NotFoundException(key_id)
+        return arn
+
+    def create_key(self, **kw):
+        key_id = f"xxxxxxxx-0000-0000-0000-{len(self.keys):012d}"
+        arn = f"arn:aws:kms:{_QUICK_REGION}:{_ACCOUNT}:key/{key_id}"
+        self.keys[arn] = {
+            "Arn": arn, "KeyId": key_id, "KeySpec": kw["KeySpec"],
+            "KeyUsage": kw["KeyUsage"], "Enabled": True, "KeyState": "Enabled",
+            "MultiRegion": False,
+        }
+        self.key_tags[arn] = list(kw.get("Tags", []))
+        return {"KeyMetadata": dict(self.keys[arn])}
+
+    def create_alias(self, *, AliasName, TargetKeyId):
+        arn = next(a for a, m in self.keys.items() if m["KeyId"] == TargetKeyId)
+        self.aliases[AliasName] = arn
+
+    def describe_key(self, *, KeyId):
+        return {"KeyMetadata": dict(self.keys[self._resolve(KeyId)])}
+
+    def list_resource_tags(self, *, KeyId):
+        return {"Tags": list(self.key_tags.get(self._resolve(KeyId), []))}
+
+    def get_public_key(self, *, KeyId):
+        from cryptography.hazmat.primitives import serialization
+
+        meta = self.keys[self._resolve(KeyId)]
+        der = _kms_private_key().public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return {"PublicKey": der, "KeySpec": meta["KeySpec"], "KeyUsage": meta["KeyUsage"]}
+
+    def sign(self, *, KeyId, Message, MessageType, SigningAlgorithm):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+        self._resolve(KeyId)
+        assert MessageType == "DIGEST"
+        signature = _kms_private_key().sign(
+            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
+        )
+        return {"Signature": signature, "SigningAlgorithm": SigningAlgorithm}
+
+    def get_key_policy(self, *, KeyId, PolicyName="default"):
+        self._resolve(KeyId)
+        root = {
+            "Sid": "Enable IAM User Permissions", "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{_ACCOUNT}:root"},
+            "Action": "kms:*", "Resource": "*",
+        }
+        return {"Policy": json.dumps({
+            "Version": "2012-10-17", "Statement": [root, *self.extra_statements],
+        })}
+
+    def list_grants(self, *, KeyId, **_):
+        self._resolve(KeyId)
+        return {"Grants": list(self.grants)}
+
+
+class _FakeIam:
+    def __init__(self):
+        self.roles_present: set = {"aws-quicksight-kms-role-v0"}
+        self.identity_allowed_keys: set = set()
+        self.simulations: list = []      # kwargs of every simulate_principal_policy
+
+    def get_role(self, *, RoleName):
+        if RoleName not in self.roles_present:
+            raise _client_error("NoSuchEntity", f"role {RoleName} not found", "GetRole", 404)
+        return {"Role": {"RoleName": RoleName,
+                         "Arn": f"arn:aws:iam::{_ACCOUNT}:role/service-role/{RoleName}"}}
+
+    def simulate_principal_policy(self, **kw):
+        self.simulations.append(kw)
+        return {"EvaluationResults": [
+            {"EvalActionName": action, "EvalResourceName": resource,
+             "EvalDecision": "allowed" if resource in self.identity_allowed_keys
+             else "implicitDeny"}
+            for action in kw.get("ActionNames", [])
+            for resource in kw.get("ResourceArns", ["*"])
+        ]}
+
+
+class _FakeCloudTrail:
+    def __init__(self):
+        self.events: list = []
+        self.lookups: list = []
+
+    def lookup_events(self, **kw):
+        self.lookups.append(kw)
+        return {"Events": list(self.events)}
+
+
+class _FakeSts:
+    def __init__(self):
+        self.arn = _CALLER_ARN
+
+    def get_caller_identity(self):
+        return {"Arn": self.arn, "Account": _ACCOUNT, "UserId": "AROAEXAMPLE:tester"}
+
+
+class _FakeSession:
+    def __init__(self, cloud: _FakeCloud):
+        self.region_name = _QUICK_REGION
+        self._clients = {
+            "quicksight": cloud.quicksight, "kms": cloud.kms, "iam": cloud.iam,
+            "cloudtrail": cloud.cloudtrail, "sts": cloud.sts,
+        }
+
+    def client(self, name, **_kw):
+        return self._clients.get(name) or MagicMock()
 
 
 class _FakeTarget:
@@ -69,7 +347,18 @@ class _FakeCloud:
         self.apps: dict = {}           # display name -> app dict
         self.extended: list = []       # (role_name, secret_arn) for foreign roles
         self.secret_factory = secret_factory
+        self.deletions: list = []      # (kind, id) in the order Quick and Entra deletes ran
+        self.quicksight = _FakeQuickSight(self.deletions)
+        self.kms = _FakeKms()
+        self.iam = _FakeIam()
+        self.cloudtrail = _FakeCloudTrail()
+        self.sts = _FakeSts()
+        self.session = _FakeSession(self)
         self._install(monkeypatch)
+
+    def authorize(self, key_arn: str) -> None:
+        """The Quick console "Select keys" step: Quick may sign with the key after it."""
+        self.quicksight.authorized_keys.add(key_arn)
 
     # --- data source payload helpers ---------------------------------------------
 
@@ -88,7 +377,7 @@ class _FakeCloud:
         from kb_connector.providers.microsoft.client import GraphClient
 
         target = _FakeTarget(self)
-        mp.setattr(setup_mod, "_aws_session_and_account", lambda cfg: (MagicMock(), _ACCOUNT))
+        mp.setattr(setup_mod, "_aws_session_and_account", lambda cfg: (self.session, _ACCOUNT))
         mp.setattr(setup_mod, "_build_target", lambda cfg, session: target)
         mp.setattr(setup_mod, "_preflight_aws_ownership", lambda *a, **k: None)
         mp.setattr("time.sleep", lambda _: None)
@@ -146,8 +435,25 @@ class _FakeCloud:
         mp.setattr(apps, "find_application_by_name", find_app)
         mp.setattr(apps, "create_application", create_app)
         mp.setattr(apps, "ensure_service_principal", lambda g, app_id: {"id": f"sp-{app_id}"})
-        mp.setattr(apps, "resolve_grants", lambda g, plan: [])
-        mp.setattr(apps, "grant_admin_consent", lambda *a: None)
+        def resolve_grants(g, plan):
+            return [
+                apps.ResolvedGrant(req, f"sp-{req.resource_app_id}", f"role-{req.value}")
+                for req in plan.requirements
+            ]
+
+        def grant_admin_consent(g, client_sp_id, grants):
+            # create_app names the service principal sp-<object id>;
+            # ensure_service_principal names it sp-<app id>.
+            app = next(a for a in self.apps.values()
+                       if client_sp_id in (f"sp-{a['id']}", f"sp-{a['appId']}"))
+            consent = app.setdefault("consent", [])
+            for grant in grants:
+                key = (grant.resource_sp_id, grant.app_role_id)
+                if key not in consent:
+                    consent.append(key)
+
+        mp.setattr(apps, "resolve_grants", resolve_grants)
+        mp.setattr(apps, "grant_admin_consent", grant_admin_consent)
         mp.setattr(apps, "declare_required_resource_access", lambda *a: None)
         mp.setattr(apps, "list_certificate_thumbprints", lambda g, obj: list(by_object(obj)["certs"]))
         mp.setattr(apps, "upload_certificate",
@@ -155,7 +461,7 @@ class _FakeCloud:
         mp.setattr(apps, "add_client_secret", lambda g, obj, **k: self.secret_factory("client"))
 
         # Teardown
-        mp.setattr("kb_connector.context.default_session_factory", lambda r, p: MagicMock())
+        mp.setattr("kb_connector.context.default_session_factory", lambda r, p: self.session)
         mp.setattr("kb_connector.context.default_target_factory", lambda **kw: target)
 
         def delete_role(session, role_arn):
@@ -167,6 +473,7 @@ class _FakeCloud:
 
         def delete_app(*, object_id, **_):
             name = next(n for n, a in self.apps.items() if a["id"] == object_id)
+            self.deletions.append(("app", object_id))
             del self.apps[name]
 
         mp.setattr(td, "delete_role", delete_role)
@@ -394,6 +701,230 @@ def test_two_s3_connectors_on_one_kb_keep_both_bucket_grants(cloud):
     policies = cloud.roles["kb-connector-a-role"]["policies"]
     assert policies["kb-connector-s3-content-access"] == "bucket-a"
     assert policies["kb-connector-s3-content-access-b"] == "bucket-b"
+
+
+def _quick_config(connector_type: str = "sharepoint", extra: str = "") -> None:
+    body = (
+        f'[connectors.c]\ntype = "{connector_type}"\ntarget = "quick"\n'
+        f'credential = "cert"\nregion = "{_QUICK_REGION}"\nacl = true\n'
+    )
+    if connector_type == "sharepoint":
+        body += 'site_urls = ["https://x.sharepoint.com/sites/eng"]\n'
+    _write_config(body + extra)
+
+
+# --- Quick teardown and monitor ------------------------------------------------------
+
+
+def _seed_quick(cloud, *, ds: str | None = "tool", kb: str | None = "tool",
+                signing_key: str = "tool") -> dict:
+    """A Quick connector as setup leaves it, written straight to the fakes and state."""
+    key = cloud.kms.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]
+    cloud.authorize(key["Arn"])
+    obj = "00000000-0000-0000-0000-00000000000a"
+    cloud.apps["kb-connector-c"] = {"appId": f"app-{obj}", "id": obj, "certs": ["tp"]}
+    entry = {
+        "connector_type": "sharepoint", "target": "quick", "region": _QUICK_REGION,
+        "tenant_id": _TENANT, "client_app_id": f"app-{obj}", "client_app_object_id": obj,
+        "cert_thumbprint_b64url": "tp", "signing_key_arn": key["Arn"],
+        "created_resources": {"app": "tool", "signing_key": signing_key},
+    }
+    qs = cloud.quicksight
+    if ds:
+        ds_arn = qs.create_data_source(
+            AwsAccountId=_ACCOUNT, DataSourceId="kb-connector-c-ds", Name="c-ds",
+            Type="SHAREPOINT", Credentials={"SharePointClientCredentials": {
+                "KmsKeyArn": key["Arn"], "CertThumbprint": "tp"}},
+            DataSourceParameters={"SharePointParameters": {
+                "SharePointDomain": "x.sharepoint.com", "ClientId": f"app-{obj}"}},
+        )["Arn"]
+        entry["data_source_id"] = "kb-connector-c-ds"
+        entry["created_resources"]["ds"] = ds
+        if kb:
+            qs.create_knowledge_base(
+                AwsAccountId=_ACCOUNT, KnowledgeBaseId="kb-connector-c-kb",
+                Name="kb-connector-c", DataSourceArn=ds_arn,
+                KnowledgeBaseConfiguration={"templateConfiguration": {"template": {}}},
+            )
+            entry["knowledge_base_id"] = "kb-connector-c-kb"
+            entry["created_resources"]["kb"] = kb
+    qs.calls.clear()
+    Path("kb-connector.state.json").write_text(json.dumps({"connectors": {"c": entry}}))
+    return entry
+
+
+def test_quick_teardown_deletes_kb_then_ds_then_app_and_keeps_the_key(cloud, capsys):
+    _quick_config()
+    entry = _seed_quick(cloud)
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert cloud.deletions == [
+        ("kb", "kb-connector-c-kb"), ("ds", "kb-connector-c-ds"),
+        ("app", entry["client_app_object_id"]),
+    ]
+    assert "Quick knowledge base kb-connector-c-kb" in out
+    assert "Quick data source kb-connector-c-ds" in out
+    assert f"KMS signing key {entry['signing_key_arn']} (never deleted by teardown)" in out
+    assert f"schedule-key-deletion --key-id {entry['signing_key_arn']}" in out
+    assert entry["signing_key_arn"] in cloud.kms.keys
+    assert not (cloud.quicksight.kbs or cloud.quicksight.data_sources or cloud.apps)
+    assert _state() is None
+
+
+def test_quick_teardown_dry_run_prints_the_key_line_and_deletes_nothing(cloud, capsys):
+    _quick_config()
+    entry = _seed_quick(cloud)
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert f"schedule-key-deletion --key-id {entry['signing_key_arn']}" in out
+    assert cloud.deletions == []
+
+
+def test_quick_teardown_leaves_an_external_signing_key_alone(cloud, capsys):
+    _quick_config()
+    entry = _seed_quick(cloud, signing_key="external")
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert "schedule-key-deletion" not in out
+    assert f"KMS signing key {entry['signing_key_arn']} is recorded as external" in out
+
+
+def test_quick_teardown_keeps_an_external_kb_and_data_source(cloud, capsys):
+    _quick_config()
+    _seed_quick(cloud, ds="external", kb="external")
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert "Kept (adopted by this tool, not created by it):" in out
+    assert "• Quick knowledge base kb-connector-c-kb" in out
+    assert "• Quick data source kb-connector-c-ds" in out
+    assert "the kept Quick data source authenticates with" in out
+    assert [kind for kind, _ in cloud.deletions] == ["app"]
+    assert "kb-connector-c-kb" in cloud.quicksight.kbs
+    assert "kb-connector-c-ds" in cloud.quicksight.data_sources
+    assert _state()["knowledge_base_id"] == "kb-connector-c-kb"
+
+
+def test_quick_teardown_keeps_a_tool_data_source_under_an_external_kb(cloud, capsys):
+    _quick_config()
+    _seed_quick(cloud, ds="tool", kb="external")
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert "Kept (created by this tool, used by an external resource):" in out
+    assert (
+        "• Quick data source kb-connector-c-ds (used by external Quick knowledge "
+        "base kb-connector-c-kb)" in out
+    )
+    assert "delete Quick knowledge base kb-connector-c-kb in the Amazon Quick console" in out
+    assert "re-run `kb-connector teardown c`" in out
+    assert "the kept Quick data source authenticates with" in out
+    assert [kind for kind, _ in cloud.deletions] == ["app"]
+    assert "kb-connector-c-kb" in cloud.quicksight.kbs
+    assert "kb-connector-c-ds" in cloud.quicksight.data_sources
+    state = _state()
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["created_resources"]["ds"] == "tool"
+
+
+def test_quick_teardown_deletes_the_data_source_once_the_external_kb_is_gone(
+    cloud, capsys
+):
+    _quick_config()
+    entry = _seed_quick(cloud, ds="tool", kb="external")
+    del cloud.quicksight.kbs["kb-connector-c-kb"]   # deleted in the Quick console
+    capsys.readouterr()
+
+    assert _cli("teardown", "c", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "Quick knowledge base kb-connector-c-kb (external) is not found in Quick" in out
+    assert "• Quick data source kb-connector-c-ds" in out
+    assert cloud.deletions == []
+    assert _state()["knowledge_base_id"] == "kb-connector-c-kb"
+
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert "Removed Quick knowledge base kb-connector-c-kb from state" in out
+    assert cloud.deletions == [
+        ("ds", "kb-connector-c-ds"), ("app", entry["client_app_object_id"]),
+    ]
+    assert _state() is None
+
+
+def test_quick_teardown_keeps_the_data_source_and_app_when_the_kb_check_fails(
+    cloud, capsys, monkeypatch
+):
+    _quick_config()
+    entry = _seed_quick(cloud, ds="tool", kb="external")
+
+    def refuse(**_):
+        raise _client_error("AccessDeniedException", "not allowed", "DescribeKnowledgeBase", 403)
+
+    monkeypatch.setattr(cloud.quicksight, "describe_knowledge_base", refuse)
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert (
+        "Quick knowledge base kb-connector-c-kb could not be checked "
+        "(AccessDeniedException), so the data source and the Entra app are kept." in out
+    )
+    assert f"• Entra app {entry['client_app_id']}" in out
+    assert cloud.deletions == []
+    state = _state()
+    assert state["knowledge_base_id"] == "kb-connector-c-kb"
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["client_app_id"] == entry["client_app_id"]
+
+
+def test_quick_teardown_of_credential_only_state_deletes_the_app(cloud, capsys):
+    """State written by 1.4 Quick setup: an Entra app and a signing key, no DS or KB."""
+    _quick_config()
+    entry = _seed_quick(cloud, ds=None, kb=None)
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 0
+    out = capsys.readouterr().out
+    assert [kind for kind, _ in cloud.deletions] == ["app"]
+    assert f"schedule-key-deletion --key-id {entry['signing_key_arn']}" in out
+    assert _state() is None
+
+
+def test_quick_teardown_keeps_the_data_source_when_the_kb_delete_fails(
+    cloud, capsys, monkeypatch
+):
+    _quick_config()
+    entry = _seed_quick(cloud)
+
+    def refuse(**_):
+        raise _client_error("AccessDeniedException", "not allowed", "DeleteKnowledgeBase", 403)
+
+    monkeypatch.setattr(cloud.quicksight, "delete_knowledge_base", refuse)
+    capsys.readouterr()
+    assert _cli("teardown", "c", "--yes") == 1
+    out = capsys.readouterr().out
+    assert "Failed to delete Quick knowledge base kb-connector-c-kb" in out
+    assert "Skipping Quick data source kb-connector-c-ds" in out
+    assert cloud.deletions == []
+    assert "kb-connector-c-ds" in cloud.quicksight.data_sources
+    assert entry["client_app_object_id"] == cloud.apps["kb-connector-c"]["id"]
+    state = _state()
+    assert state["knowledge_base_id"] == "kb-connector-c-kb"
+    assert state["data_source_id"] == "kb-connector-c-ds"
+    assert state["client_app_id"] == entry["client_app_id"]
+
+
+def test_monitor_refuses_a_quick_connector(cloud, capsys, monkeypatch):
+    from kb_connector.cli.main import main
+
+    _quick_config()
+    _seed_quick(cloud)
+    monkeypatch.setattr("sys.argv", ["kb-connector", "monitor", "c"])
+    assert main() != 0
+    err = capsys.readouterr().err
+    assert "no knowledge-base sync API" in err
+    assert "kb-connector validate c" in err
 
 
 def test_a_reserved_data_source_name_gets_the_wait_message():

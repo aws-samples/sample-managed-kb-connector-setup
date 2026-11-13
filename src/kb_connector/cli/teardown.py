@@ -86,25 +86,35 @@ def _run_teardown(args: argparse.Namespace) -> int:
     )
     if not plan.tracked:
         print(f"No resources tracked in state for {plan.connector!r}. Nothing to tear down.")
+        _render_signing_key(plan)
         return 0
 
     _render_plan(plan, dry_run=args.dry_run)
 
     if not plan.delete:
-        # Every tracked resource is adopted. The state entry is the only record
+        # Every tracked resource is kept. The state entry is the only record
         # that this connector is attached to them, so it is kept.
-        print(
-            f"\n  Nothing to delete: all {len(plan.keep)} tracked resource(s) were "
-            f"adopted rather than created by this tool."
-        )
-        print(
-            "  Keeping tracked state so the attachment stays recorded. Use "
-            "--include-adopted to delete them, or remove them yourself."
-        )
+        if all(item.adopted for item in plan.keep):
+            print(
+                f"\n  Nothing to delete: all {len(plan.keep)} tracked resource(s) were "
+                f"adopted rather than created by this tool."
+            )
+            print(
+                "  Keeping tracked state so the attachment stays recorded. Use "
+                "--include-adopted to delete them, or remove them yourself."
+            )
+        else:
+            print(
+                f"\n  Nothing to delete: all {len(plan.keep)} tracked resource(s) "
+                f"are kept."
+            )
+            print("  Keeping tracked state so the attachment stays recorded.")
+        _render_signing_key(plan)
         return 0
 
     if args.dry_run:
         print("\n  Dry run — no changes made.")
+        _render_signing_key(plan)
         return 0
 
     if not args.yes:
@@ -122,6 +132,7 @@ def _run_teardown(args: argparse.Namespace) -> int:
         on_event=_render_event,
     )
 
+    # Quick has no ingestion jobs, so only a Bedrock teardown is ever blocked.
     if result.blocked_by_job:
         cs = plan.ctx.cs
         print(
@@ -138,9 +149,10 @@ def _run_teardown(args: argparse.Namespace) -> int:
         return 1
 
     if plan.keep:
+        kept = "adopted" if all(item.adopted for item in plan.keep) else "kept"
         print(
             f"\n  Keeping tracked state for {plan.connector!r}: "
-            f"{len(plan.keep)} adopted resource(s) still exist."
+            f"{len(plan.keep)} {kept} resource(s) still exist."
         )
     if result.state_cleared:
         print("\n  Teardown complete. Connector state cleared.")
@@ -151,6 +163,7 @@ def _run_teardown(args: argparse.Namespace) -> int:
             f"\n  Teardown incomplete: {len(result.failed)} failed, "
             f"{len(result.skipped)} skipped. State updated; re-run teardown to retry."
         )
+    _render_signing_key(plan)
     return 0 if result.ok else 1
 
 
@@ -164,19 +177,73 @@ def _render_plan(plan: TeardownPlan, *, dry_run: bool) -> None:
         for item in plan.delete:
             note = " [ADOPTED — deleting because --include-adopted]" if item.adopted else ""
             print(f"    • {item.description}{note}")
-    if plan.keep:
+    adopted = [item for item in plan.keep if item.adopted]
+    in_use = [item for item in plan.keep if not item.adopted]
+    if adopted:
         print("\n  Kept (adopted by this tool, not created by it):")
-        for item in plan.keep:
+        for item in adopted:
             print(f"    • {item.description}")
         print(
             "    These were pre-existing when the connector was set up. Use "
             "--include-adopted to delete them too, or remove them yourself."
         )
+    if in_use:
+        kb_id = in_use[0].used_by_kb
+        print("\n  Kept (created by this tool, used by an external resource):")
+        for item in in_use:
+            print(f"    • {item.description}")
+        if plan.kb_check_error:
+            print(
+                f"    Quick knowledge base {kb_id} could not be checked "
+                f"({plan.kb_check_error}), so the data source and the Entra app are "
+                f"kept. Re-run `kb-connector teardown {plan.connector}` once the "
+                f"check can succeed."
+            )
+        else:
+            print(
+                f"    To remove the data source, delete Quick knowledge base {kb_id} "
+                f"in the Amazon Quick console, then re-run "
+                f"`kb-connector teardown {plan.connector}`."
+            )
+    if plan.gone_kb:
+        print(
+            f"\n  Quick knowledge base {plan.gone_kb} (external) is not found in "
+            f"Quick, so teardown removes it from state and deletes the data source."
+        )
+    kept_ds = any(item.kind == "ds" for item in plan.keep)
+    app = next((item for item in plan.delete if item.kind == "app"), None)
+    if plan.ctx is not None and plan.ctx.target_name == "quick" and kept_ds and app:
+        print(
+            f"    Teardown deletes {app.description}, which the kept Quick data "
+            f"source authenticates with, so that data source cannot sync afterwards."
+        )
+    if plan.signing_key_arn:
+        print("\n  Also kept:" if plan.keep else "\n  Kept:")
+        print(f"    • KMS signing key {plan.signing_key_arn} (never deleted by teardown)")
+
+
+def _render_signing_key(plan: TeardownPlan) -> None:
+    """What to do with the Quick KMS signing key teardown leaves in place."""
+    if not plan.signing_key_arn:
+        return
+    if plan.signing_key_external:
+        print(
+            f"\n  KMS signing key {plan.signing_key_arn} is recorded as external "
+            f"(not created by this tool) and is left as it is."
+        )
+        return
+    from kb_connector.core import kms_signing
+
+    print()
+    for line in kms_signing.describe_orphan_risk(plan.signing_key_arn).splitlines():
+        print(f"  {line}")
 
 
 def _render_event(event: TeardownEvent) -> None:
     item = event.item
-    if event.kind == "deleted" and item:
+    if event.kind == "forgotten":
+        print(f"    ✓ Removed Quick knowledge base {event.detail} from state")
+    elif event.kind == "deleted" and item:
         print(f"    ✓ Deleted {item.description}")
     elif event.kind == "failed" and item:
         print(f"    ✗ Failed to delete {item.description}: {event.detail}")
